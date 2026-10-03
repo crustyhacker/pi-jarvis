@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
-## [Unreleased]
+## [1.5.0] - 2026-10-03
 
 ### Added
 - Compact, theme-aware overlay header with Ctrl+O diagnostics and independent startup, working, queue, and error feedback.

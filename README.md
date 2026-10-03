@@ -13,7 +13,7 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.4.0</p>
+<p><strong>Current version:</strong> 1.5.0</p>
 
 <p>
   <strong>Persistent side session</strong> ·
@@ -60,7 +60,7 @@ The main Pi session should stay on the critical path.
 | **Permission-gated tools** | Local `read`, `bash`, `edit`, and `write` stay off until you enable them |
 | **Safe main-session handoff** | `Note main` is quiet; `Redirect` is confirmation-gated |
 | **Independent model control** | Follow the main model or pin `/jarvis` to a separate model |
-| **Cleaner UX** | Thinking-step streaming is collapsed into a cleaner animated fallback |
+| **Cleaner UX** | Compact header, scrollable history, multiline drafts, and independent activity/queue feedback |
 
 ---
 
@@ -226,9 +226,9 @@ The overlay header exposes three controls, all **off by default**:
 
 Long redirects are paged: review every page with Up/Down or PageUp/PageDown before pressing Y. Resize if the terminal is too small to review safely. Configured Pi selection keybindings are respected.
 
-### Keyboard and drafts — unreleased UX update
+### Keyboard and drafts
 
-These improvements are in the source checkout; the published npm release is still **1.4.0**.
+Version **1.5.0** adds compact diagnostics, scrollback, and a multiline draft editor.
 
 | Key | Action |
 |---|---|
