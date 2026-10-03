@@ -226,6 +226,30 @@ The overlay header exposes three controls, all **off by default**:
 
 Long redirects are paged: review every page with Up/Down or PageUp/PageDown before pressing Y. Resize if the terminal is too small to review safely. Configured Pi selection keybindings are respected.
 
+### Keyboard and drafts — unreleased UX update
+
+These improvements are in the source checkout; the published npm release is still **1.4.0**.
+
+| Key | Action |
+|---|---|
+| Enter | Send the draft; toggle a focused permission control |
+| Shift+Enter / Ctrl+J | Insert a newline |
+| Tab / Shift+Tab | Cycle between the editor and permission controls |
+| Space | Toggle a focused permission control |
+| PageUp / PageDown | Scroll conversation history; reaching the bottom resumes live following |
+| Ctrl+End | Jump back to live output |
+| Ctrl+O | Expand/collapse model, main-context delta, and access details |
+| Ctrl+L | Dismiss notices |
+| Escape | Close; during redirect review, cancel the confirmation instead |
+
+The compact header keeps main status, the side model, main focus, and permissions visible. Activity and waiting-message counts remain visible while reading older output; counts exclude the active request. The latest notice appears separately; expand details for more of a long notice.
+
+The multiline editor uses Pi's public editor and configured editing keybindings. Up/Down move within a draft; Up at the beginning of the first line (or in an empty editor) recalls prompts. Down past recalled prompts restores the draft. Pasted indentation and newlines are preserved, with Pi's normal tab-to-spaces normalization. Oversized drafts (over 64 KiB) and terminal-control payloads are rejected explicitly, never silently truncated or sent.
+
+Unsent drafts survive closing and reopening `/jarvis` in the same running Pi session. They are not saved to disk. Side `/new`, main-session replacement, and switching to an unrelated side-session reference clear them; navigating the side tree only resets the transcript view. Closing still revokes every permission.
+
+Scrollback follows new output until you scroll up. To bound rendering work, the overlay retains up to 500 recent entries and 512K UTF-16 code units of source text, with a 64K-unit per-entry limit. Omitted content is marked explicitly; these display limits do not modify persisted conversation history. Resizing preserves the reading position on a best-effort basis.
+
 ### Permission flow
 
 ```mermaid

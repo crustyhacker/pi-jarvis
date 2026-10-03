@@ -116,6 +116,7 @@ class BaseComponent implements Component {
 
 const theme = {
 	fg: (_color: string, text: string) => text,
+	bg: (_color: string, text: string) => `\x1b[48;5;236m${text}\x1b[0m`,
 	bold: (text: string) => text,
 } as any;
 
@@ -503,7 +504,7 @@ async function testOverlayRenderDistinctness(): Promise<void> {
 	});
 	const overlay = new JarvisOverlayComponent(tui, theme, bridge, view, () => {});
 	const lines = overlay.render(80);
-	assert.ok(lines.some((line) => line.includes("\x1b[48;2;24;28;36m")), "overlay should render its own shaded background");
+	assert.ok(lines.some((line) => line.includes("\x1b[48;5;236m")), "overlay should use the host theme background rather than a hard-coded dark color");
 	assert.ok(lines[0]?.includes("╭") && lines.at(-1)?.includes("╰"), "overlay should render a bordered floating window");
 	assert.ok(lines.some((line) => line.includes("User:")), "user transcript entries should label the speaker as User:");
 	assert.ok(lines.some((line) => line.includes("Jarvis:")), "assistant transcript entries should label the speaker as Jarvis:");
@@ -535,7 +536,7 @@ async function testOverlayClippedTranscriptPreservesSpeakerLabel(): Promise<void
 	const lines = overlay.render(34);
 	const conversationDivider = lines.findIndex((line) => line.includes("Conversation"));
 	assert.ok(conversationDivider >= 0, "overlay should render a conversation divider");
-	const promptDivider = lines.findIndex((line) => line.includes("Prompt"));
+	const promptDivider = lines.findIndex((line) => line.includes("Message"));
 	const transcriptLine = lines
 		.slice(conversationDivider + 1, promptDivider >= 0 ? promptDivider : undefined)
 		.find((line) => line.includes("Jarvis:") || line.includes("Long clipped transcript"));
@@ -570,10 +571,11 @@ async function testOverlaySanitizesNonTranscriptUiText(): Promise<void> {
 	bridge.setStatus("status", "status \x1b[2J line");
 	const { view } = createTestOverlayView({ displayEntries: [] });
 	const overlay = new JarvisOverlayComponent(tui, theme, bridge, view, () => {});
+	const normalLines = overlay.render(80);
+	assert.ok(normalLines.some((line) => line.includes("notice label")), "overlay should sanitize notices before rendering them");
+	assert.ok(normalLines.some((line) => line.includes("status  line")), "overlay should sanitize bridge status text before rendering it");
 	const confirmation = bridge.requestConfirmation("title \x1b[2J", "body \x1b]8;;https://example.com\x07label\x1b]8;;\x07");
 	const lines = overlay.render(80);
-	assert.ok(lines.some((line) => line.includes("notice label")), "overlay should sanitize notices before rendering them");
-	assert.ok(lines.some((line) => line.includes("status  line")), "overlay should sanitize bridge status text before rendering it");
 	assert.ok(lines.some((line) => line.includes("title ")), "overlay should sanitize confirmation titles before rendering them");
 	assert.ok(lines.some((line) => line.includes("body label")), "overlay should sanitize confirmation bodies before rendering them");
 	assert.ok(!lines.some((line) => line.includes("\x1b[2J") || line.includes("https://example.com")), "overlay should not render raw control-sequence payloads anywhere in the UI");
@@ -591,7 +593,7 @@ async function testOverlaySanitizesWorkingMessageText(): Promise<void> {
 	const overlay = new JarvisOverlayComponent(tui, theme, bridge, view, () => {});
 	const lines = overlay.render(80);
 	const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
-	assert.ok(lines.some((line) => stripAnsi(line).includes("thinking  now")), "overlay should sanitize animated working-message text before rendering it");
+	assert.ok(lines.some((line) => stripAnsi(line).includes("thinking now")), "overlay should sanitize animated working-message text before rendering it");
 	assert.ok(!lines.some((line) => line.includes("\x1b[2J")), "overlay should not render raw control sequences inside the animated working message");
 	overlay.dispose();
 }
@@ -612,10 +614,13 @@ async function testOverlayForwardingToggleControls(): Promise<void> {
 	let lines = overlay.render(80);
 	assert.ok(lines.some((line) => line.includes("Jarvis · Main busy")), "overlay header should show the Jarvis title and current main status");
 	assert.ok(lines.some((line) => line.includes("Focus: editing side-session.ts")), "overlay header should show the current main-session focus");
-	assert.ok(lines.some((line) => line.includes("Since last: focus → editing side-session.ts")), "overlay header should show the since-last delta");
+	assert.ok(!lines.some((line) => line.includes("Since last:")), "default header should keep diagnostics collapsed");
+	overlay.handleInput("\x0f");
+	lines = overlay.render(80);
+	assert.ok(lines.some((line) => line.includes("Since last: focus → editing side-session.ts")), "expanded header should show the since-last delta");
 	assert.ok(lines.some((line) => line.includes("Access: local tools + MCP available")), "overlay header should show repo tool availability details");
-	assert.ok(lines.some((line) => line.includes("Models: main openai/gpt-5.2")), "overlay header should show the current main model label");
-	assert.ok(lines.some((line) => line.includes("jarvis faux/test-model (follow main)")), "overlay header should show the active Jarvis model and mode");
+	assert.ok(lines.some((line) => line.includes("Main model: openai/gpt-5.2")), "overlay header should show the current main model label");
+	assert.ok(lines.some((line) => line.includes("Jarvis model: faux/test-model (follow main)")), "overlay header should show the active Jarvis model and mode");
 	assert.ok(lines.some((line) => line.includes("Repo tools: off")), "overlay header should show the repo tools toggle state");
 	assert.ok(lines.some((line) => line.includes("Note main: off")), "overlay header should show the note-main toggle state");
 	assert.ok(lines.some((line) => line.includes("Redirect: off")), "overlay header should show the redirect toggle state");
@@ -686,7 +691,10 @@ async function testJarvisOverlayInputHistoryNavigatesUserMessages(): Promise<voi
 	overlay.handleInput("f");
 	overlay.handleInput("t");
 	
-	// Up -> second message
+	// Native multiline Editor first moves to the beginning of the draft.
+	overlay.handleInput("\x1b[A");
+	assert.equal(bridge.getDraft(), "Draft");
+	// Up from the first line/start -> second message.
 	overlay.handleInput("\x1b[A");
 	assert.equal(getOverlayInputValue(overlay.render(80)), "second message", "Up arrow should load the most recent user message");
 
@@ -2854,6 +2862,7 @@ async function testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline(): Promi
 
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
+			capturedOverlay.handleInput("\x0f");
 			const lines = capturedOverlay.render(100) as string[];
 			assert.ok(
 				lines.some((line) => line.includes("Since last: request → NEW_MAIN_REQUEST_AFTER_BASELINE")),
@@ -2879,6 +2888,7 @@ async function testJarvisOverlayReportsAssistantOnlyMainDelta(): Promise<void> {
 
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
+			capturedOverlay.handleInput("\x0f");
 			const lines = capturedOverlay.render(100) as string[];
 			assert.ok(
 				lines.some((line) => line.includes("Since last: assistant → Assistant-only main update")),
@@ -2897,6 +2907,7 @@ async function testJarvisOverlayToolToggleSyncsRuntime(): Promise<void> {
 			const runtime = await openJarvisRuntime(harness);
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
+			capturedOverlay.handleInput("\x0f");
 			let lines = capturedOverlay.render(80) as string[];
 			assert.ok(lines.some((line) => line.includes("Since last: first /jarvis turn")), "overlay header should surface the since-last delta note");
 			assert.ok(lines.some((line) => line.includes("Access: repo tools off")), "overlay header should surface repo tool availability when tools are off");

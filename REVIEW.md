@@ -28,11 +28,19 @@
 - Deterministic real SDK tests cover host-only/native/legacy custom providers, runtime auth changes, trust, lifecycle, and tool revocation. Both regular and fullscreen TUI implementations are exercised with fake terminals.
 - No live provider billing requests or human-driven terminal smoke test were performed.
 
+## Unreleased UX follow-through
+
+- Four workers used `openai-codex/gpt-6.1-sol:xhigh`; no OpenRouter agents.
+- Compact themed header, expandable diagnostics, transcript paging/live follow, multiline editor, in-memory drafts, and independent queue/activity/notice feedback.
+- Coordinator integration preserves confirmation priority, consumes chunked paste before shortcuts, clears drafts only at thread boundaries, and bounds display history without altering persisted sessions.
+- New editor/layout/scroll/status/integration suites run in `npm test`; release verification requires all three new helper modules. Final validation: 121 test results passing, build passing, release verification passing. No live provider requests or human terminal smoke test for this UX pass.
+- This work is not published and does not change the 1.4.0 release tag.
+
 ## Explicit limitations / proposed next improvements
 
 1. **Native MCP integration (high priority).** Automatic loading of the legacy adapter is disabled: its published peer ranges do not declare Pi 1.0 support. Integrate Pi's built-in factories only with direct/deferred/nested execution gates, late tool registration, trust, and teardown tests. Local read/bash/edit/write tools remain available by opt-in.
 2. **Virtual/router models (high priority).** The public extension registry does not expose session-aware virtual routing. These models reject explicitly; pin Jarvis to a physical model. Prefer an upstream supported runtime bridge rather than reaching into private fields.
 3. **Cross-process configuration locking.** Atomic replacement prevents partial files, but two processes can still overwrite concurrent changes. Add a portable lock/recovery protocol and multiprocess tests before claiming concurrent-writer support.
-4. **Large-history performance and UX.** Cache main context projections and wrapped transcript blocks; add a bounded scrollback view and a multi-line draft editor. Profile long sessions before introducing incremental caches.
+4. **Large-history performance.** The unreleased UX pass adds bounded scrollback, wrapped-block caching, and a multiline draft editor. Main-context projection caching remains a follow-up; profile long sessions before expanding incremental caches.
 5. **Broader release automation.** Add CI across supported Node versions and operating systems, a reusable clean-host tarball smoke test, and manual terminal acceptance checks.
 6. **Upstream development dependency advisory.** `npm audit --omit=dev` is clean. Full audit retains a high-severity `brace-expansion` advisory through Pi 1.0.0's published shrinkwrap (`5.0.9`, patched in `5.0.12`). Other reported development advisories were resolved through lockfile updates. A root override did not supersede that shrinkwrap and was not retained. This dependency is not shipped by Jarvis; update the validated Pi host when an upstream corrected release is available.

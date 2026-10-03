@@ -479,6 +479,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		state.bootPromise = undefined;
 		state.flushPromise = undefined;
 		state.queuedMessages = [];
+		state.bridge.refresh();
 		state.lastJarvisSeenMainContext = undefined;
 		state.allowSideTools = false;
 		state.allowFollowUpToMain = false;
@@ -545,6 +546,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			state.bootPromise = undefined;
 			state.flushPromise = undefined;
 			state.queuedMessages = [];
+			state.bridge.refresh();
 			state.lastJarvisSeenMainContext = undefined;
 			state.sessionRef = sessionRef;
 			resetTransientAccessControls(state);
@@ -620,6 +622,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		state.bootPromise = undefined;
 		state.flushPromise = undefined;
 		state.queuedMessages = [];
+		state.bridge.refresh();
 		state.lastJarvisSeenMainContext = undefined;
 		state.jarvisModelSelection = { mode: "follow-main" };
 		state.jarvisModelSelectionSource = "default";
@@ -1037,10 +1040,14 @@ async function executeJarvisSideCommand(
 			runtime.addSystemMessage(runtime.describeSessionTree());
 			return runtime;
 		}
+		const generation = state.bootGeneration;
 		await runtime.navigateSessionTree(command.targetId, {
 			summarize: command.summarize,
 			customInstructions: command.customInstructions,
 		});
+		if (generation === state.bootGeneration && state.runtime === runtime) {
+			state.bridge.resetTranscript();
+		}
 		return runtime;
 	}
 
@@ -1068,6 +1075,7 @@ function normalizeInitialMessage(args: string): string | undefined {
 
 function queueMessage(state: MainState, message: string): void {
 	state.queuedMessages.push(message);
+	state.bridge.refresh();
 }
 
 function parseJarvisSideCommand(message: string): JarvisSideCommand | undefined {
@@ -1113,6 +1121,8 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 	return {
 		isReady: () => state.runtime?.isReady() ?? false,
 		isStreaming: () => state.runtime?.isStreaming() ?? false,
+		getQueuedMessageCount: () => state.queuedMessages === queue ? queue.length : 0,
+		getIsProcessing: () => state.queuedMessages === queue && Boolean(state.bootPromise || state.flushPromise),
 		getModelLabel: () => state.runtime?.getModelLabel() ?? formatModelLabel(getDesiredJarvisModel(state)),
 		getModelModeLabel: () => getJarvisModelModeLabel(state.jarvisModelSelection),
 		getMainStatusLabel: () => state.mainContext.summary.mainStatus,
@@ -1147,6 +1157,7 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 		sendMessage: async (text: string) => {
 			if (state.queuedMessages !== queue) return;
 			queueMessage(state, text);
+			if (state.queuedMessages !== queue) return;
 			await flushQueuedMessages(pi, state, ctx);
 		},
 	};
@@ -1155,7 +1166,8 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 function getOverlayEntries(state: MainState): JarvisDisplayEntry[] {
 	let entries: JarvisDisplayEntry[];
 	if (state.runtime) {
-		entries = state.runtime.getDisplayEntries();
+		// Do not append per-render UI status to runtime-owned transcript arrays.
+		entries = [...state.runtime.getDisplayEntries()];
 	} else {
 		const hasRestorableSessionRef = Boolean(state.sessionRef?.file && existsSync(state.sessionRef.file));
 		entries = [
@@ -1166,13 +1178,7 @@ function getOverlayEntries(state: MainState): JarvisDisplayEntry[] {
 					: "Starting /jarvis side conversation…",
 			},
 		];
-		if (state.queuedMessages.length > 0) {
-			entries.push({ kind: "status", text: `Queued ${state.queuedMessages.length} message${state.queuedMessages.length === 1 ? "" : "s"}…` });
-		}
 	}
-
-	entries.push({ kind: "status", text: `Since last /jarvis turn: ${formatMainContextDeltaLabel(state.lastJarvisSeenMainContext, state.mainContext)}` });
-	entries.push({ kind: "status", text: `Repo tools: ${state.runtime?.getRepoToolsDetailLabel() ?? (state.allowSideTools ? "local tools only" : "repo tools off")}` });
 
 	if (!isModelBridgeCompatible(getDesiredJarvisModel(state))) {
 		entries.push({ kind: "status", text: "Relay disabled: current /jarvis model is incompatible with bridge tools" });
@@ -1222,7 +1228,9 @@ async function flushQueuedMessages(pi: ExtensionAPI, state: MainState, ctx: Exte
 	const queue = state.queuedMessages;
 	const isCurrent = () => state.queuedMessages === queue;
 	let flushPromise: Promise<void>;
-	flushPromise = (async () => {
+	// Publish ownership before any refresh or asynchronous work can reenter.
+	flushPromise = Promise.resolve().then(async () => {
+		if (!isCurrent()) return;
 		try {
 			updateContextState(pi, state, ctx);
 			let runtime = await ensureRuntime(pi, state, ctx);
@@ -1231,6 +1239,8 @@ async function flushQueuedMessages(pi: ExtensionAPI, state: MainState, ctx: Exte
 				// Consume once: a failed command must not poison the queue, and an
 				// uncertain provider/tool send must not be retried automatically.
 				const message = queue.shift()!;
+				state.bridge.refresh();
+				if (!isCurrent()) return;
 				try {
 					const command = parseJarvisSideCommand(message);
 					if (command) {
@@ -1251,12 +1261,18 @@ async function flushQueuedMessages(pi: ExtensionAPI, state: MainState, ctx: Exte
 		} catch (error) {
 			if (!isCurrent() || isStaleJarvisBootError(error)) return;
 			queue.length = 0;
+			state.bridge.refresh();
+			if (!isCurrent()) return;
 			state.bridge.notify(`/jarvis startup failed: ${error instanceof Error ? error.message : String(error)}. Please submit again.`, "error");
 		}
-	})().finally(() => {
-		if (state.flushPromise === flushPromise) state.flushPromise = undefined;
+	}).finally(() => {
+		if (state.flushPromise === flushPromise) {
+			state.flushPromise = undefined;
+			state.bridge.refresh();
+		}
 	});
 	state.flushPromise = flushPromise;
+	state.bridge.refresh();
 	return flushPromise;
 }
 
@@ -1337,9 +1353,11 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 	}).finally(() => {
 		if (state.bootPromise === bootPromise) {
 			state.bootPromise = undefined;
+			state.bridge.refresh();
 		}
 	});
 	state.bootPromise = bootPromise;
+	state.bridge.refresh();
 
 	return bootPromise;
 }

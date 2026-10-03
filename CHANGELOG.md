@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [Unreleased]
+
+### Added
+- Compact, theme-aware overlay header with Ctrl+O diagnostics and independent startup, working, queue, and error feedback.
+- PageUp/PageDown transcript scrollback with paused-reading position, hidden-line counts, and Ctrl+End return to live output.
+- Public Pi multiline editor: Enter sends, Shift+Enter/Ctrl+J adds a line, and unsent drafts survive overlay close/reopen within the same side thread.
+
+### Changed
+- Cache wrapped transcript blocks and bound the overlay view to recent content with explicit omission notices; persisted session history is unchanged.
+- Keep prompt history separate from changing transcript projections; side `/new` and main-session replacement clear drafts and recall history. Side-tree navigation resets scroll without discarding drafts.
+- Reject unsafe or oversized pasted drafts explicitly rather than silently flattening, truncating, or submitting them; drafts are limited to 64 KiB.
+- Preserve confirmation-review priority, permission revocation, generation-safe queue ownership, and no automatic replay of uncertain sends.
+- Add focused layout, editor, scroll, queue, and integration regressions to the default test suite and verify the new packaged modules.
+
 ## [1.4.0] - 2026-10-03
 
 ### Changed

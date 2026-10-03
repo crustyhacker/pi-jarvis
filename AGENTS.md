@@ -2,7 +2,7 @@
 
 ## Project Scope
 - `pi-jarvis` is a Pi extension that opens a `/jarvis` side-conversation overlay.
-- Core runtime files: `index.ts`, `side-session.ts`, `overlay.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
+- Core runtime files: `index.ts`, `side-session.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
 - Current baseline: Pi 1.0.0 (`@earendil-works` packages), Node.js >=22.19.0. Older Pi hosts are not supported.
 
 ## Current `/jarvis-model` and `/jarvis-thinking` Behavior
@@ -25,6 +25,15 @@
 - Side resources/settings honor `ctx.isProjectTrusted()`. Local tool execution and bridge delivery recheck live permissions; closing the overlay revokes them and cancels pending confirmations.
 - Use `agent_settled`, not `agent_end`, for final idle state. Main context must honor Pi context-edit/compaction projection.
 - Runtime disposal must not detach the overlay's bridge subscription. Queue ownership must survive side `/new` but not main-session replacement; failed/uncertain sends are not auto-retried.
+
+## Unreleased Overlay UX
+- Compact header by default; Ctrl+O expands diagnostics, PageUp/PageDown scroll transcript, Ctrl+End follows live, Ctrl+L dismisses notices.
+- Use Pi's public multiline Editor. Enter sends; Shift+Enter/Ctrl+J inserts newline. Preserve indentation and reject unsafe/oversized drafts (64 KiB) explicitly.
+- Bridge-owned in-memory drafts survive close/reopen. Bridge reset clears draft/recall on side `/new` or main/side-reference replacement; side-tree navigation only resets scroll.
+- Consume bracketed paste before global shortcuts and confirmation keys; pasted content must not toggle permissions or approve a redirect.
+- Queue count excludes active work; processing includes boot and complete queue settlement. Keep activity separate from scrollback and never replay uncertain sends.
+- Bound overlay history (500 entries, 512K UTF-16 units total, 64K per entry) with explicit omission notices; never truncate persisted history.
+- Keep published version 1.4.0 until a subsequent release is approved; UX changes are documented as unreleased.
 
 ## Validation
 - Run `npm test` for full validation.

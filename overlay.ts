@@ -1,5 +1,8 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { Input, CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type KeybindingsManager, type TUI } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type KeybindingsManager, type TUI } from "@earendil-works/pi-tui";
+import { JarvisDraftEditor } from "./draft-editor.js";
+import { renderJarvisHeader, renderJarvisActivity } from "./overlay-layout.js";
+import { TranscriptViewport } from "./transcript-viewport.js";
 
 export interface JarvisDisplayEntry {
 	kind: "user" | "assistant" | "tool" | "system" | "status";
@@ -9,6 +12,10 @@ export interface JarvisDisplayEntry {
 export interface JarvisOverlayView {
 	isReady(): boolean;
 	isStreaming(): boolean;
+	/** Waiting inputs only, excluding the active request. */
+	getQueuedMessageCount?(): number;
+	/** Whole queue operation, including startup and local side commands. */
+	getIsProcessing?(): boolean;
 	getModelLabel(): string;
 	getModelModeLabel(): string;
 	getMainStatusLabel(): string;
@@ -53,19 +60,32 @@ export interface JarvisOverlaySnapshot {
 	pendingConfirmation?: JarvisPendingConfirmation;
 }
 
-interface TranscriptBlock {
-	lines: string[];
-	preserveHeaderWhenClipped: boolean;
-}
-
 export class JarvisOverlayBridge {
 	private requestRender?: () => void;
 	private statuses = new Map<string, string>();
 	private notifications: NotificationItem[] = [];
 	private workingMessage?: string;
 	private pendingConfirmation?: PendingConfirmationRecord;
+	private draft = "";
+	private threadGeneration = 0;
+	private transcriptGeneration = 0;
+
+	getDraft(): string { return this.draft; }
+	getThreadGeneration(): number { return this.threadGeneration; }
+	getTranscriptGeneration(): number { return this.transcriptGeneration; }
+	/** Branch navigation resets scroll without discarding an unrelated draft. */
+	resetTranscript(): void { this.transcriptGeneration += 1; this.emit(); }
+	setDraft(text: string): void { this.draft = text; }
+
+	dismissNotifications(): void {
+		this.notifications = [];
+		this.emit();
+	}
 
 	reset(): void {
+		this.threadGeneration += 1;
+		this.transcriptGeneration += 1;
+		this.draft = "";
 		this.statuses.clear();
 		this.notifications = [];
 		this.workingMessage = undefined;
@@ -178,12 +198,14 @@ export class JarvisOverlayBridge {
 
 export class JarvisOverlayComponent implements Component, Focusable {
 	focused = false;
-	private readonly input = new Input({ prompt: "" });
+	private input: JarvisDraftEditor;
 	private readonly maxHeightProvider: () => number;
 	private focusTarget: OverlayFocusTarget = "input";
-	private historyIndex = -1;
-	private historyDraft = "";
-	private historyEntries: string[] = [];
+	private expandedDetails = false;
+	private threadGeneration: number;
+	private transcriptGeneration: number;
+	private historySeeded = false;
+	private readonly viewport = new TranscriptViewport();
 	private disposed = false;
 	private releaseBridge?: () => boolean;
 	private confirmationToken?: object;
@@ -197,6 +219,10 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	private renderedColumns = 0;
 	private thinkingAnimationTick = 0;
 	private thinkingAnimationTimer?: NodeJS.Timeout;
+	private transcriptCacheWidth = -1;
+	private transcriptCache: Array<{ kind: JarvisDisplayEntry["kind"]; text: string; lines: string[] }> = [];
+	private transcriptLines: string[] = [];
+	private transcriptContinuationLabels: Array<string | undefined> = [];
 
 	constructor(
 		private readonly tui: TUI,
@@ -208,25 +234,63 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	) {
 		this.maxHeightProvider = () => Math.max(0, Math.min(this.tui.terminal.rows, Math.max(1, Math.floor(this.tui.terminal.rows * 0.78))));
 
-		this.input.onSubmit = (value) => {
-			const message = sanitizeInlineText(value).trim();
-			if (!message) {
-				return;
+		this.threadGeneration = bridge.getThreadGeneration();
+		this.transcriptGeneration = bridge.getTranscriptGeneration();
+		this.input = this.createEditor();
+	}
+
+	private createEditor(): JarvisDraftEditor {
+		const generation = this.bridge.getThreadGeneration();
+		const editor = new JarvisDraftEditor(this.tui, this.theme, {
+			onChange: (text) => {
+				if (!this.disposed && generation === this.bridge.getThreadGeneration()) this.bridge.setDraft(text);
+			},
+			onError: (message) => {
+				if (!this.disposed && generation === this.bridge.getThreadGeneration()) this.bridge.notify(message, "warning");
+			},
+			onSubmit: (message) => {
+				if (!message.trim() || this.disposed || generation !== this.bridge.getThreadGeneration()) return;
+				editor.addToHistory(message);
+				this.viewport.toLatest();
+				try {
+					void Promise.resolve(this.view.sendMessage(message)).catch((error: unknown) => {
+						if (!this.disposed && generation === this.bridge.getThreadGeneration()) this.bridge.notify(String(error), "error");
+					});
+				} catch (error) {
+					this.bridge.notify(String(error), "error");
+				}
+			},
+		}, this.bridge.getDraft());
+		this.historySeeded = this.view.isReady();
+		if (this.historySeeded) this.seedHistory(editor);
+		return editor;
+	}
+
+	private seedHistory(editor: JarvisDraftEditor): void {
+		for (const entry of this.view.getDisplayEntries().filter((entry) => entry.kind === "user").slice(-100)) editor.addToHistory(entry.text);
+	}
+
+	private syncThread(): void {
+		const transcriptGeneration = this.bridge.getTranscriptGeneration();
+		if (transcriptGeneration !== this.transcriptGeneration) {
+			this.transcriptGeneration = transcriptGeneration;
+			this.viewport.reset();
+			this.transcriptCacheWidth = -1;
+		}
+		const generation = this.bridge.getThreadGeneration();
+		if (generation === this.threadGeneration) {
+			if (!this.historySeeded && this.view.isReady()) {
+				this.seedHistory(this.input);
+				this.historySeeded = true;
 			}
-			this.input.setValue("");
-			this.historyIndex = -1;
-			this.historyDraft = "";
-			try {
-				void Promise.resolve(this.view.sendMessage(message)).catch((error: unknown) => {
-					if (!this.disposed) this.bridge.notify(String(error), "error");
-				});
-			} catch (error) {
-				this.bridge.notify(String(error), "error");
-			}
-		};
-		this.input.onEscape = () => {
-			this.dispose();
-		};
+			return;
+		}
+		const previousInput = this.input;
+		this.threadGeneration = generation;
+		this.input = this.createEditor();
+		this.input.inheritPasteDrain(previousInput);
+		previousInput.dispose();
+		this.viewport.reset();
 	}
 
 	attachBridge(): void {
@@ -236,8 +300,9 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
-		if (this.disposed || isKeyRelease(data)) return;
+		if (this.disposed) return;
 		try {
+			this.syncThread();
 			this.handleKey(data);
 		} finally {
 			this.input.invalidate();
@@ -247,7 +312,13 @@ export class JarvisOverlayComponent implements Component, Focusable {
 
 	private handleKey(data: string): void {
 		const kb = this.keybindings;
-		if (this.bridge.hasPendingConfirmation()) {
+		const hasConfirmation = this.bridge.hasPendingConfirmation();
+		if (this.input.handlePasteInput(data, hasConfirmation)) {
+			if (!hasConfirmation) this.focusTarget = "input";
+			return;
+		}
+		if (isKeyRelease(data)) return;
+		if (hasConfirmation) {
 			if (matchesKey(data, "y") || matchesKey(data, "shift+y")) {
 				if (this.focused && this.confirmationCanApprove && this.confirmationToken === this.bridge.getConfirmationToken()
 					&& this.renderedRows === this.tui.terminal.rows && this.renderedColumns === this.tui.terminal.columns) {
@@ -273,6 +344,26 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			this.dispose();
 			return;
 		}
+		if (matchesKey(data, "ctrl+o")) {
+			this.expandedDetails = !this.expandedDetails;
+			return;
+		}
+		if (matchesKey(data, "ctrl+l")) {
+			this.bridge.dismissNotifications();
+			return;
+		}
+		if (matchesKey(data, "ctrl+end")) {
+			this.viewport.toLatest();
+			return;
+		}
+		if (kb.matches(data, "tui.editor.pageUp")) {
+			this.viewport.pageUp();
+			return;
+		}
+		if (kb.matches(data, "tui.editor.pageDown")) {
+			this.viewport.pageDown();
+			return;
+		}
 		if (matchesKey(data, "shift+tab")) {
 			this.cycleFocus(-1);
 			return;
@@ -287,42 +378,12 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		}
 		if (this.focusTarget !== "input") return;
 
-		const up = kb.matches(data, "tui.editor.historyPrevious") || kb.matches(data, "tui.editor.cursorUp");
-		const down = kb.matches(data, "tui.editor.historyNext") || kb.matches(data, "tui.editor.cursorDown");
-		if (up || down) {
-			const entries = this.view.getDisplayEntries().filter((e) => e.kind === "user").map((e) => sanitizeInlineText(e.text));
-			if (entries.length !== this.historyEntries.length || entries.some((text, i) => text !== this.historyEntries[i])) {
-				if (this.historyIndex !== -1) this.input.setValue(this.historyDraft);
-				this.historyIndex = -1;
-				this.historyEntries = entries;
-			}
-			if (entries.length === 0) return;
-			if (up) {
-				if (this.historyIndex === -1) {
-					this.historyDraft = this.input.getValue();
-					this.historyIndex = entries.length - 1;
-				} else {
-					this.historyIndex = Math.max(0, this.historyIndex - 1);
-				}
-				this.input.setValue(entries[this.historyIndex]!);
-			} else if (this.historyIndex !== -1) {
-				this.historyIndex++;
-				if (this.historyIndex >= entries.length) {
-					this.historyIndex = -1;
-					this.input.setValue(this.historyDraft);
-				} else {
-					this.input.setValue(entries[this.historyIndex]!);
-				}
-			}
-			return;
-		}
-		const before = this.input.getValue();
 		this.input.handleInput(data);
-		if (this.input.getValue() !== before) this.historyIndex = -1;
 	}
 
 	render(width: number): string[] {
 		if (this.disposed) return [];
+		this.syncThread();
 		width = Math.max(0, Math.floor(width));
 		const maxHeight = this.maxHeightProvider();
 		const snapshot = this.bridge.snapshot();
@@ -337,42 +398,61 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		}
 		if (width < 5 || maxHeight < 3) {
 			this.stopThinkingAnimation();
-			return [truncateToWidth(hasConfirmation ? "Enlarge to review; Esc cancel" : this.renderInputLine(width), width, "", true)];
+			return hasConfirmation ? [truncateToWidth("Enlarge to review; Esc cancel", width, "", true)] : this.renderInputLines(width, 1);
 		}
 		const innerWidth = width - 4;
 		const maxBodyLines = maxHeight - 2;
-		let promptSectionLines: string[];
 		if (snapshot.pendingConfirmation) {
-			promptSectionLines = this.renderConfirmation(snapshot.pendingConfirmation, innerWidth, maxBodyLines);
-		} else {
-			promptSectionLines = [
-				this.sectionDivider("Prompt", innerWidth),
-				this.renderInputLine(innerWidth),
-				truncateToWidth(this.theme.fg("dim", `${this.keyLabel("tui.input.tab")} cycle • ${this.keyLabel("tui.input.submit")} send/toggle • space toggle • ${this.keyLabel("tui.select.cancel")} close`), innerWidth, "", true),
-			];
-			if (maxBodyLines === 1) promptSectionLines = [this.renderInputLine(innerWidth)];
-			else promptSectionLines = promptSectionLines.slice(-maxBodyLines);
+			this.stopThinkingAnimation();
+			return [this.borderTop(innerWidth),
+				...this.renderConfirmation(snapshot.pendingConfirmation, innerWidth, maxBodyLines).map((line) => this.row(line, innerWidth)),
+				this.borderBottom(innerWidth)];
 		}
-		let remainingLines = Math.max(0, maxBodyLines - promptSectionLines.length);
-		const header = this.renderHeader(innerWidth);
-		const topSections = remainingLines >= header.length ? header : remainingLines >= 2
-			? [...header.slice(0, remainingLines - 1), header[header.length - 1]!]
-			: header.slice(0, remainingLines);
-		remainingLines -= topSections.length;
-		const notificationLines = this.notificationLines(snapshot.notifications, innerWidth);
-		if (remainingLines > 0) {
-			const notices = notificationLines.slice(-remainingLines);
-			topSections.push(...notices);
-			remainingLines -= notices.length;
+
+		const inputLines = this.renderInputLines(innerWidth, Math.max(1, Math.min(5, Math.floor(maxBodyLines / 4))));
+		const footerLines = maxBodyLines >= 10 ? [
+			`${this.keyLabel("tui.input.submit")} send • ${this.keyLabel("tui.input.newLine")} newline • ${this.keyLabel("tui.input.tab")} access • ${this.keyLabel("tui.select.cancel")} close`,
+			snapshot.notifications.length ? "ctrl+l dismiss notice • ctrl+o details • ctrl+end live"
+				: `${this.keyLabel("tui.editor.pageUp")}/${this.keyLabel("tui.editor.pageDown")} scroll • ctrl+end live • ctrl+o details`,
+		] : maxBodyLines >= 3 ? [`${this.keyLabel("tui.input.submit")} send • ${this.keyLabel("tui.input.newLine")} newline • ${this.keyLabel("tui.select.cancel")} close`] : [];
+		const promptSection = [
+			...(maxBodyLines >= 7 ? [this.sectionDivider("Message", innerWidth)] : []),
+			...inputLines,
+			...footerLines.map((line) => truncateToWidth(this.theme.fg("dim", line), innerWidth, "", true)),
+		];
+		let remaining = Math.max(0, maxBodyLines - promptSection.length);
+		const header = renderJarvisHeader(this.theme, this.view, innerWidth, {
+			expanded: this.expandedDetails, focusTarget: this.focusTarget, focused: this.focused,
+		});
+		// Keep a transcript row on normal terminals; keep the focused access
+		// control available even on short ones. Details never consume the editor.
+		const headerBudget = Math.min(header.length, Math.max(0, remaining - (remaining >= 5 ? 3 : 0)));
+		const top: string[] = headerBudget >= header.length ? header : headerBudget >= 2
+			? [...header.slice(0, headerBudget - 1), header[header.length - 1]!]
+			: headerBudget === 1 ? [this.focusTarget === "input" ? header[0]! : header[header.length - 1]!] : [];
+		remaining -= top.length;
+		const active = Boolean(this.view.getIsProcessing?.() || this.view.isStreaming());
+		this.syncThinkingAnimation(active && remaining > 0);
+		if (remaining > 0) {
+			const icon = active ? ["◈", "◆", "◇", "✦"][this.thinkingAnimationTick % 4] + " " : "";
+			top.push(truncateToWidth(this.theme.fg("accent", icon) + renderJarvisActivity(this.theme, snapshot, this.view, innerWidth), innerWidth, "", true));
+			remaining -= 1;
 		}
-		this.syncThinkingAnimation(Boolean(!hasConfirmation && remainingLines > 1 && snapshot.workingMessage && this.view.isStreaming()));
-		if (remainingLines > 0) {
-			topSections.push(this.sectionDivider("Conversation", innerWidth));
-			topSections.push(...this.renderTranscript(innerWidth, remainingLines - 1, snapshot));
+		if (remaining > 2 && snapshot.notifications.length) {
+			const notices = this.notificationLines(snapshot.notifications, innerWidth);
+			const count = Math.min(this.expandedDetails ? 4 : 1, notices.length, remaining - 2);
+			const visibleNotices = notices.slice(0, count);
+			if (count < notices.length) visibleNotices[count - 1] = truncateToWidth(visibleNotices[count - 1]!, innerWidth - 1, "", true) + this.theme.fg("dim", "…");
+			top.push(...visibleNotices);
+			remaining -= count;
 		}
-		return [this.borderTop(innerWidth),
-			...[...topSections, ...promptSectionLines].slice(0, maxBodyLines).map((line) => this.row(line, innerWidth)),
-			this.borderBottom(innerWidth)];
+		if (remaining > 0) {
+			const transcript = this.renderTranscript(innerWidth, Math.max(0, remaining - 1), snapshot);
+			const position = this.viewport.getStatus();
+			const label = position.following ? "Conversation · live" : `History · ${position.hiddenBelow} lines below · ctrl+end live`;
+			top.push(this.sectionDivider(label, innerWidth), ...transcript);
+		}
+		return [this.borderTop(innerWidth), ...[...top, ...promptSection].slice(0, maxBodyLines).map((line) => this.row(line, innerWidth)), this.borderBottom(innerWidth)];
 	}
 
 	private renderConfirmation(confirmation: JarvisPendingConfirmation, innerWidth: number, budget: number): string[] {
@@ -410,6 +490,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 
 	invalidate(): void {
 		this.input.invalidate();
+		this.transcriptCacheWidth = -1;
 		this.confirmationCanApprove = false;
 	}
 
@@ -417,6 +498,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.input.focused = false;
+		this.input.dispose();
 		this.stopThinkingAnimation();
 		const ownsInteraction = this.releaseBridge?.() ?? true;
 		if (ownsInteraction) {
@@ -425,65 +507,51 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		}
 	}
 
-	private renderHeader(innerWidth: number): string[] {
-		const mainStatus = sanitizeInlineText(this.view.getMainStatusLabel());
-		const mainStatusColor = mainStatus === "busy" ? "warning" : "success";
-		const toolsToggle = this.renderToggle("Repo tools", this.view.isToolAccessEnabled(), this.focused && this.focusTarget === "tools");
-		const followUpToggle = this.renderToggle("Note main", this.view.isFollowUpToMainEnabled(), this.focused && this.focusTarget === "followUp");
-		const steerToggle = this.renderToggle("Redirect", this.view.isSteerToMainEnabled(), this.focused && this.focusTarget === "steer");
-		const mainModel = sanitizeInlineText(this.view.getMainModelLabel());
-		const sideModel = sanitizeInlineText(this.view.getModelLabel());
-		const modelMode = sanitizeInlineText(this.view.getModelModeLabel());
-		const focus = sanitizeInlineText(this.view.getMainFocusLabel());
-		const delta = sanitizeInlineText(this.view.getMainDeltaLabel());
-		const repoToolsDetail = sanitizeInlineText(this.view.getRepoToolsDetailLabel());
-		// Keep the active control visible first when a narrow row cannot fit all three.
-		const toggles = this.focusTarget === "followUp" ? [followUpToggle, steerToggle, toolsToggle]
-			: this.focusTarget === "steer" ? [steerToggle, toolsToggle, followUpToggle]
-				: [toolsToggle, followUpToggle, steerToggle];
-		return [
-			truncateToWidth(
-				`${this.theme.bold(this.theme.fg("accent", "Jarvis"))} ${this.theme.fg("muted", "·")} ${this.theme.fg("accent", "Main")} ${this.theme.fg(mainStatusColor, mainStatus)}`,
-				innerWidth,
-			),
-			truncateToWidth(this.theme.fg("muted", `Focus: ${focus}`), innerWidth, "", true),
-			truncateToWidth(this.theme.fg("muted", `Since last: ${delta}`), innerWidth, "", true),
-			truncateToWidth(this.theme.fg("muted", `Access: ${repoToolsDetail}`), innerWidth, "", true),
-			truncateToWidth(
-				`${this.theme.fg("muted", "Models:")} ${this.theme.fg("muted", `main ${mainModel}  ·  jarvis ${sideModel} (${modelMode})`)}` ,
-				innerWidth,
-				"",
-				true,
-			),
-			truncateToWidth(toggles.join("  "), innerWidth, "", true),
-		];
-	}
-
 	private renderTranscript(innerWidth: number, budget: number, snapshot: JarvisOverlaySnapshot): string[] {
-		if (budget <= 0) {
-			return [];
+		if (budget <= 0) return [];
+		const allEntries = [...this.view.getDisplayEntries(), ...snapshot.statuses.map((text): JarvisDisplayEntry => ({ kind: "status", text }))];
+		// Bound rendered history, not the persisted side transcript. The omitted
+		// prefix is explicit and discoverable when scrolling to the beginning.
+		const entries: JarvisDisplayEntry[] = [];
+		let remainingChars = 512 * 1024;
+		let omitted = allEntries.length > 500;
+		for (let i = allEntries.length - 1; i >= Math.max(0, allEntries.length - 500) && remainingChars > 0; i--) {
+			const entry = allEntries[i]!;
+			const limit = Math.min(64 * 1024, remainingChars);
+			const clipped = entry.text.length > limit;
+			const text = clipped ? `[Earlier text omitted from overlay]\n${entry.text.slice(-limit)}` : entry.text;
+			entries.unshift({ kind: entry.kind, text });
+			remainingChars -= Math.min(entry.text.length, limit);
+			omitted ||= clipped || (remainingChars === 0 && i > 0);
 		}
-
-		const blocks: TranscriptBlock[] = [];
-		const displayEntries = this.view.getDisplayEntries();
-		const showAnimatedThinkingFallback = Boolean(snapshot.workingMessage && this.view.isStreaming());
-		let previousKind: JarvisDisplayEntry["kind"] | undefined;
-		for (const entry of displayEntries) {
-			if (
-				previousKind !== undefined && previousKind !== entry.kind && previousKind !== "system" && entry.kind !== "system"
-			) {
-				blocks.push({ lines: [""], preserveHeaderWhenClipped: false });
+		if (omitted) entries.unshift({ kind: "status", text: "Older content omitted from this bounded overlay view; persisted session history is unchanged." });
+		const changed = this.transcriptCacheWidth !== innerWidth || entries.length !== this.transcriptCache.length
+			|| entries.some((entry, i) => entry.kind !== this.transcriptCache[i]?.kind || entry.text !== this.transcriptCache[i]?.text);
+		if (changed) {
+			if (this.transcriptCacheWidth !== innerWidth) this.transcriptCache = [];
+			this.transcriptCacheWidth = innerWidth;
+			this.transcriptLines = [];
+			this.transcriptContinuationLabels = [];
+			const cache: typeof this.transcriptCache = [];
+			const labels = { user: "User:", assistant: "Jarvis:", tool: "Tool:", status: "Note:", system: "" };
+			for (let i = 0; i < entries.length; i++) {
+				const entry = entries[i]!;
+				const previous = this.transcriptCache[i];
+				const block = previous?.kind === entry.kind && previous.text === entry.text ? previous.lines : this.renderEntry(entry, innerWidth);
+				cache.push({ ...entry, lines: block });
+				if (i > 0 && entries[i - 1]!.kind !== entry.kind) { this.transcriptLines.push(""); this.transcriptContinuationLabels.push(undefined); }
+				for (let j = 0; j < block.length; j++) {
+					this.transcriptLines.push(block[j]!);
+					this.transcriptContinuationLabels.push(j > 0 ? labels[entry.kind] || undefined : undefined);
+				}
 			}
-			blocks.push(this.createTranscriptBlock(this.renderEntry(entry, innerWidth), entry.kind !== "system"));
-			previousKind = entry.kind;
+			this.transcriptCache = cache;
 		}
-		if (showAnimatedThinkingFallback) {
-			blocks.push(this.createTranscriptBlock(this.renderAnimatedThinkingFallback(innerWidth, snapshot.workingMessage!), false));
-		}
-		for (const status of snapshot.statuses) {
-			blocks.push(this.createTranscriptBlock(this.wrapBlock(sanitizeOverlayDisplayText(status), innerWidth), false));
-		}
-		return this.clipTranscriptBlocks(blocks, budget);
+		const visible = this.viewport.render(this.transcriptLines, budget, innerWidth);
+		const start = this.viewport.getStatus().startLine;
+		const label = this.transcriptContinuationLabels[start];
+		if (label && visible.length) visible[0] = truncateToWidth(`${this.theme.fg("muted", label)} ${visible[0]!.trimStart()}`, innerWidth, "", true);
+		return visible;
 	}
 
 	private renderEntry(entry: JarvisDisplayEntry, innerWidth: number): string[] {
@@ -503,54 +571,20 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		}
 	}
 
-	private renderInputLine(innerWidth: number): string {
-		const prefix = innerWidth >= 2 ? `${this.theme.fg("accent", "›")} ` : "";
-		const safeValue = sanitizeInlineText(this.input.getValue());
-		if (safeValue !== this.input.getValue()) this.input.setValue(safeValue);
+	private renderInputLines(innerWidth: number, maxLines: number): string[] {
+		const prefix = innerWidth >= 3 ? `${this.theme.fg("accent", "›")} ` : "";
 		const inputWidth = Math.max(1, innerWidth - visibleWidth(prefix));
-		const rendered = this.input.render(inputWidth)[0] ?? "";
-		return truncateToWidth(prefix + rendered, innerWidth, "", true);
-	}
-
-	private createTranscriptBlock(lines: string[], preserveHeaderWhenClipped: boolean): TranscriptBlock {
-		return { lines, preserveHeaderWhenClipped };
-	}
-
-	private clipTranscriptBlocks(blocks: readonly TranscriptBlock[], budget: number): string[] {
-		const visible: string[] = [];
-		let remaining = budget;
-		for (let i = blocks.length - 1; i >= 0 && remaining > 0; i--) {
-			const block = blocks[i];
-			if (block.lines.length <= remaining) {
-				visible.unshift(...block.lines);
-				remaining -= block.lines.length;
-				continue;
-			}
-			visible.unshift(...this.clipTranscriptBlock(block, remaining));
-			break;
-		}
-		return visible;
-	}
-
-	private clipTranscriptBlock(block: TranscriptBlock, budget: number): string[] {
-		if (block.lines.length <= budget) {
-			return [...block.lines];
-		}
-		if (block.preserveHeaderWhenClipped && budget > 1) {
-			return [block.lines[0] ?? "", ...block.lines.slice(-(budget - 1))];
-		}
-		return block.lines.slice(-budget);
+		return this.input.render(inputWidth, maxLines).map((line, index) => truncateToWidth(
+			(index === 0 ? prefix : " ".repeat(visibleWidth(prefix))) + line, innerWidth, "", true,
+		));
 	}
 
 	private notificationLines(items: readonly NotificationItem[], innerWidth: number): string[] {
-		const recent = items.slice(-2);
-		const lines: string[] = [];
-		for (const item of recent) {
-			const color = item.type === "error" ? "error" : item.type === "warning" ? "warning" : "muted";
-			lines.push(this.sectionDivider("Notice", innerWidth));
-			lines.push(...this.wrapBlock(this.theme.fg(color, sanitizeOverlayDisplayText(item.message)), innerWidth));
-		}
-		return lines;
+		const item = items.at(-1);
+		if (!item) return [];
+		const color = item.type === "error" ? "error" : item.type === "warning" ? "warning" : "muted";
+		const label = item.type === "error" ? "Error" : item.type === "warning" ? "Warning" : "Notice";
+		return this.wrapBlock(this.theme.fg(color, `${label}: ${sanitizeOverlayDisplayText(item.message)}`), innerWidth);
 	}
 
 	private sectionDivider(label: string, innerWidth: number): string {
@@ -559,12 +593,6 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		const left = Math.floor(fillWidth / 2);
 		const right = fillWidth - left;
 		return truncateToWidth(this.theme.fg("borderMuted", `${"─".repeat(left)}${plain}${"─".repeat(right)}`), innerWidth, "", true);
-	}
-
-	private renderToggle(label: string, enabled: boolean, focused: boolean): string {
-		const text = `${label}: ${enabled ? "on" : "off"}`;
-		const rendered = this.theme.fg(enabled ? "success" : "muted", text);
-		return focused ? this.theme.bold(`[${rendered}]`) : rendered;
 	}
 
 	private keyLabel(action: Parameters<KeybindingsManager["getKeys"]>[0]): string {
@@ -598,6 +626,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 					this.thinkingAnimationTick += 1;
 					this.tui.requestRender();
 				}, 80);
+				this.thinkingAnimationTimer.unref?.();
 			}
 			return;
 		}
@@ -611,32 +640,6 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		clearInterval(this.thinkingAnimationTimer);
 		this.thinkingAnimationTimer = undefined;
 		this.thinkingAnimationTick = 0;
-	}
-
-	private renderAnimatedThinkingFallback(innerWidth: number, message: string): string[] {
-		const icons = ["◈", "◆", "◇", "✦", "✧", "✦"];
-		const icon = icons[this.thinkingAnimationTick % icons.length] ?? "◈";
-		const shimmerText = this.renderShimmeringThinkingText(sanitizeOverlayDisplayText(message));
-		return this.wrapBlock(`${this.theme.bold(this.theme.fg("accent", icon))} ${shimmerText}`, innerWidth);
-	}
-
-	private renderShimmeringThinkingText(text: string): string {
-		const chars = [...text];
-		if (chars.length === 0) {
-			return "";
-		}
-		const highlightIndex = this.thinkingAnimationTick % chars.length;
-		return chars
-			.map((char, index) => {
-				const distance = Math.abs(index - highlightIndex);
-				const color = distance === 0
-					? [232, 239, 247]
-					: distance === 1
-						? [171, 182, 198]
-						: [112, 122, 138];
-				return `\x1b[38;2;${color[0]};${color[1]};${color[2]}m${char}`;
-			})
-			.join("") + "\x1b[0m";
 	}
 
 	private wrapWithPrefix(prefix: string, text: string, innerWidth: number): string[] {
@@ -670,7 +673,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	}
 
 	private overlayBackground(text: string): string {
-		return `\x1b[48;2;24;28;36m${text}\x1b[0m`;
+		return typeof this.theme.bg === "function" ? this.theme.bg("customMessageBg", text) : text;
 	}
 }
 

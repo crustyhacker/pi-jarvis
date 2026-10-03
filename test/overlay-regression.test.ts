@@ -14,12 +14,12 @@ import {
 const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const plain = (lines: string[]) => lines.map(stripTerminalSequences).join("\n");
 
-function fixture(bridge = new JarvisOverlayBridge(), keybindings = getKeybindings()) {
+function fixture(bridge = new JarvisOverlayBridge(), keybindings = getKeybindings(), entries: JarvisDisplayEntry[] = []) {
 	const terminal = { rows: 40, columns: 120 };
 	let renders = 0;
 	let closes = 0;
 	const sent: string[] = [];
-	const state = { entries: [] as JarvisDisplayEntry[], streaming: false, tools: false, followUp: false, steer: false };
+	const state = { entries, streaming: false, tools: false, followUp: false, steer: false };
 	const host = { terminal, requestRender: () => { renders++; } } as unknown as TUI;
 	const view: JarvisOverlayView = {
 		isReady: () => true, isStreaming: () => state.streaming,
@@ -136,29 +136,27 @@ test("confirmation swallows ordinary input and Escape cancels without closing", 
 	assert.equal(f.closes(), 1);
 });
 
-test("history changes, shrinking, emptying and replacement preserve the draft without drifting indices", () => {
-	const f = fixture();
+test("native prompt history preserves drafts without indexing a changing transcript", () => {
+	const f = fixture(undefined, undefined, [{ kind: "user", text: "first" }, { kind: "user", text: "second" }]);
 	f.overlay.handleInput("draft");
-	f.state.entries = [{ kind: "user", text: "first" }, { kind: "user", text: "second" }];
+	f.overlay.render(80);
+	f.overlay.handleInput("\x01"); // beginning of first line enables native history
 	f.overlay.handleInput("\x1b[A");
-	assert.ok(plain(f.overlay.render(80)).includes("second"));
+	assert.equal(f.bridge.getDraft(), "second");
 	f.state.entries = [{ kind: "user", text: "replacement" }];
 	f.overlay.handleInput("\x1b[A");
-	assert.ok(plain(f.overlay.render(80)).includes("replacement"));
-	f.overlay.handleInput("\x1b[B");
-	assert.ok(plain(f.overlay.render(80)).includes("draft"));
-	f.overlay.handleInput("\x1b[A");
+	assert.equal(f.bridge.getDraft(), "first", "prompt recall is independent of transcript projection");
 	f.state.entries = [];
-	f.overlay.handleInput("\x1b[A");
-	assert.ok(plain(f.overlay.render(80)).includes("draft"));
-	f.state.entries = [{ kind: "user", text: "newest" }];
-	f.overlay.handleInput("\x1b[A");
-	f.state.entries.push({ kind: "user", text: "even newer" });
-	f.overlay.handleInput("\x1b[A");
-	assert.ok(plain(f.overlay.render(80)).includes("even newer"));
 	f.overlay.handleInput("\x1b[B");
+	assert.equal(f.bridge.getDraft(), "second");
+	f.overlay.handleInput("\x1b[B");
+	assert.equal(f.bridge.getDraft(), "draft");
 	f.overlay.handleInput("\r");
 	assert.deepEqual(f.sent, ["draft"]);
+	f.bridge.reset();
+	f.overlay.render(80);
+	f.overlay.handleInput("\x1b[A");
+	assert.equal(f.bridge.getDraft(), "", "new side threads cannot recall old prompts");
 	f.overlay.dispose();
 });
 
@@ -229,12 +227,13 @@ test("C1/CSI/OSC/DCS/control payloads cannot reach transcript, labels, confirmat
 	assert.ok(!/[\x7f-\x9f]/.test(lines.join("")));
 	f.overlay.handleInput("n");
 	assert.equal(await pending, false);
-	f.state.entries = [{ kind: "user", text: unsafe }];
-	f.overlay.handleInput("\x1b[A");
+	f.overlay.handleInput(`\x1b[200~${unsafe}\x1b[201~`);
 	lines = f.overlay.render(80);
 	assert.ok(!lines.join("").includes("hidden-url"));
+	assert.equal(f.bridge.getDraft(), "", "unsafe text must be rejected, not silently rewritten and sent");
+	f.overlay.handleInput("safe");
 	f.overlay.handleInput("\r");
-	assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(f.sent[0]!));
+	assert.deepEqual(f.sent, ["safe"]);
 	f.overlay.dispose();
 });
 
