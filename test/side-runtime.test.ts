@@ -109,6 +109,7 @@ async function fixture(run: (f: {
 		} });
 	} finally {
 		for (const runtime of runtimes) runtime.dispose();
+		await Promise.all(runtimes.map((runtime) => runtime.waitForDisposal()));
 		if (prior === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = prior;
 		rmSync(root, { recursive: true, force: true });
@@ -211,7 +212,7 @@ test("real side SDK prompts use host custom stream, isolated lazy cwd, and settl
 	}, (selected) => { calls++; return response(selected); });
 });
 
-test("declined trust applies to both SDK settings and loader; unsupported MCP never starts", async () => {
+test("declined trust protects SDK settings/resources/MCP; trusted MCP still requires opt-in", async () => {
 	await fixture(async ({ cwd, create }) => {
 		mkdirSync(join(cwd, ".pi", "prompts"), { recursive: true });
 		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ defaultThinkingLevel: "high", defaultTools: ["bash"] }));
@@ -229,14 +230,14 @@ test("declined trust applies to both SDK settings and loader; unsupported MCP ne
 		assert.equal(session.resourceLoader.getPrompts().prompts.some((p) => p.name === "protected"), false);
 		assert.deepEqual(session.getActiveToolNames().sort(), ["bash", "edit", "read", "write"]);
 		assert.equal(session.getAllTools().some((tool) => tool.name.includes("mcp")), false);
-		assert.match(runtime.getRepoToolsDetailLabel(), /MCP unavailable: adapter unsupported on Pi 1.0/);
+		assert.equal(runtime.getRepoToolsDetailLabel(), "local tools + native MCP");
 		assert.equal(existsSync(marker), false);
 		const trusted = sessionOf(await create({ projectTrusted: true }));
 		assert.equal(trusted.settingsManager.isProjectTrusted(), true);
 		assert.equal(trusted.settingsManager.getProjectSettings().defaultThinkingLevel, "high");
 		assert.equal(trusted.resourceLoader.getSystemPrompt(), "PROJECT SYSTEM MUST NOT LOAD");
 		assert.equal(trusted.resourceLoader.getPrompts().prompts.some((p) => p.name === "protected"), true);
-		assert.equal(existsSync(marker), false, "MCP stays intentionally disabled even in trusted projects");
+		assert.equal(existsSync(marker), false, "trusted project MCP must not start while Repo tools is off");
 	});
 });
 

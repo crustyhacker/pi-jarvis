@@ -2,7 +2,7 @@
 
 ## Project Scope
 - `pi-jarvis` is a Pi extension that opens a `/jarvis` side-conversation overlay.
-- Core runtime files: `index.ts`, `side-session.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
+- Core runtime files: `index.ts`, `side-session.ts`, `native-mcp.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
 - Current baseline: Pi 1.0.0 (`@earendil-works` packages), Node.js >=22.19.0. Older Pi hosts are not supported.
 
 ## Current `/jarvis-model` and `/jarvis-thinking` Behavior
@@ -20,7 +20,7 @@
 - `follow-main` thinking follows the main thinking level regardless of model selection, except xAI `/jarvis` models force thinking `off`.
 - `/compact`, `/tree`, and `/new` entered inside `/jarvis` operate on the isolated `/jarvis` side-session, not the main Pi session.
 - `Note main` and `Redirect` stay disabled when the active `/jarvis` model is incompatible with bridge tools.
-- Published package keeps Pi runtime packages as optional peers, not bundled dependencies. MCP adapter auto-loading is disabled: the published adapter does not declare Pi 1.0 support; native MCP is not enabled. Repo tools expose only read/bash/edit/write.
+- Published packages keep Pi runtime packages as optional peers, not bundled dependencies. Never load the legacy MCP adapter. Published 1.5.0 is local-only; unreleased source adds native MCP to Repo tools opt-in alongside read/bash/edit/write.
 - Physical models delegate to the host's public registry for auth and dispatch. Virtual/router models explicitly reject; do not access the registry's private backing runtime.
 - Side resources/settings honor `ctx.isProjectTrusted()`. Local tool execution and bridge delivery recheck live permissions; closing the overlay revokes them and cancels pending confirmations.
 - Use `agent_settled`, not `agent_end`, for final idle state. Main context must honor Pi context-edit/compaction projection.
@@ -34,14 +34,25 @@
 - Queue count excludes active work; processing includes boot and complete queue settlement. Keep activity separate from scrollback and never replay uncertain sends.
 - Bound overlay history (500 entries, 512K UTF-16 units total, 64K per entry) with explicit omission notices; never truncate persisted history.
 
+## Native MCP (Unreleased)
+- Use Pi's root-exported native factories, not private registry/runtime/transport internals. Jarvis owns separate configured-server connections; main-only extension registrations are not inherited.
+- No native startup/credential expansion while initially off. Respect project trust, enabled states, native tool exposures, and live Repo tools permission for direct/deferred/codemode/resource execution.
+- Revocation invalidates permission generations, hides owned tools, aborts calls and invokes owned native shutdown. Stale prepared tools and late registrations cannot regain access after re-enable.
+- Pi cancellation is best effort: already-started handshake/authentication/remote work may finish or time out after shutdown is requested. Do not promise immediate child teardown, rollback, or sandboxing.
+- Keep server administration in main Pi. Disable codemode model helpers (`models: false`); preserve independent Note main/Redirect gates and the overlay-owned bridge subscription.
+- Tests use temporary agent/workspace directories and local fixture servers only; never start real user MCP servers or resolve real credentials during validation.
+
 ## Git and Release Policy
 - Every commit must have an annotated git tag; this is mandatory. Release commits use `v<version>`; other commits use `commit-<short-sha>`.
-- Push each commit with its tag. Keep release versions synchronized across package metadata, lockfile, README, and changelog.
+- Push each commit with its tag, preferably atomically. Keep release versions synchronized across package metadata, lockfile, README, and changelog.
+- CI checks all reachable commits after policy baseline `92734df`; branch/PR jobs validate on Node 22.19.0 and 24. Only annotated matching `vX.Y.Z` tags create GitHub releases with verified npm archives. `commit-*` tags never release; npm publication remains manual.
+- Existing release assets must not be overwritten with differing bytes. See `RELEASING.md` for branch/tag protection and merge/fork constraints; CI alone cannot prevent administrator bypass.
 
 ## Validation
 - Run `npm test` for full validation.
 - Run `npm run build` before release packaging.
 - Run `npm run verify:release` to validate npm pack payload and release metadata expectations.
+- Run `npm run check:tags` after tagging commits to validate annotated-tag policy.
 
 ## Docs To Keep In Sync
 - `README.md`

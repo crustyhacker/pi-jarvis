@@ -2183,6 +2183,7 @@ async function withSideSessionRuntime(
 			await run(runtime, probe);
 		} finally {
 			runtime.dispose();
+			await runtime.waitForDisposal();
 		}
 		// Re-run helper users may swap permissions via this object reference
 		void permissions;
@@ -3443,20 +3444,21 @@ async function testSideSessionLocalToolsActivateWhenPermitted(): Promise<void> {
 	await withSideSessionRuntime({ toolAccessEnabled: true }, async (runtime, probe) => {
 		assert.ok(probe.session);
 		assert.deepEqual(probe.session.getActiveToolNames().sort(), ["bash", "edit", "read", "write"]);
-		assert.match(runtime.getRepoToolsDetailLabel(), /^local tools only \(MCP unavailable.*\)$/);
+		assert.equal(runtime.getRepoToolsDetailLabel(), "local tools + native MCP");
 	});
 }
 
-async function testSideSessionMcpExplicitlyUnavailable(): Promise<void> {
+async function testSideSessionNativeMcpDoesNotLoadLegacyAdapter(): Promise<void> {
 	await withSideSessionRuntime({ toolAccessEnabled: true }, async (runtime, probe) => {
 		assert.ok(probe.session);
-		assert.ok(!probe.session.getAllTools().some((tool) => tool.name === "mcp"), "no adapter/native MCP tool is loaded by /jarvis");
+		assert.ok(!probe.session.getAllTools().some((tool) => tool.name === "mcp"), "native integration never registers the legacy adapter's mcp tool");
 		runtime.setToolAccessEnabled(false);
 		assert.deepEqual(probe.session.getActiveToolNames(), []);
 		assert.equal(runtime.getRepoToolsDetailLabel(), "repo tools off");
 		runtime.setToolAccessEnabled(true);
+		await runtime.waitForToolAccessChange();
 		assert.ok(!probe.session.getActiveToolNames().includes("mcp"));
-		assert.match(runtime.getRepoToolsDetailLabel(), /^local tools only \(MCP unavailable.*\)$/);
+		assert.equal(runtime.getRepoToolsDetailLabel(), "local tools + native MCP");
 	});
 }
 
@@ -4126,7 +4128,7 @@ const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
 	["testBuildMainSessionContextPassedValidationWaitsForUserWithoutCompletionSignal", testBuildMainSessionContextPassedValidationWaitsForUserWithoutCompletionSignal],
 	["testSideSessionToolWhitelist", testSideSessionToolWhitelist],
 	["testSideSessionLocalToolsActivateWhenPermitted", testSideSessionLocalToolsActivateWhenPermitted],
-	["testSideSessionMcpExplicitlyUnavailable", testSideSessionMcpExplicitlyUnavailable],
+	["testSideSessionNativeMcpDoesNotLoadLegacyAdapter", testSideSessionNativeMcpDoesNotLoadLegacyAdapter],
 	["testSideSessionBridgeToolsActivateWhenPermitted", testSideSessionBridgeToolsActivateWhenPermitted],
 	["testFollowUpToolPermissionGating", testFollowUpToolPermissionGating],
 	["testSteerToolPermissionAndConfirmGating", testSteerToolPermissionAndConfirmGating],

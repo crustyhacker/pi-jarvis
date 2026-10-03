@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [Unreleased]
+
+### Added
+- Native Pi MCP in the isolated side-session, sharing the explicit Repo tools opt-in; direct, deferred, codemode, and resource calls use live permission and lifetime checks.
+- Fresh MCP permission generations, guarded late registrations, cancellation signals, and native shutdown requests on disable or disposal. No MCP configuration/credential expansion or connections start while initially disabled.
+- GitHub Actions for validation, annotated-tag policy checks, and release-tag packaging. Only matching annotated `vX.Y.Z` tags create GitHub releases; npm publishing remains manual.
+- Deterministic local MCP integration fixtures and release-automation regression tests, plus `RELEASING.md` and `npm run check:tags`.
+
+### Safety and limitations
+- Jarvis uses its own MCP connections to configured servers; it does not take ownership of the main session's connections. Project MCP configuration honors project trust, and server administration stays in main Pi.
+- Revocation blocks new Jarvis executions and requests cancellation; already-started native handshakes, authentication refreshes, or remote operations can finish or time out under Pi's lifecycle. Cancellation is not immediate teardown, rollback, or a sandbox.
+- Codemode model helpers are disabled; this integration does not add classifier/image-model dispatch or restore the legacy MCP adapter.
+- CI checks report tag-policy violations; enforcing protected branches/tags still requires repository rules. Historical commits through the 1.5.0 release are the policy baseline.
+
 ## [1.5.0] - 2026-10-03
 
 ### Added

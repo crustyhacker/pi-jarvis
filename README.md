@@ -120,7 +120,7 @@ pi install npm:pi-jarvis
 
 This package is meant to run **inside a Pi installation** that already provides the Pi runtime packages. Those host packages are declared as optional peers so npm does not install a second copy of the full Pi/AI provider stack just to add this extension.
 
-Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. This release supports local repository tools only: automatic `pi-mcp-adapter` loading is disabled because the published adapter does not declare Pi 1.0 support. Native MCP integration is not yet enabled; the overlay reports MCP as unavailable.
+Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Published **1.5.0** supports local repository tools only. The unreleased source adds native Pi MCP as described below; it does not load the legacy `pi-mcp-adapter` or bundle another Pi runtime.
 
 ### 2) Restart or reload Pi
 
@@ -218,7 +218,7 @@ The overlay header exposes three controls, all **off by default**:
 
 | Control | What it does | Safety model |
 |---|---|---|
-| `Repo tools` | Enables local `read`, `bash`, `edit`, and `write` | Explicit opt-in |
+| `Repo tools` | Enables local `read`, `bash`, `edit`, and `write`; unreleased source also enables configured native MCP | Explicit opt-in |
 | `Note main` | Sends a concise, non-interrupting note to the main session | Explicit opt-in |
 | `Redirect` | Sends a redirecting instruction to the main session | Explicit opt-in + per-send confirmation |
 
@@ -259,7 +259,7 @@ flowchart TD
     A --> D[Redirect off]
 
     B -->|enable| E[Jarvis may use local tools]
-    E --> H[MCP unavailable in this release]
+    E --> H[Native MCP in unreleased source]
 
     C -->|enable| I[Jarvis may send a quiet note to main]
     D -->|enable| J[Jarvis may request redirect sends]
@@ -345,7 +345,18 @@ This repository's validation baseline is **Pi 1.0.0**, using host-provided `@ear
 
 Physical models use the main host's public model registry for requests and credentials, including custom providers and runtime-only authentication. **Virtual/router models are not supported**: Pi's public extension registry does not expose session-aware virtual routing. Pin `/jarvis-model <provider/physical-model>` if the main session uses a virtual model.
 
-MCP is deliberately unavailable in this release. A future native integration needs execution-time permission checks for direct, deferred, and nested tool calls; installing the old adapter does not enable it.
+### Native MCP — unreleased
+
+Pi already provides MCP; Jarvis now opts its separate SDK session into Pi's native factories. The published 1.5.0 package remains local-tools-only until the next release.
+
+- **Repo tools is the opt-in for both local tools and native MCP.** While initially off, Jarvis does not start MCP connections or expand MCP configuration credentials/commands.
+- Enabling it starts **separate, side-owned connections** to configured servers from the active agent directory's `mcp.json` and, only when trusted, the project's `.pi/mcp.json`. Main-session connections are neither reused nor disconnected. Servers registered only by main-session extensions are not automatically inherited.
+- Native direct, deferred/tool-search, codemode, and resource tools keep Pi's configured exposure. Jarvis rechecks live permission and session lifetime for calls, including nested calls and previously prepared tool references. Server annotations are hints, not permission grants.
+- Disabling Repo tools, closing the overlay, or disposing the side runtime invalidates that permission generation, hides its tools, aborts owned call signals, and requests native disconnection. Re-enabling creates a fresh generation rather than reviving stale calls.
+- **Cancellation is best effort, not rollback or a sandbox.** Pi may allow already-started connection handshakes, authentication refresh/cleanup, or remote operations to finish or time out after revocation. A pending native handshake may outlive the shutdown request until Pi finishes or times it out.
+- Manage servers and OAuth sign-in in **main Pi** (`/mcp` or `pi mcp ...`), not through a side-session administration command. Jarvis does not register a side `/mcp` manager. Codemode's classifier/image-model helpers are disabled in the side session.
+
+Use narrowly scoped credentials and trust your configured servers. Enabling Repo tools permits the configured MCP capabilities; it is not a read-only grant.
 
 ---
 
@@ -380,6 +391,20 @@ Preview and verify the npm payload contract:
 ```bash
 npm run verify:release
 ```
+
+Check the mandatory annotated-tag policy for committed history:
+
+```bash
+npm run check:tags
+```
+
+### Release automation — unreleased
+
+GitHub Actions validate branch pushes and pull requests on Node 22.19.0 and 24. They check every reachable post-policy-baseline commit for an annotated tag and run tests, build, and package verification. Fork PR jobs are read-only.
+
+A matching annotated **`vX.Y.Z`** tag runs exact-tag validation and creates a GitHub release with the validated npm tarball. **`commit-*` tags do not release anything. npm publication stays manual**; no npm publishing token is configured. Existing assets are verified, never overwritten with different bytes.
+
+CI reports violations; protected-branch/tag rules must be configured separately for enforcement. See [RELEASING.md](https://github.com/crustyhacker/pi-jarvis/blob/main/RELEASING.md) for atomic tagged pushes, fork/merge handling, reruns, and manual npm publication.
 
 ---
 

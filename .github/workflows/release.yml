@@ -1,0 +1,89 @@
+name: GitHub release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event.deleted != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      EXPECTED_HEAD: ${{ github.sha }}
+      EVENT_AFTER: ${{ github.event.after }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # An immutable event SHA, not a moving branch or a re-resolved tag tip.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      # EVENT_AFTER may be the annotation OID or a normalized commit SHA;
+      # either must match this exact annotated tag. The bundle pins its OID.
+      - name: Verify annotated release tag, event object, metadata, and all new commits
+        run: node scripts/check-tags.mjs --head "$EXPECTED_HEAD" --release-tag "$RELEASE_TAG" --event-after "$EVENT_AFTER"
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run verify:release
+      - name: Pack and validate actual archive without lifecycle scripts
+        run: node scripts/prepare-release.mjs --tag "$RELEASE_TAG" --head "$EXPECTED_HEAD" --event-after "$EVENT_AFTER" --out-dir "$RUNNER_TEMP/release-bundle"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: bundle
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-bundle/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only this job can write. No dependency install/build runs with write permission.
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      EXPECTED_HEAD: ${{ github.sha }}
+      EVENT_AFTER: ${{ github.event.after }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          # Immutable validation output, also works when rerunning only publish.
+          artifact-ids: ${{ needs.validate.outputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-bundle/
+      - name: Create release or verify identical existing asset (never overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-github-release.mjs --tag "$RELEASE_TAG" --head "$EXPECTED_HEAD" --event-after "$EVENT_AFTER" --bundle-dir "$RUNNER_TEMP/release-bundle"
+
+# Only v* tag pushes release. There is no npm publish step or npm credential setup.
+# Annotated-object/name/target checks are structural authenticity, not signature
+# verification. Protect v* creation/update/deletion with a maintainer tag ruleset.

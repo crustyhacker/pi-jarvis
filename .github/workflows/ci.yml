@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.event.deleted != true
+    name: test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24']
+    env:
+      # Check real PR commits, never GitHub's synthetic merge commit.
+      POLICY_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.POLICY_HEAD }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Check every post-baseline commit and refresh tags
+        shell: bash
+        run: |
+          args=(--head "$POLICY_HEAD")
+          if [[ -n "$PR_HEAD_REPOSITORY" && "$PR_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            args+=(--fork "$PR_HEAD_REPOSITORY")
+          fi
+          node scripts/check-remote-tags.mjs "${args[@]}"
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run verify:release
+
+# commit-* tags deliberately trigger neither this branch/PR CI nor a release.
+# Push commits + annotated tags atomically. A bounded tag refresh handles reordered
+# deliveries; a tag-only push does not retroactively change a failed branch check.
+# Fork PRs have only read permissions, no repository secrets, and no target event.

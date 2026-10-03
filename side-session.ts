@@ -19,10 +19,12 @@ import {
 	type AgentSessionEvent,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type McpExtensionOptions,
 	type SessionEntry,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { JarvisOverlayBridge, type JarvisDisplayEntry } from "./overlay.js";
+import { NativeMcpController, stripMcpServerSection } from "./native-mcp.js";
 
 const SIDE_SYSTEM_PROMPT = `
 Authoritative /jarvis addendum:
@@ -50,6 +52,8 @@ type SideRuntimeCreateOptions = {
 	cwd: string;
 	/** The host trust decision. Missing means untrusted, never implicit approval. */
 	projectTrusted?: boolean;
+	/** Optional public factory options for isolated MCP fixtures. Defaults use Pi config/auth. */
+	nativeMcpOptions?: McpExtensionOptions;
 	modelRegistry: ExtensionContext["modelRegistry"];
 	model: Model<any> | undefined;
 	jarvisModelModeProvider?: () => "follow-main" | "pinned";
@@ -173,6 +177,8 @@ export class JarvisSideSessionRuntime {
 	private syncHostModels?: (model?: Model<any>) => Promise<void>;
 	private readonly lifetime = new AbortController();
 	private syncActiveTools?: () => void;
+	private nativeMcp?: NativeMcpController;
+	private disposal: Promise<void> = Promise.resolve();
 
 	private constructor(
 		bridge: JarvisOverlayBridge,
@@ -208,12 +214,26 @@ export class JarvisSideSessionRuntime {
 		if (!this.toolAccessEnabled) {
 			return "repo tools off";
 		}
-		return "local tools only (MCP unavailable: adapter unsupported on Pi 1.0; native integration not enabled)";
+		return "local tools + native MCP";
 	}
 
 	setToolAccessEnabled(enabled: boolean): void {
+		if (this.lifetime.signal.aborted) return;
 		this.toolAccessEnabled = enabled;
+		void this.nativeMcp?.setEnabled(enabled).catch((error) => {
+			if (!this.lifetime.signal.aborted) this.bridge.notify(`Side MCP error: ${error instanceof Error ? error.message : String(error)}`, "error");
+		});
 		this.syncActiveTools?.();
+	}
+
+	/** Wait for the permission transition, not native background handshakes. */
+	waitForToolAccessChange(): Promise<void> {
+		return this.nativeMcp?.waitForChange() ?? Promise.resolve();
+	}
+
+	/** Native shutdown is best-effort for already-started handshake/auth work. */
+	waitForDisposal(): Promise<void> {
+		return this.disposal;
 	}
 
 	getDisplayEntries(): JarvisDisplayEntry[] {
@@ -344,6 +364,10 @@ export class JarvisSideSessionRuntime {
 	}
 
 	dispose(): void {
+		// Retained public native shutdown handlers run BEFORE SDK ctx invalidation.
+		// AgentSession.dispose() does not emit session_shutdown on Pi 1.0.
+		this.disposal = this.nativeMcp?.dispose() ?? this.disposal;
+		void this.disposal.catch(() => {});
 		this.lifetime.abort();
 		this.ready = false;
 		this.toolAccessEnabled = false;
@@ -356,6 +380,10 @@ export class JarvisSideSessionRuntime {
 	}
 
 	private async initialize(options: SideRuntimeCreateOptions): Promise<void> {
+		const assertInitializing = () => {
+			if (this.lifetime.signal.aborted) throw new Error("/jarvis initialization cancelled: runtime was disposed.");
+		};
+		assertInitializing();
 		const sideSessionManager = SessionManager.open(options.sessionFile, dirname(options.sessionFile), options.cwd);
 		const persistedContext = sideSessionManager.buildSessionContext();
 		const hadExistingEntries = sideSessionManager.getEntries().length > 0;
@@ -368,9 +396,16 @@ export class JarvisSideSessionRuntime {
 			assertSupportedSideModel(options.modelRegistry.find(persistedContext.model.provider, persistedContext.model.modelId));
 		}
 		const { modelRuntime, sync } = await createSideModelRuntime(options.modelRegistry);
+		assertInitializing();
 		this.syncHostModels = sync;
 		const settingsManager = SettingsManager.create(options.cwd, getAgentDir(), {
 			projectTrusted: options.projectTrusted ?? false,
+		});
+		this.nativeMcp = new NativeMcpController({
+			hasToolAccess,
+			lifetimeSignal: this.lifetime.signal,
+			mcpOptions: options.nativeMcpOptions,
+			onChange: () => { this.syncActiveTools?.(); this.bridge.refresh(); },
 		});
 
 		const resourceLoader = new DefaultResourceLoader({
@@ -396,10 +431,14 @@ export class JarvisSideSessionRuntime {
 					options.sendSteerToMain,
 					hasConversationHistory,
 					this.lifetime.signal,
+					this.nativeMcp,
 				),
+				// Permission preflight is registered BEFORE native await/connect hooks.
+				this.nativeMcp.extensionFactory,
 			],
 		});
 		await resourceLoader.reload();
+		assertInitializing();
 
 		// Pi 1 executes tool batches in parallel by default. Serialize side tools
 		// and gate execute(), not only declarations/preflight: permissions may be
@@ -436,6 +475,10 @@ export class JarvisSideSessionRuntime {
 			resourceLoader,
 			sessionManager: sideSessionManager,
 		});
+		if (this.lifetime.signal.aborted) {
+			session.dispose();
+			assertInitializing();
+		}
 		this.session = session;
 
 		await session.bindExtensions({
@@ -444,12 +487,14 @@ export class JarvisSideSessionRuntime {
 				this.bridge.notify(`Side extension error: ${error.error}`, "error");
 			},
 		});
+		assertInitializing();
 		this.syncActiveTools?.();
 
 		if (options.model && hadExistingEntries) {
 			const previousModel = persistedContext.model;
 			if (!previousModel || previousModel.provider !== options.model.provider || previousModel.modelId !== options.model.id) {
 				await session.setModel(options.model);
+				assertInitializing();
 			}
 		}
 		if (options.thinkingLevel && persistedContext.thinkingLevel !== options.thinkingLevel) {
@@ -643,6 +688,7 @@ function createSideExtensionFactory(
 	sendSteerToMain: SideRuntimeCreateOptions["sendSteerToMain"],
 	hasConversationHistory?: SideRuntimeCreateOptions["hasConversationHistory"],
 	lifetimeSignal?: AbortSignal,
+	nativeMcp?: Pick<NativeMcpController, "getActiveToolNames" | "isToolAvailable">,
 ) {
 	let previousMainContext: MainSessionContextPayload | undefined;
 	const followUpToolName = "jarvis_send_follow_up_to_main";
@@ -681,7 +727,7 @@ function createSideExtensionFactory(
 	];
 	const getMainAgentName = () => extractPrimaryAssistantName(getMainSystemPrompt());
 	const getInheritedMainSystemPrompt = () =>
-		stripInheritedSections(getMainSystemPrompt().trim(), inheritedSectionsToStrip)
+		stripInheritedSections(stripMcpServerSection(getMainSystemPrompt()), inheritedSectionsToStrip)
 			.split(/\r?\n/)
 			.filter((line) => !inheritedLineBlocklist.some((pattern) => pattern.test(line)))
 			.map((line) =>
@@ -727,7 +773,7 @@ function createSideExtensionFactory(
 		const permissions = getCommunicationPermissions();
 		const activeToolNames: string[] = [];
 		if (hasToolAccess()) {
-			activeToolNames.push(...OPTIONAL_SIDE_TOOL_NAMES);
+			activeToolNames.push(...OPTIONAL_SIDE_TOOL_NAMES, ...(nativeMcp?.getActiveToolNames() ?? []));
 		}
 		if (permissions.allowFollowUpToMain) {
 			activeToolNames.push(followUpToolName);
@@ -740,7 +786,7 @@ function createSideExtensionFactory(
 	};
 	const getToolAccessPrompt = () =>
 		hasToolAccess()
-			? "Local /jarvis tool access for this turn:\n- Repo and system tools are enabled right now. You may use read, bash, edit, and write if those tools are active. MCP is unavailable: the legacy adapter is unsupported on Pi 1.0 and native integration is not enabled."
+			? "Local /jarvis tool access for this turn:\n- Repo and system tools are enabled right now. You may use read, bash, edit, and write if those tools are active. Native Pi MCP shares this permission; use active direct tools, tool_search, or codemode as configured. MCP tools and resources belong to this isolated side session, not the main session. Use main Pi /mcp to manage server configuration and authentication."
 			: "Local /jarvis tool access for this turn:\n- Repo and system tools are disabled right now. Use the injected context and bridge tools only.";
 	const getCommunicationPrompt = () => {
 		const permissions = getCommunicationPermissions();
@@ -882,7 +928,7 @@ function createSideExtensionFactory(
 				if (!getCommunicationPermissions().allowFollowUpToMain) return { block: true, reason: "Main-session notes are disabled." };
 			} else if (event.toolName === steerToolName) {
 				if (!getCommunicationPermissions().allowSteerToMain) return { block: true, reason: "Main-session redirects are disabled." };
-			} else if (!hasToolAccess() || !OPTIONAL_SIDE_TOOL_NAMES.some((name) => name === event.toolName)) {
+			} else if (!hasToolAccess() || (!OPTIONAL_SIDE_TOOL_NAMES.some((name) => name === event.toolName) && !nativeMcp?.isToolAvailable(event.toolName))) {
 				return { block: true, reason: "/jarvis local tool is disabled or unsupported." };
 			}
 		});
