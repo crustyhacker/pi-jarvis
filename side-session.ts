@@ -1,21 +1,27 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
-import { createRequire } from "node:module";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { AssistantMessage, Model } from "@mariozechner/pi-ai";
+import type { AssistantMessage, Model, Provider, ModelsApiStreamOptions } from "@earendil-works/pi-ai";
 import type { MainSessionContextPayload } from "./main-context.js";
-import { Type } from "@mariozechner/pi-ai";
+import { InMemoryCredentialStore, Type } from "@earendil-works/pi-ai";
 import {
 	DefaultResourceLoader,
 	SessionManager,
+	SettingsManager,
+	ModelRuntime,
 	createAgentSession,
-	createCodingTools,
+	defineTool,
+	createReadToolDefinition,
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createWriteToolDefinition,
 	getAgentDir,
 	type AgentSessionEvent,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type SessionEntry,
-} from "@mariozechner/pi-coding-agent";
+	type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { JarvisOverlayBridge, type JarvisDisplayEntry } from "./overlay.js";
 
 const SIDE_SYSTEM_PROMPT = `
@@ -28,8 +34,7 @@ Authoritative /jarvis addendum:
 `.trim();
 
 const FRESH_THREAD_CONTEXT_NOTE = "You are in a fresh /jarvis thread. Keep the opening concise and conversational, then answer directly.";
-const OPTIONAL_SIDE_TOOL_NAMES = ["read", "bash", "edit", "write", "mcp"] as const;
-const require = createRequire(import.meta.url);
+const OPTIONAL_SIDE_TOOL_NAMES = ["read", "bash", "edit", "write"] as const;
 
 type SideSessionHandle = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
@@ -43,6 +48,8 @@ type SideSessionTreeNode = {
 type SideRuntimeCreateOptions = {
 	bridge: JarvisOverlayBridge;
 	cwd: string;
+	/** The host trust decision. Missing means untrusted, never implicit approval. */
+	projectTrusted?: boolean;
 	modelRegistry: ExtensionContext["modelRegistry"];
 	model: Model<any> | undefined;
 	jarvisModelModeProvider?: () => "follow-main" | "pinned";
@@ -56,12 +63,79 @@ type SideRuntimeCreateOptions = {
 		allowSteerToMain: boolean;
 	};
 	sendFollowUpToMain: (message: string) => void;
-	confirmSteerToMain: (message: string) => Promise<boolean>;
+	confirmSteerToMain: (message: string, signal?: AbortSignal) => Promise<boolean>;
 	sendSteerToMain: (message: string) => void;
 	hasConversationHistory?: () => boolean;
-	mcpExtensionPathProvider?: () => string | undefined;
 	themeProvider: () => ExtensionContext["ui"]["theme"];
 };
+
+/**
+ * Build an isolated SDK runtime using only the host registry's public facade.
+ * Catalog/auth reads stay on the host (including runtime-only credentials). All
+ * request dispatch delegates directly so auth, endpoint overrides and header
+ * transforms are assembled exactly once, by the host, not by two runtimes.
+ * Pi's registry does not expose virtual router definitions or resolveModel().
+ */
+export async function createSideModelRuntime(host: ExtensionContext["modelRegistry"]) {
+	const modelRuntime = await ModelRuntime.create({
+		credentials: new InMemoryCredentialStore(),
+		modelsPath: null,
+		refreshOnCreate: false,
+	});
+	const registered = new Set<string>();
+	const sync = async (selected?: Model<any>) => {
+		assertSupportedSideModel(selected);
+		const providerIds = new Set([
+			...modelRuntime.getProviders().map((provider) => provider.id),
+			...host.getAll().map((model) => model.provider),
+		]);
+		for (const id of providerIds) {
+			if (registered.has(id)) continue;
+			const provider: Provider = {
+				id,
+				name: host.getProviderDisplayName(id),
+				getModels: () => host.getAll().filter((model) => model.provider === id && model.api !== "pi-virtual"),
+				// Do not copy credentials into side storage; resolve them on the host.
+				auth: { apiKey: {
+					name: "Host session authentication",
+					check: async ({ signal }) => {
+						signal.throwIfAborted();
+						return host.getProviderAuthStatus(id).configured ? { type: "api_key" } : undefined;
+					},
+					resolve: async ({ signal }) => {
+						signal.throwIfAborted();
+						const auth = await host.getProviderAuth(id);
+						signal.throwIfAborted();
+						return auth;
+					},
+				} },
+				stream: (model, context, options) => host.stream<typeof model.api>(model, context, options as ModelsApiStreamOptions<typeof model.api> | undefined),
+				streamSimple: (model, context, options) => host.streamSimple(model, context, options),
+			};
+			modelRuntime.registerNativeProvider(provider);
+			registered.add(id);
+		}
+		await modelRuntime.refresh({ allowNetwork: false });
+	};
+	// Public request methods, intentionally delegated ahead of side preparation:
+	// otherwise host auth/header transforms would run after side transforms.
+	modelRuntime.stream = (model, context, options) => {
+		assertSupportedSideModel(model);
+		return host.stream(model, context, options);
+	};
+	modelRuntime.streamSimple = (model, context, options) => {
+		assertSupportedSideModel(model);
+		return host.streamSimple(model, context, options);
+	};
+	await sync();
+	return { modelRuntime, sync };
+}
+
+function assertSupportedSideModel(model: Model<any> | undefined): void {
+	if (model?.api === "pi-virtual") {
+		throw new Error(`/jarvis cannot use virtual model ${model.provider}/${model.id}: Pi's public host registry does not expose session-aware routing. Select a physical model.`);
+	}
+}
 
 export function getJarvisSessionDirectory(cwd: string, agentDir: string = getAgentDir()): string {
 	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
@@ -96,7 +170,8 @@ export class JarvisSideSessionRuntime {
 	private modelLabel = "model unavailable";
 	private hasConversationHistory = false;
 	private toolAccessEnabled = false;
-	private mcpAvailable = false;
+	private syncHostModels?: (model?: Model<any>) => Promise<void>;
+	private readonly lifetime = new AbortController();
 	private syncActiveTools?: () => void;
 
 	private constructor(
@@ -108,8 +183,13 @@ export class JarvisSideSessionRuntime {
 
 	static async create(options: SideRuntimeCreateOptions): Promise<JarvisSideSessionRuntime> {
 		const runtime = new JarvisSideSessionRuntime(options.bridge, options.themeProvider);
-		await runtime.initialize(options);
-		return runtime;
+		try {
+			await runtime.initialize(options);
+			return runtime;
+		} catch (error) {
+			runtime.dispose();
+			throw error;
+		}
 	}
 
 	isReady(): boolean {
@@ -128,7 +208,7 @@ export class JarvisSideSessionRuntime {
 		if (!this.toolAccessEnabled) {
 			return "repo tools off";
 		}
-		return this.mcpAvailable ? "local tools + MCP available" : "local tools only (MCP unavailable)";
+		return "local tools only (MCP unavailable: adapter unsupported on Pi 1.0; native integration not enabled)";
 	}
 
 	setToolAccessEnabled(enabled: boolean): void {
@@ -175,31 +255,38 @@ export class JarvisSideSessionRuntime {
 		if (!this.session) {
 			throw new Error("/jarvis session is not ready.");
 		}
+		const session = this.session;
 		this.pendingUserMessage = text;
-		if (this.session.isStreaming) {
-			await this.session.prompt(text, { streamingBehavior: "steer" });
-			return;
+		this.bridge.refresh();
+		try {
+			await session.prompt(text, session.isStreaming ? { streamingBehavior: "steer" } : undefined);
+		} catch (error) {
+			if (this.pendingUserMessage === text) this.pendingUserMessage = undefined;
+			if (this.session === session) this.bridge.refresh();
+			throw error;
 		}
-		await this.session.prompt(text);
 	}
 
 	addSystemMessage(text: string): void {
 		this.localStatusEntries.push({ kind: "system", text });
 		this.trimLocalStatusEntries();
+		this.bridge.refresh();
 	}
 
 	async compactJarvisContext(customInstructions?: string): Promise<void> {
 		if (!this.session) {
 			throw new Error("/jarvis session is not ready.");
 		}
+		const session = this.session;
 		this.bridge.setWorkingMessage("Compacting /jarvis…");
 		try {
-			const result = await this.session.compact(customInstructions);
+			const result = await session.compact(customInstructions);
+			if (this.session !== session) return;
 			this.refreshHistory();
 			const tokenLabel = Number.isFinite(result.tokensBefore) ? ` (${Math.round(result.tokensBefore / 1000)}k tokens summarized)` : "";
 			this.addSystemMessage(`Compacted /jarvis context${tokenLabel}.`);
 		} finally {
-			this.bridge.setWorkingMessage(undefined);
+			if (this.session === session) this.bridge.setWorkingMessage(undefined);
 		}
 	}
 
@@ -217,7 +304,9 @@ export class JarvisSideSessionRuntime {
 		if (!this.session) {
 			throw new Error("/jarvis session is not ready.");
 		}
-		const result = await this.session.navigateTree(targetId, options);
+		const session = this.session;
+		const result = await session.navigateTree(targetId, options);
+		if (this.session !== session) return;
 		if (result.cancelled) {
 			this.addSystemMessage("/jarvis tree navigation cancelled.");
 			return;
@@ -235,11 +324,15 @@ export class JarvisSideSessionRuntime {
 			return;
 		}
 
+		const session = this.session;
+		await this.syncHostModels?.(model);
+		if (this.session !== session || this.lifetime.signal.aborted) return;
 		if (model) {
 			const current = this.session.model;
 			const differs = !current || current.provider !== model.provider || current.id !== model.id;
 			if (differs) {
-				await this.session.setModel(model);
+				await session.setModel(model);
+				if (this.session !== session || this.lifetime.signal.aborted) return;
 			}
 		}
 
@@ -251,28 +344,40 @@ export class JarvisSideSessionRuntime {
 	}
 
 	dispose(): void {
+		this.lifetime.abort();
+		this.ready = false;
+		this.toolAccessEnabled = false;
+		this.syncActiveTools = undefined;
+		this.syncHostModels = undefined;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.session?.dispose();
 		this.session = undefined;
-		this.bridge.detach();
 	}
 
 	private async initialize(options: SideRuntimeCreateOptions): Promise<void> {
-		const sideSessionManager = SessionManager.open(options.sessionFile, dirname(options.sessionFile));
+		const sideSessionManager = SessionManager.open(options.sessionFile, dirname(options.sessionFile), options.cwd);
 		const persistedContext = sideSessionManager.buildSessionContext();
 		const hadExistingEntries = sideSessionManager.getEntries().length > 0;
 		this.hasConversationHistory = hadExistingEntries;
 		this.toolAccessEnabled = options.toolAccessProvider();
+		const hasToolAccess = () => this.toolAccessEnabled && options.toolAccessProvider() && !this.lifetime.signal.aborted;
 		const hasConversationHistory = () => this.hasConversationHistory || (options.hasConversationHistory?.() ?? false);
-		const mcpExtensionPath = options.mcpExtensionPathProvider ? options.mcpExtensionPathProvider() : resolveOptionalMcpExtensionPath();
-		this.mcpAvailable = false;
+		assertSupportedSideModel(options.model);
+		if (!options.model && persistedContext.model) {
+			assertSupportedSideModel(options.modelRegistry.find(persistedContext.model.provider, persistedContext.model.modelId));
+		}
+		const { modelRuntime, sync } = await createSideModelRuntime(options.modelRegistry);
+		this.syncHostModels = sync;
+		const settingsManager = SettingsManager.create(options.cwd, getAgentDir(), {
+			projectTrusted: options.projectTrusted ?? false,
+		});
 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: getAgentDir(),
 			noExtensions: true,
-			additionalExtensionPaths: mcpExtensionPath ? [mcpExtensionPath] : [],
+			settingsManager,
 			extensionFactories: [
 				createSideExtensionFactory(
 					options.systemPromptProvider,
@@ -281,7 +386,7 @@ export class JarvisSideSessionRuntime {
 						activeModelLabel: formatModelLabel(this.session?.model),
 						mode: options.jarvisModelModeProvider?.() ?? "follow-main",
 					}),
-					() => this.toolAccessEnabled,
+					hasToolAccess,
 					(refreshActiveTools) => {
 						this.syncActiveTools = refreshActiveTools;
 					},
@@ -290,15 +395,42 @@ export class JarvisSideSessionRuntime {
 					options.confirmSteerToMain,
 					options.sendSteerToMain,
 					hasConversationHistory,
+					this.lifetime.signal,
 				),
 			],
 		});
 		await resourceLoader.reload();
 
+		// Pi 1 executes tool batches in parallel by default. Serialize side tools
+		// and gate execute(), not only declarations/preflight: permissions may be
+		// revoked after a call was prepared but before it starts executing.
+		const localTools: ToolDefinition[] = [
+			defineTool(createReadToolDefinition(options.cwd, { autoResizeImages: settingsManager.getImageAutoResize() })),
+			defineTool(createBashToolDefinition(options.cwd, {
+				commandPrefix: settingsManager.getShellCommandPrefix(),
+				shellPath: settingsManager.getShellPath(),
+			})),
+			defineTool(createEditToolDefinition(options.cwd)),
+			defineTool(createWriteToolDefinition(options.cwd)),
+		];
+		const guardedLocalTools = localTools.map((tool): ToolDefinition => ({
+			...tool,
+			defaultActive: false,
+			executionMode: "sequential",
+			execute: async (id, params, signal, onUpdate, ctx) => {
+				if (!hasToolAccess() || signal?.aborted) {
+					throw new Error("/jarvis local tool access is disabled or cancelled.");
+				}
+				return tool.execute(id, params, signal, onUpdate, ctx);
+			},
+		}));
+
 		const { session, modelFallbackMessage } = await createAgentSession({
 			cwd: options.cwd,
 			agentDir: getAgentDir(),
-			modelRegistry: options.modelRegistry as any,
+			modelRuntime,
+			settingsManager,
+			customTools: guardedLocalTools,
 			model: options.model,
 			thinkingLevel: options.thinkingLevel as any,
 			resourceLoader,
@@ -312,7 +444,6 @@ export class JarvisSideSessionRuntime {
 				this.bridge.notify(`Side extension error: ${error.error}`, "error");
 			},
 		});
-		this.mcpAvailable = session.getAllTools().some((tool) => tool.name === "mcp");
 		this.syncActiveTools?.();
 
 		if (options.model && hadExistingEntries) {
@@ -347,14 +478,24 @@ export class JarvisSideSessionRuntime {
 				this.bridge.setWorkingMessage("Compacting /jarvis…");
 				break;
 			case "compaction_end":
-				this.bridge.setWorkingMessage(undefined);
+				if (!event.willRetry) this.bridge.setWorkingMessage(undefined);
 				if (event.aborted) {
 					this.addSystemMessage("/jarvis compaction cancelled.");
 				} else if (event.errorMessage) {
 					this.addSystemMessage(event.errorMessage);
 				}
 				break;
+			case "auto_retry_start":
+				this.bridge.setWorkingMessage(`Retrying /jarvis (${event.attempt}/${event.maxAttempts})…`);
+				break;
+			case "auto_retry_end":
+				if (!event.success && event.finalError) this.addSystemMessage(event.finalError);
+				break;
 			case "agent_end":
+				this.streamingAssistant = undefined;
+				this.pendingToolCalls.clear();
+				break;
+			case "agent_settled":
 				this.bridge.setWorkingMessage(undefined);
 				this.streamingAssistant = undefined;
 				this.pendingToolCalls.clear();
@@ -372,6 +513,7 @@ export class JarvisSideSessionRuntime {
 			case "message_end":
 				if (event.message.role === "assistant") {
 					this.streamingAssistant = undefined;
+					if (event.message.errorMessage) this.addSystemMessage(event.message.errorMessage);
 				}
 				break;
 			case "tool_execution_start":
@@ -402,6 +544,7 @@ export class JarvisSideSessionRuntime {
 			this.pendingUserMessage = undefined;
 		}
 		this.modelLabel = formatModelLabel(this.session.model);
+		this.bridge.refresh();
 	}
 
 	private trimLocalStatusEntries(): void {
@@ -499,6 +642,7 @@ function createSideExtensionFactory(
 	confirmSteerToMain: SideRuntimeCreateOptions["confirmSteerToMain"],
 	sendSteerToMain: SideRuntimeCreateOptions["sendSteerToMain"],
 	hasConversationHistory?: SideRuntimeCreateOptions["hasConversationHistory"],
+	lifetimeSignal?: AbortSignal,
 ) {
 	let previousMainContext: MainSessionContextPayload | undefined;
 	const followUpToolName = "jarvis_send_follow_up_to_main";
@@ -596,7 +740,7 @@ function createSideExtensionFactory(
 	};
 	const getToolAccessPrompt = () =>
 		hasToolAccess()
-			? "Local /jarvis tool access for this turn:\n- Repo and system tools are enabled right now. You may use read, bash, edit, write, and mcp if those tools are active."
+			? "Local /jarvis tool access for this turn:\n- Repo and system tools are enabled right now. You may use read, bash, edit, and write if those tools are active. MCP is unavailable: the legacy adapter is unsupported on Pi 1.0 and native integration is not enabled."
 			: "Local /jarvis tool access for this turn:\n- Repo and system tools are disabled right now. Use the injected context and bridge tools only.";
 	const getCommunicationPrompt = () => {
 		const permissions = getCommunicationPermissions();
@@ -676,10 +820,14 @@ function createSideExtensionFactory(
 				"This channel is non-interrupting and should not alter the current main turn.",
 			],
 			parameters: toolParameters,
-			async execute(_toolCallId, params) {
-				const message = params.message.trim();
+			async execute(_toolCallId, params, signal) {
+				if (signal?.aborted || lifetimeSignal?.aborted) return createToolResult("cancelled", "Cancelled main-session send.");
+				const message = params.message.replace(/\r\n?/g, "\n").trim();
 				if (!message) {
 					return createToolResult("blocked", "Cannot send an empty follow-up note to the main session.");
+				}
+				if (/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(message)) {
+					return createToolResult("blocked", "Main-session notes cannot contain terminal control characters.");
 				}
 				if (!getCommunicationPermissions().allowFollowUpToMain) {
 					return createToolResult("blocked", "Follow-up notes to the main session are disabled for /jarvis.");
@@ -699,21 +847,44 @@ function createSideExtensionFactory(
 				"Every redirect send needs explicit user confirmation before it is forwarded.",
 			],
 			parameters: toolParameters,
-			async execute(_toolCallId, params) {
-				const message = params.message.trim();
+			async execute(_toolCallId, params, signal) {
+				if (signal?.aborted || lifetimeSignal?.aborted) return createToolResult("cancelled", "Cancelled main-session send.");
+				const message = params.message.replace(/\r\n?/g, "\n").trim();
 				if (!message) {
 					return createToolResult("blocked", "Cannot send an empty steer message to the main session.");
+				}
+				if (/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(message)) {
+					return createToolResult("blocked", "Redirects cannot contain terminal control characters hidden by confirmation rendering.");
 				}
 				if (!getCommunicationPermissions().allowSteerToMain) {
 					return createToolResult("blocked", "Session redirection is disabled for /jarvis.");
 				}
-				const confirmed = await confirmSteerToMain(message);
+				const confirmationSignal = signal && lifetimeSignal
+					? AbortSignal.any([signal, lifetimeSignal]) : signal ?? lifetimeSignal;
+				const confirmed = await confirmWithCancellation(message, confirmSteerToMain, confirmationSignal);
 				if (!confirmed) {
 					return createToolResult("cancelled", "Cancelled steer request to the main session.");
+				}
+				if (confirmationSignal?.aborted) return createToolResult("cancelled", "Cancelled steer request to the main session.");
+				if (!getCommunicationPermissions().allowSteerToMain) {
+					return createToolResult("blocked", "Session redirection was disabled while confirmation was pending.");
 				}
 				sendSteerToMain(message);
 				return createToolResult("sent", "Sent steer message to the main session: " + message);
 			},
+		});
+
+		// Active declarations alone are not an execution boundary: already-issued
+		// calls (including nested calls) must recheck permissions at execution.
+		pi.on("tool_call", async (event) => {
+			if (lifetimeSignal?.aborted) return { block: true, reason: "/jarvis session is closed." };
+			if (event.toolName === followUpToolName) {
+				if (!getCommunicationPermissions().allowFollowUpToMain) return { block: true, reason: "Main-session notes are disabled." };
+			} else if (event.toolName === steerToolName) {
+				if (!getCommunicationPermissions().allowSteerToMain) return { block: true, reason: "Main-session redirects are disabled." };
+			} else if (!hasToolAccess() || !OPTIONAL_SIDE_TOOL_NAMES.some((name) => name === event.toolName)) {
+				return { block: true, reason: "/jarvis local tool is disabled or unsupported." };
+			}
 		});
 
 		pi.on("session_start", async () => {
@@ -761,6 +932,7 @@ function createSideUiContext(
 		onTerminalInput: () => () => {},
 		setStatus: (key: string, text: string | undefined) => bridge.setStatus(key, text),
 		setWorkingMessage: (message?: string) => bridge.setWorkingMessage(message),
+		setWorkingVisible: () => {},
 		setWorkingIndicator: () => {},
 		setHiddenThinkingLabel: () => {},
 		setWidget: () => {},
@@ -780,6 +952,7 @@ function createSideUiContext(
 		editor: async () => undefined,
 		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
+		getEditorComponent: () => undefined,
 		get theme() {
 			return themeProvider();
 		},
@@ -788,21 +961,26 @@ function createSideUiContext(
 		setTheme: () => ({ success: false, error: "Theme switching is unavailable inside /jarvis." }),
 		getToolsExpanded: () => false,
 		setToolsExpanded: () => {},
-	} as ExtensionContext["ui"];
+	};
 }
 
-function resolveOptionalMcpExtensionPath(): string | undefined {
-	for (const candidate of ["pi-mcp-adapter/index.ts", "pi-mcp-adapter/index.js"]) {
-		try {
-			const resolved = require.resolve(candidate);
-			if (existsSync(resolved)) {
-				return resolved;
-			}
-		} catch {
-			// Ignore optional dependency resolution failures.
-		}
+async function confirmWithCancellation(
+	message: string,
+	confirm: SideRuntimeCreateOptions["confirmSteerToMain"],
+	signal?: AbortSignal,
+): Promise<boolean> {
+	if (signal?.aborted) return false;
+	if (!signal) return confirm(message);
+	let onAbort: () => void = () => {};
+	const cancelled = new Promise<false>((resolve) => {
+		onAbort = () => resolve(false);
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+	try {
+		return await Promise.race([confirm(message, signal), cancelled]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
 	}
-	return undefined;
 }
 
 function extractPrimaryAssistantName(systemPrompt: string): string | undefined {

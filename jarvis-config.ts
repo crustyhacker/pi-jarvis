@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type JarvisModelSelectionScope = "global" | "project";
 
-export type JarvisThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type JarvisThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export type StoredJarvisModelSelection =
 	| { mode: "follow-main" }
@@ -34,18 +35,15 @@ export function loadJarvisModelSelectionSetting(
 	agentDir: string = getAgentDir(),
 ): StoredJarvisModelSelection | undefined {
 	const path = getJarvisConfigPath(cwd, scope, agentDir);
-	if (!existsSync(path)) {
-		return undefined;
-	}
-
-	const config = readJarvisConfigFile(path);
+	const config = readJarvisConfigFileIfPresent(path);
+	if (!config) return undefined;
 	if (config.modelSelection === undefined) {
 		return undefined;
 	}
 
 	const selection = parseStoredJarvisModelSelection(config.modelSelection);
 	if (!selection) {
-		throw new Error(`Invalid modelSelection in ${path}.`);
+		throw new MalformedJarvisConfigError(`Invalid modelSelection in ${path}.`);
 	}
 	return selection;
 }
@@ -76,18 +74,15 @@ export function loadJarvisThinkingSelectionSetting(
 	agentDir: string = getAgentDir(),
 ): StoredJarvisThinkingSelection | undefined {
 	const path = getJarvisConfigPath(cwd, scope, agentDir);
-	if (!existsSync(path)) {
-		return undefined;
-	}
-
-	const config = readJarvisConfigFile(path);
+	const config = readJarvisConfigFileIfPresent(path);
+	if (!config) return undefined;
 	if (config.thinkingSelection === undefined) {
 		return undefined;
 	}
 
 	const selection = parseStoredJarvisThinkingSelection(config.thinkingSelection);
 	if (!selection) {
-		throw new Error(`Invalid thinkingSelection in ${path}.`);
+		throw new MalformedJarvisConfigError(`Invalid thinkingSelection in ${path}.`);
 	}
 	return selection;
 }
@@ -119,17 +114,16 @@ function clearJarvisConfigSetting(
 	agentDir: string,
 ): void {
 	const path = getJarvisConfigPath(cwd, scope, agentDir);
-	if (!existsSync(path)) {
-		return;
-	}
-
-	let config: JarvisConfigFile;
+	let config: JarvisConfigFile | undefined;
 	try {
-		config = readJarvisConfigFile(path);
-	} catch {
+		config = readJarvisConfigFileIfPresent(path);
+	} catch (error) {
+		if (!(error instanceof MalformedJarvisConfigError)) throw error;
+		// Explicit clear intentionally recovers malformed JSON, not unreadable files.
 		rmSync(path, { force: true });
 		return;
 	}
+	if (!config) return;
 
 	delete config[setting];
 	if (Object.keys(config).length === 0) {
@@ -140,35 +134,73 @@ function clearJarvisConfigSetting(
 	writeJarvisConfigFile(path, config);
 }
 
+export class MalformedJarvisConfigError extends Error {}
+
+function readJarvisConfigFileIfPresent(path: string): JarvisConfigFile | undefined {
+	try {
+		return readJarvisConfigFile(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
 function readJarvisConfigFile(path: string): JarvisConfigFile {
+	// Keep I/O errors distinct from intentional malformed-content recovery.
+	const text = readFileSync(path, "utf-8");
 	let raw: unknown;
 	try {
-		raw = JSON.parse(readFileSync(path, "utf-8"));
+		raw = JSON.parse(text);
 	} catch (error) {
-		throw new Error(`Failed to parse ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		throw new MalformedJarvisConfigError(`Failed to parse ${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-		throw new Error(`Expected ${path} to contain a JSON object.`);
+		throw new MalformedJarvisConfigError(`Expected ${path} to contain a JSON object.`);
 	}
 
 	return { ...(raw as Record<string, unknown>) };
 }
 
 function readExistingJarvisConfigFileForWrite(path: string): JarvisConfigFile {
-	if (!existsSync(path)) {
-		return {};
-	}
 	try {
-		return readJarvisConfigFile(path);
-	} catch {
+		return readJarvisConfigFileIfPresent(path) ?? {};
+	} catch (error) {
+		if (!(error instanceof MalformedJarvisConfigError)) throw error;
 		return {};
 	}
 }
 
 function writeJarvisConfigFile(path: string, config: JarvisConfigFile): void {
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(config, null, "\t")}\n`, "utf-8");
+	let mode = 0o600;
+	try {
+		mode = statSync(path).mode & 0o777;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+	}
+	const temporaryPath = `${path}.${randomUUID()}.tmp`;
+	let fd: number | undefined;
+	let created = false;
+	try {
+		fd = openSync(temporaryPath, "wx", mode);
+		created = true;
+		writeFileSync(fd, `${JSON.stringify(config, null, "\t")}\n`, "utf-8");
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		// Same-directory rename means readers see either the old or complete new file.
+		renameSync(temporaryPath, path);
+		created = false;
+	} finally {
+		// Cleanup is best effort after a failed operation; never mask its error.
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch { /* Keep the original write/close failure. */ }
+		}
+		if (created) {
+			try { rmSync(temporaryPath, { force: true }); } catch { /* Keep the original failure. */ }
+		}
+	}
 }
 
 function parseStoredJarvisModelSelection(data: unknown): StoredJarvisModelSelection | undefined {
@@ -215,5 +247,5 @@ function parseStoredJarvisThinkingSelection(data: unknown): StoredJarvisThinking
 }
 
 function isJarvisThinkingLevel(value: unknown): value is JarvisThinkingLevel {
-	return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+	return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
 }

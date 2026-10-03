@@ -1,5 +1,5 @@
-import type { Theme } from "@mariozechner/pi-coding-agent";
-import { Input, CURSOR_MARKER, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type TUI } from "@mariozechner/pi-tui";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { Input, CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type KeybindingsManager, type TUI } from "@earendil-works/pi-tui";
 
 export interface JarvisDisplayEntry {
 	kind: "user" | "assistant" | "tool" | "system" | "status";
@@ -75,13 +75,27 @@ export class JarvisOverlayBridge {
 		pending?.resolve(false);
 	}
 
-	attach(requestRender: () => void): void {
+	attach(requestRender: () => void): () => boolean {
 		this.requestRender = requestRender;
 		this.emit();
+		// A stale overlay must never detach a newer interaction's subscriber.
+		return () => {
+			if (this.requestRender !== requestRender) return false;
+			this.requestRender = undefined;
+			return true;
+		};
+	}
+
+	getConfirmationToken(): object | undefined {
+		return this.pendingConfirmation;
 	}
 
 	detach(): void {
 		this.requestRender = undefined;
+	}
+
+	refresh(): void {
+		this.emit();
 	}
 
 	setStatus(key: string, value: string | undefined): void {
@@ -106,14 +120,23 @@ export class JarvisOverlayBridge {
 		this.emit();
 	}
 
-	requestConfirmation(title: string, message: string): Promise<boolean> {
+	requestConfirmation(title: string, message: string, signal?: AbortSignal): Promise<boolean> {
+		if (signal?.aborted) return Promise.resolve(false);
 		if (this.pendingConfirmation) {
 			const previous = this.pendingConfirmation;
 			this.pendingConfirmation = undefined;
 			previous.resolve(false);
 		}
 		return new Promise<boolean>((resolve) => {
-			this.pendingConfirmation = { title, message, resolve };
+			const record: PendingConfirmationRecord = { title, message, resolve: (value) => {
+				signal?.removeEventListener("abort", onAbort);
+				resolve(value);
+			} };
+			const onAbort = () => {
+				if (this.pendingConfirmation === record) this.resolveConfirmation(false);
+			};
+			this.pendingConfirmation = record;
+			signal?.addEventListener("abort", onAbort, { once: true });
 			this.emit();
 		});
 	}
@@ -155,11 +178,23 @@ export class JarvisOverlayBridge {
 
 export class JarvisOverlayComponent implements Component, Focusable {
 	focused = false;
-	private readonly input = new Input();
+	private readonly input = new Input({ prompt: "" });
 	private readonly maxHeightProvider: () => number;
 	private focusTarget: OverlayFocusTarget = "input";
 	private historyIndex = -1;
 	private historyDraft = "";
+	private historyEntries: string[] = [];
+	private disposed = false;
+	private releaseBridge?: () => boolean;
+	private confirmationToken?: object;
+	private confirmationLayout = "";
+	private confirmationOffset = 0;
+	private confirmationPageSize = 1;
+	private confirmationLineCount = 0;
+	private confirmationSeen = new Set<number>();
+	private confirmationCanApprove = false;
+	private renderedRows = 0;
+	private renderedColumns = 0;
 	private thinkingAnimationTick = 0;
 	private thinkingAnimationTimer?: NodeJS.Timeout;
 
@@ -169,179 +204,243 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		private readonly bridge: JarvisOverlayBridge,
 		private readonly view: JarvisOverlayView,
 		private readonly close: () => void,
+		private readonly keybindings: KeybindingsManager = getKeybindings(),
 	) {
-		this.maxHeightProvider = () => Math.max(3, Math.floor(this.tui.terminal.rows * 0.78));
+		this.maxHeightProvider = () => Math.max(0, Math.min(this.tui.terminal.rows, Math.max(1, Math.floor(this.tui.terminal.rows * 0.78))));
 
 		this.input.onSubmit = (value) => {
-			const message = value.trim();
+			const message = sanitizeInlineText(value).trim();
 			if (!message) {
 				return;
 			}
 			this.input.setValue("");
 			this.historyIndex = -1;
 			this.historyDraft = "";
-			void this.view.sendMessage(message);
+			try {
+				void Promise.resolve(this.view.sendMessage(message)).catch((error: unknown) => {
+					if (!this.disposed) this.bridge.notify(String(error), "error");
+				});
+			} catch (error) {
+				this.bridge.notify(String(error), "error");
+			}
 		};
 		this.input.onEscape = () => {
-			this.close();
+			this.dispose();
 		};
 	}
 
+	attachBridge(): void {
+		if (this.disposed) return;
+		this.releaseBridge?.();
+		this.releaseBridge = this.bridge.attach(() => this.tui.requestRender());
+	}
+
 	handleInput(data: string): void {
+		if (this.disposed || isKeyRelease(data)) return;
+		try {
+			this.handleKey(data);
+		} finally {
+			this.input.invalidate();
+			this.tui.requestRender();
+		}
+	}
+
+	private handleKey(data: string): void {
+		const kb = this.keybindings;
 		if (this.bridge.hasPendingConfirmation()) {
-			if (data === "y" || data === "Y") {
-				this.bridge.resolveConfirmation(true);
+			if (matchesKey(data, "y") || matchesKey(data, "shift+y")) {
+				if (this.focused && this.confirmationCanApprove && this.confirmationToken === this.bridge.getConfirmationToken()
+					&& this.renderedRows === this.tui.terminal.rows && this.renderedColumns === this.tui.terminal.columns) {
+					this.bridge.resolveConfirmation(true);
+				}
 				return;
 			}
-			if (data === "n" || data === "N" || matchesKey(data, "escape")) {
+			if (matchesKey(data, "n") || matchesKey(data, "shift+n") || kb.matches(data, "tui.select.cancel")) {
 				this.bridge.resolveConfirmation(false);
 				return;
 			}
-			// Swallow every other key while a confirmation is pending so the user
-			// cannot accidentally submit a message, move focus, or close the overlay
-			// without answering the prompt.
+			if (this.confirmationToken !== this.bridge.getConfirmationToken()) return;
+			if (kb.matches(data, "tui.select.pageDown") || kb.matches(data, "tui.select.down")) {
+				this.confirmationOffset = Math.min(Math.max(0, this.confirmationLineCount - this.confirmationPageSize),
+					this.confirmationOffset + (kb.matches(data, "tui.select.pageDown") ? this.confirmationPageSize : 1));
+			} else if (kb.matches(data, "tui.select.pageUp") || kb.matches(data, "tui.select.up")) {
+				this.confirmationOffset = Math.max(0, this.confirmationOffset - (kb.matches(data, "tui.select.pageUp") ? this.confirmationPageSize : 1));
+			}
+			// Other keys cannot submit input or toggle permissions while reviewing.
 			return;
 		}
-		if (matchesKey(data, "escape")) {
-			this.close();
-			return;
-		}
-		if (matchesKey(data, "tab")) {
-			this.cycleFocus(1);
+		if (kb.matches(data, "tui.select.cancel")) {
+			this.dispose();
 			return;
 		}
 		if (matchesKey(data, "shift+tab")) {
 			this.cycleFocus(-1);
 			return;
 		}
-		if (this.focusTarget !== "input" && (matchesKey(data, "space") || matchesKey(data, "enter"))) {
+		if (kb.matches(data, "tui.input.tab")) {
+			this.cycleFocus(1);
+			return;
+		}
+		if (this.focusTarget !== "input" && (matchesKey(data, "space") || kb.matches(data, "tui.input.submit"))) {
 			this.toggleFocusedControl();
 			return;
 		}
-		if (this.focusTarget !== "input") {
-			return;
-		}
+		if (this.focusTarget !== "input") return;
 
-		if (matchesKey(data, "up") || matchesKey(data, "down")) {
-			const entries = this.view.getDisplayEntries().filter((e) => e.kind === "user");
+		const up = kb.matches(data, "tui.editor.historyPrevious") || kb.matches(data, "tui.editor.cursorUp");
+		const down = kb.matches(data, "tui.editor.historyNext") || kb.matches(data, "tui.editor.cursorDown");
+		if (up || down) {
+			const entries = this.view.getDisplayEntries().filter((e) => e.kind === "user").map((e) => sanitizeInlineText(e.text));
+			if (entries.length !== this.historyEntries.length || entries.some((text, i) => text !== this.historyEntries[i])) {
+				if (this.historyIndex !== -1) this.input.setValue(this.historyDraft);
+				this.historyIndex = -1;
+				this.historyEntries = entries;
+			}
 			if (entries.length === 0) return;
-
-			if (matchesKey(data, "up")) {
+			if (up) {
 				if (this.historyIndex === -1) {
 					this.historyDraft = this.input.getValue();
 					this.historyIndex = entries.length - 1;
 				} else {
 					this.historyIndex = Math.max(0, this.historyIndex - 1);
 				}
-				this.input.setValue(entries[this.historyIndex].text);
-			} else {
-				if (this.historyIndex !== -1) {
-					this.historyIndex++;
-					if (this.historyIndex >= entries.length) {
-						this.historyIndex = -1;
-						this.input.setValue(this.historyDraft);
-					} else {
-						this.input.setValue(entries[this.historyIndex].text);
-					}
+				this.input.setValue(entries[this.historyIndex]!);
+			} else if (this.historyIndex !== -1) {
+				this.historyIndex++;
+				if (this.historyIndex >= entries.length) {
+					this.historyIndex = -1;
+					this.input.setValue(this.historyDraft);
+				} else {
+					this.input.setValue(entries[this.historyIndex]!);
 				}
 			}
 			return;
 		}
-
+		const before = this.input.getValue();
 		this.input.handleInput(data);
+		if (this.input.getValue() !== before) this.historyIndex = -1;
 	}
 
 	render(width: number): string[] {
-		const hasConfirmation = this.bridge.hasPendingConfirmation();
-		this.input.focused = this.focused && !hasConfirmation && this.focusTarget === "input";
-
+		if (this.disposed) return [];
+		width = Math.max(0, Math.floor(width));
 		const maxHeight = this.maxHeightProvider();
-		const innerWidth = Math.max(24, width - 4);
 		const snapshot = this.bridge.snapshot();
+		const hasConfirmation = Boolean(snapshot.pendingConfirmation);
+		this.input.focused = this.focused && !hasConfirmation && this.focusTarget === "input";
+		this.renderedRows = this.tui.terminal.rows;
+		this.renderedColumns = this.tui.terminal.columns;
+		this.confirmationCanApprove = false;
+		if (width === 0 || maxHeight === 0) {
+			this.stopThinkingAnimation();
+			return [];
+		}
+		if (width < 5 || maxHeight < 3) {
+			this.stopThinkingAnimation();
+			return [truncateToWidth(hasConfirmation ? "Enlarge to review; Esc cancel" : this.renderInputLine(width), width, "", true)];
+		}
+		const innerWidth = width - 4;
+		const maxBodyLines = maxHeight - 2;
+		let promptSectionLines: string[];
+		if (snapshot.pendingConfirmation) {
+			promptSectionLines = this.renderConfirmation(snapshot.pendingConfirmation, innerWidth, maxBodyLines);
+		} else {
+			promptSectionLines = [
+				this.sectionDivider("Prompt", innerWidth),
+				this.renderInputLine(innerWidth),
+				truncateToWidth(this.theme.fg("dim", `${this.keyLabel("tui.input.tab")} cycle • ${this.keyLabel("tui.input.submit")} send/toggle • space toggle • ${this.keyLabel("tui.select.cancel")} close`), innerWidth, "", true),
+			];
+			if (maxBodyLines === 1) promptSectionLines = [this.renderInputLine(innerWidth)];
+			else promptSectionLines = promptSectionLines.slice(-maxBodyLines);
+		}
+		let remainingLines = Math.max(0, maxBodyLines - promptSectionLines.length);
+		const header = this.renderHeader(innerWidth);
+		const topSections = remainingLines >= header.length ? header : remainingLines >= 2
+			? [...header.slice(0, remainingLines - 1), header[header.length - 1]!]
+			: header.slice(0, remainingLines);
+		remainingLines -= topSections.length;
 		const notificationLines = this.notificationLines(snapshot.notifications, innerWidth);
-		const headerLines = this.renderHeader(innerWidth);
-		const transcriptDivider = this.sectionDivider("Conversation", innerWidth);
-		const promptDivider = this.sectionDivider(hasConfirmation ? "Confirm" : "Prompt", innerWidth);
-		const confirmationLines = snapshot.pendingConfirmation
-			? this.renderConfirmation(snapshot.pendingConfirmation, innerWidth)
-			: undefined;
-		const inputLine = confirmationLines ? undefined : this.renderInputLine(innerWidth);
-		const footer = truncateToWidth(
-			`${this.theme.fg("dim", hasConfirmation ? "Y confirm • N/esc cancel" : "tab cycle • enter send/toggle • space toggle • esc close")}`,
-			innerWidth,
-		);
-
-		const promptSectionLines = [
-			promptDivider,
-			...(confirmationLines ?? (inputLine ? [inputLine] : [])),
-			footer,
-		];
-		const borderLines = 2;
-		const maxBodyLines = Math.max(1, maxHeight - borderLines);
-		const reservedBottomLines = promptSectionLines.length;
-		let remainingLines = Math.max(0, maxBodyLines - reservedBottomLines);
-
-		const topSections: string[] = [];
-		const visibleHeaderLines = headerLines.slice(0, remainingLines);
-		topSections.push(...visibleHeaderLines);
-		remainingLines -= visibleHeaderLines.length;
-
-		if (remainingLines > 0 && notificationLines.length > 0) {
-			const visibleNotificationLines = notificationLines.slice(-remainingLines);
-			topSections.push(...visibleNotificationLines);
-			remainingLines -= visibleNotificationLines.length;
-		}
-
 		if (remainingLines > 0) {
-			topSections.push(transcriptDivider);
-			remainingLines -= 1;
-			topSections.push(...this.renderTranscript(innerWidth, remainingLines, snapshot));
+			const notices = notificationLines.slice(-remainingLines);
+			topSections.push(...notices);
+			remainingLines -= notices.length;
 		}
-
-		const body = [...topSections, ...promptSectionLines].slice(0, maxBodyLines);
-
-		const lines: string[] = [];
-		lines.push(this.borderTop(innerWidth));
-		for (const line of body) {
-			lines.push(this.row(line, innerWidth));
+		this.syncThinkingAnimation(Boolean(!hasConfirmation && remainingLines > 1 && snapshot.workingMessage && this.view.isStreaming()));
+		if (remainingLines > 0) {
+			topSections.push(this.sectionDivider("Conversation", innerWidth));
+			topSections.push(...this.renderTranscript(innerWidth, remainingLines - 1, snapshot));
 		}
-		lines.push(this.borderBottom(innerWidth));
-		return lines;
+		return [this.borderTop(innerWidth),
+			...[...topSections, ...promptSectionLines].slice(0, maxBodyLines).map((line) => this.row(line, innerWidth)),
+			this.borderBottom(innerWidth)];
 	}
 
-	private renderConfirmation(confirmation: JarvisPendingConfirmation, innerWidth: number): string[] {
-		const lines: string[] = [];
-		lines.push(this.theme.bold(this.theme.fg("warning", `▶ ${sanitizeOverlayDisplayText(confirmation.title)}`)));
-		for (const rawLine of sanitizeOverlayDisplayText(confirmation.message).split("\n")) {
-			if (rawLine.length === 0) {
-				lines.push("");
-				continue;
-			}
-			lines.push(...this.wrapBlock(rawLine, innerWidth));
+	private renderConfirmation(confirmation: JarvisPendingConfirmation, innerWidth: number, budget: number): string[] {
+		const token = this.bridge.getConfirmationToken();
+		const layout = `${innerWidth}:${budget}`;
+		if (token !== this.confirmationToken || layout !== this.confirmationLayout) {
+			this.confirmationToken = token;
+			this.confirmationLayout = layout;
+			this.confirmationOffset = 0;
+			this.confirmationSeen.clear();
 		}
-		lines.push(this.theme.fg("muted", "Press Y to confirm, N or Esc to cancel."));
-		return lines;
+		// Wrap the title too, and do not silently truncate wide graphemes during review.
+		const content = [
+			...wrapTextWithAnsi(`▶ ${sanitizeInlineText(confirmation.title)}`, innerWidth),
+			...sanitizeOverlayDisplayText(confirmation.message).split("\n").flatMap((line) => line ? wrapTextWithAnsi(line, innerWidth) : [""]),
+		];
+		this.confirmationLineCount = content.length;
+		if (budget < 4 || innerWidth < 4 || content.some((line) => visibleWidth(line) > innerWidth)) {
+			return [truncateToWidth("Enlarge to review; Esc cancel", innerWidth, "", true)].slice(0, budget);
+		}
+		const allFits = content.length + 3 <= budget;
+		this.confirmationPageSize = allFits ? content.length : Math.max(1, budget - 3);
+		this.confirmationOffset = Math.min(this.confirmationOffset, Math.max(0, content.length - this.confirmationPageSize));
+		const visible = content.slice(this.confirmationOffset, this.confirmationOffset + this.confirmationPageSize);
+		for (let i = this.confirmationOffset; i < this.confirmationOffset + visible.length; i++) this.confirmationSeen.add(i);
+		this.confirmationCanApprove = this.confirmationSeen.size === content.length;
+		const cancelKey = this.keyLabel("tui.select.cancel");
+		const review = allFits ? `Press Y to confirm, N or ${cancelKey === "esc" ? "Esc" : cancelKey} to cancel.`
+			: `${this.confirmationOffset + 1}-${this.confirmationOffset + visible.length}/${content.length} • ${this.keyLabel("tui.select.pageUp")}/${this.keyLabel("tui.select.pageDown")} review`;
+		const hint = this.confirmationCanApprove ? `Y confirm • N/${cancelKey} cancel` : `Review all pages before Y • N/${cancelKey} cancel`;
+		return [this.sectionDivider("Confirm", innerWidth), ...visible,
+			truncateToWidth(this.theme.fg("muted", review), innerWidth, "", true),
+			truncateToWidth(this.theme.fg("dim", hint), innerWidth, "", true)];
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.input.invalidate();
+		this.confirmationCanApprove = false;
+	}
 
 	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.input.focused = false;
 		this.stopThinkingAnimation();
-		this.bridge.detach();
+		const ownsInteraction = this.releaseBridge?.() ?? true;
+		if (ownsInteraction) {
+			this.bridge.resolveConfirmation(false);
+			this.close();
+		}
 	}
 
 	private renderHeader(innerWidth: number): string[] {
-		const mainStatus = sanitizeOverlayDisplayText(this.view.getMainStatusLabel());
+		const mainStatus = sanitizeInlineText(this.view.getMainStatusLabel());
 		const mainStatusColor = mainStatus === "busy" ? "warning" : "success";
 		const toolsToggle = this.renderToggle("Repo tools", this.view.isToolAccessEnabled(), this.focused && this.focusTarget === "tools");
 		const followUpToggle = this.renderToggle("Note main", this.view.isFollowUpToMainEnabled(), this.focused && this.focusTarget === "followUp");
 		const steerToggle = this.renderToggle("Redirect", this.view.isSteerToMainEnabled(), this.focused && this.focusTarget === "steer");
-		const mainModel = sanitizeOverlayDisplayText(this.view.getMainModelLabel());
-		const sideModel = sanitizeOverlayDisplayText(this.view.getModelLabel());
-		const modelMode = sanitizeOverlayDisplayText(this.view.getModelModeLabel());
-		const focus = sanitizeOverlayDisplayText(this.view.getMainFocusLabel());
-		const delta = sanitizeOverlayDisplayText(this.view.getMainDeltaLabel());
-		const repoToolsDetail = sanitizeOverlayDisplayText(this.view.getRepoToolsDetailLabel());
+		const mainModel = sanitizeInlineText(this.view.getMainModelLabel());
+		const sideModel = sanitizeInlineText(this.view.getModelLabel());
+		const modelMode = sanitizeInlineText(this.view.getModelModeLabel());
+		const focus = sanitizeInlineText(this.view.getMainFocusLabel());
+		const delta = sanitizeInlineText(this.view.getMainDeltaLabel());
+		const repoToolsDetail = sanitizeInlineText(this.view.getRepoToolsDetailLabel());
+		// Keep the active control visible first when a narrow row cannot fit all three.
+		const toggles = this.focusTarget === "followUp" ? [followUpToggle, steerToggle, toolsToggle]
+			: this.focusTarget === "steer" ? [steerToggle, toolsToggle, followUpToggle]
+				: [toolsToggle, followUpToggle, steerToggle];
 		return [
 			truncateToWidth(
 				`${this.theme.bold(this.theme.fg("accent", "Jarvis"))} ${this.theme.fg("muted", "·")} ${this.theme.fg("accent", "Main")} ${this.theme.fg(mainStatusColor, mainStatus)}`,
@@ -356,20 +455,18 @@ export class JarvisOverlayComponent implements Component, Focusable {
 				"",
 				true,
 			),
-			truncateToWidth(`${toolsToggle}  ${followUpToggle}  ${steerToggle}`, innerWidth, "", true),
+			truncateToWidth(toggles.join("  "), innerWidth, "", true),
 		];
 	}
 
 	private renderTranscript(innerWidth: number, budget: number, snapshot: JarvisOverlaySnapshot): string[] {
 		if (budget <= 0) {
-			this.syncThinkingAnimation(Boolean(snapshot.workingMessage && this.view.isStreaming()));
 			return [];
 		}
 
 		const blocks: TranscriptBlock[] = [];
 		const displayEntries = this.view.getDisplayEntries();
 		const showAnimatedThinkingFallback = Boolean(snapshot.workingMessage && this.view.isStreaming());
-		this.syncThinkingAnimation(showAnimatedThinkingFallback);
 		let previousKind: JarvisDisplayEntry["kind"] | undefined;
 		for (const entry of displayEntries) {
 			if (
@@ -407,8 +504,10 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	}
 
 	private renderInputLine(innerWidth: number): string {
-		const prefix = `${this.theme.fg("accent", "›")} `;
-		const inputWidth = Math.max(8, innerWidth - 2);
+		const prefix = innerWidth >= 2 ? `${this.theme.fg("accent", "›")} ` : "";
+		const safeValue = sanitizeInlineText(this.input.getValue());
+		if (safeValue !== this.input.getValue()) this.input.setValue(safeValue);
+		const inputWidth = Math.max(1, innerWidth - visibleWidth(prefix));
 		const rendered = this.input.render(inputWidth)[0] ?? "";
 		return truncateToWidth(prefix + rendered, innerWidth, "", true);
 	}
@@ -466,6 +565,10 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		const text = `${label}: ${enabled ? "on" : "off"}`;
 		const rendered = this.theme.fg(enabled ? "success" : "muted", text);
 		return focused ? this.theme.bold(`[${rendered}]`) : rendered;
+	}
+
+	private keyLabel(action: Parameters<KeybindingsManager["getKeys"]>[0]): string {
+		return this.keybindings.getKeys(action)[0]?.replace("escape", "esc") ?? "unbound";
 	}
 
 	private cycleFocus(direction: 1 | -1): void {
@@ -551,6 +654,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	}
 
 	private row(content: string, innerWidth: number): string {
+		content = truncateToWidth(content, innerWidth, "", true);
 		const visible = visibleWidth(content);
 		const padded = content + " ".repeat(Math.max(0, innerWidth - visible));
 		const bg = this.overlayBackground(padded);
@@ -573,15 +677,20 @@ export class JarvisOverlayComponent implements Component, Focusable {
 function sanitizeOverlayDisplayText(text: string): string {
 	return text
 		.replace(/\r/g, "")
-		.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
-		.replace(/\x1b[P^_X][\s\S]*?\x1b\\/g, "")
-		.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
-		.replace(/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f]/g, "")
-		.replace(/\x1b/g, "");
+		.replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "")
+		.replace(/(?:\x1b[P^_X]|[\x90\x98\x9e\x9f])[\s\S]*?(?:\x1b\\|\x9c|$)/g, "")
+		.replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\x1b[ -/]*[@-~]/g, "")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
+		.replace(/\t/g, "    ");
 }
 
-export function attachOverlayBridge(component: JarvisOverlayComponent, bridge: JarvisOverlayBridge, tui: TUI): JarvisOverlayComponent {
-	bridge.attach(() => tui.requestRender());
+function sanitizeInlineText(text: string): string {
+	return sanitizeOverlayDisplayText(text).replace(/\n/g, " ");
+}
+
+export function attachOverlayBridge(component: JarvisOverlayComponent, _bridge: JarvisOverlayBridge, _tui: TUI): JarvisOverlayComponent {
+	component.attachBridge();
 	return component;
 }
 

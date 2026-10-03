@@ -1,4 +1,4 @@
-import { getLatestCompactionEntry, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { buildSessionProjection, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type BranchEntries = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
 type ContextUsageSnapshot = ReturnType<ExtensionContext["getContextUsage"]>;
@@ -60,6 +60,7 @@ export class MainSessionTracker {
 	private contextUsage?: ContextUsageSnapshot;
 	private branchEntries: BranchEntries = [];
 	private assistantStreaming = false;
+	private agentRunActive = false;
 	private anonymousToolCallCounter = 0;
 	private readonly activeToolCalls = new Map<string, ActiveToolCall>();
 
@@ -73,6 +74,7 @@ export class MainSessionTracker {
 		this.contextUsage = undefined;
 		this.branchEntries = [];
 		this.assistantStreaming = false;
+		this.agentRunActive = false;
 		this.anonymousToolCallCounter = 0;
 		this.activeToolCalls.clear();
 	}
@@ -81,17 +83,25 @@ export class MainSessionTracker {
 		this.modelLabel = modelLabel;
 		this.systemPrompt = ctx.getSystemPrompt();
 		this.contextUsage = ctx.getContextUsage();
-		this.busyState = ctx.isIdle() ? "idle" : "busy";
+		this.busyState = this.agentRunActive || !ctx.isIdle() ? "busy" : "idle";
 		this.hasPendingMessages = ctx.hasPendingMessages();
 		this.branchEntries = [...ctx.sessionManager.getBranch()];
 		this.refreshMessagesFromBranch();
 	}
 
 	handleAgentStart(): void {
+		this.agentRunActive = true;
 		this.busyState = "busy";
 	}
 
 	handleAgentEnd(): void {
+		// This ends only a low-level attempt; recovery and queued work may follow.
+		this.assistantStreaming = false;
+		this.activeToolCalls.clear();
+	}
+
+	handleAgentSettled(): void {
+		this.agentRunActive = false;
 		this.busyState = "idle";
 		this.assistantStreaming = false;
 		this.activeToolCalls.clear();
@@ -120,7 +130,7 @@ export class MainSessionTracker {
 		}
 
 		const toolCallId = typeof event.toolCallId === "string" && event.toolCallId.length > 0 ? event.toolCallId : undefined;
-		const key = toolCallId ?? `tool:${toolName}:${this.anonymousToolCallCounter++}`;
+		const key = toolCallId ? `id:${toolCallId}` : `tool:${toolName}:${this.anonymousToolCallCounter++}`;
 		this.activeToolCalls.set(key, {
 			key,
 			toolCallId,
@@ -132,17 +142,20 @@ export class MainSessionTracker {
 	handleToolExecutionEnd(event: ToolExecutionEndEventLike): void {
 		const toolCallId = typeof event.toolCallId === "string" && event.toolCallId.length > 0 ? event.toolCallId : undefined;
 		const toolName = typeof event.toolName === "string" && event.toolName.length > 0 ? event.toolName : undefined;
-		if (toolCallId && this.activeToolCalls.delete(toolCallId)) {
+		if (toolCallId && this.activeToolCalls.delete(`id:${toolCallId}`)) {
 			return;
 		}
 		if (!toolName) {
 			return;
 		}
-		for (const [key, value] of this.activeToolCalls.entries()) {
-			if (value.toolName === toolName) {
-				this.activeToolCalls.delete(key);
-				break;
-			}
+		// An unmatched explicit ID must never finish a different identified call.
+		// Older/partial events without a start ID can still be paired FIFO by name.
+		const candidates = [...this.activeToolCalls.values()].filter((call) => call.toolName === toolName);
+		const anonymous = candidates.find((call) => !call.toolCallId);
+		if (anonymous) {
+			this.activeToolCalls.delete(anonymous.key);
+		} else if (!toolCallId && candidates.length === 1) {
+			this.activeToolCalls.delete(candidates[0]!.key);
 		}
 	}
 
@@ -194,21 +207,10 @@ export class MainSessionTracker {
 		let sawLatestUserMessage = false;
 		let sawLatestAssistantMessage = false;
 
-		const latestCompaction = getLatestCompactionEntry([...this.branchEntries]);
-		const boundedEntries = (() => {
-			if (!latestCompaction) {
-				return this.branchEntries;
-			}
-			const firstKeptIndex = this.branchEntries.findIndex((entry: any) => entry.id === latestCompaction.firstKeptEntryId);
-			if (firstKeptIndex >= 0) {
-				return this.branchEntries.slice(firstKeptIndex);
-			}
-			const compactionIndex = this.branchEntries.findIndex((entry: any) => entry.id === latestCompaction.id);
-			return compactionIndex >= 0 ? this.branchEntries.slice(compactionIndex + 1) : this.branchEntries;
-		})();
+		const messages = buildSessionProjection(this.branchEntries).messages;
 
-		for (let i = boundedEntries.length - 1; i >= 0; i--) {
-			const message = unwrapMessage(boundedEntries[i]);
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
 			if (!message) {
 				continue;
 			}

@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { InMemoryCredentialStore, type AssistantMessage } from "@earendil-works/pi-ai";
+import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { runConfigRegressionTests } from "./config-regression.test.js";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { AuthStorage, ModelRegistry, SessionManager, type SessionEntry } from "@mariozechner/pi-coding-agent";
-import { TUI, type Component } from "@mariozechner/pi-tui";
+import { ModelRuntime, ModelRegistry, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { TuiMainScreen, KeybindingsManager, TUI_KEYBINDINGS, type Component } from "@earendil-works/pi-tui";
 
 type Terminal = {
 	start(onInput: (data: string) => void, onResize: () => void): void;
@@ -37,6 +43,22 @@ import {
 } from "../jarvis-config.js";
 import { JarvisSideSessionRuntime, createSideSessionFile, getJarvisSessionDirectory } from "../side-session.js";
 import jarvisExtension from "../index.js";
+
+async function createTestModelRuntime(agentDir: string): Promise<ModelRuntime> {
+	const runtime = await ModelRuntime.create({
+		credentials: new InMemoryCredentialStore(),
+		modelsPath: null,
+		modelsStorePath: join(agentDir, "models-cache.json"),
+		refreshOnCreate: false,
+		allowModelNetwork: false,
+	});
+	runtime.registerProvider("fixture", {
+		api: "openai-completions", baseUrl: "https://invalid.example/v1", apiKey: "fake-key",
+		models: [{ id: "fake", name: "Fake", reasoning: false, input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }],
+	});
+	return runtime;
+}
 
 class FakeTerminal implements Terminal {
 	private inputHandler?: (data: string) => void;
@@ -213,7 +235,7 @@ function createOverlayCaptureHarness(harness: JarvisExtensionHarness): {
 			capturedOverlay = (factory as OverlayFactory)(
 				{ requestRender: () => {}, terminal: { rows: 40 } },
 				harness.ctx.ui.theme,
-				{},
+				new KeybindingsManager(TUI_KEYBINDINGS),
 				() => {},
 			);
 		}
@@ -441,7 +463,7 @@ async function testJarvisSessionDirectoryAvoidsWorkspacePathCollisions(): Promis
 
 async function testOverlayFocusAndEscRouting(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const base = new BaseComponent();
 	const bridge = new JarvisOverlayBridge();
 	const { view } = createTestOverlayView();
@@ -471,7 +493,7 @@ async function testOverlayFocusAndEscRouting(): Promise<void> {
 
 async function testOverlayRenderDistinctness(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { view } = createTestOverlayView({
 		displayEntries: [
@@ -489,7 +511,7 @@ async function testOverlayRenderDistinctness(): Promise<void> {
 
 async function testOverlayAnimatedThinkingFallback(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	bridge.setWorkingMessage("Thinking...");
 	const { view } = createTestOverlayView({ streaming: true, displayEntries: [] });
@@ -504,7 +526,7 @@ async function testOverlayAnimatedThinkingFallback(): Promise<void> {
 async function testOverlayClippedTranscriptPreservesSpeakerLabel(): Promise<void> {
 	const terminal = new FakeTerminal();
 	terminal.resize(40, 20);
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { view } = createTestOverlayView({
 		displayEntries: [{ kind: "assistant", text: "Long clipped transcript ".repeat(40) }],
@@ -523,7 +545,7 @@ async function testOverlayClippedTranscriptPreservesSpeakerLabel(): Promise<void
 
 async function testOverlaySanitizesDisplayControlSequences(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { view } = createTestOverlayView({
 		displayEntries: [
@@ -542,7 +564,7 @@ async function testOverlaySanitizesDisplayControlSequences(): Promise<void> {
 
 async function testOverlaySanitizesNonTranscriptUiText(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	bridge.notify("notice \x1b]8;;https://example.com\x07label\x1b]8;;\x07");
 	bridge.setStatus("status", "status \x1b[2J line");
@@ -562,7 +584,7 @@ async function testOverlaySanitizesNonTranscriptUiText(): Promise<void> {
 
 async function testOverlaySanitizesWorkingMessageText(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	bridge.setWorkingMessage("thinking \x1b[2J now");
 	const { view } = createTestOverlayView({ streaming: true, displayEntries: [] });
@@ -576,7 +598,7 @@ async function testOverlaySanitizesWorkingMessageText(): Promise<void> {
 
 async function testOverlayForwardingToggleControls(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { state, view } = createTestOverlayView({
 		mainStatus: "busy",
@@ -645,7 +667,7 @@ async function testOverlayForwardingToggleControls(): Promise<void> {
 
 async function testJarvisOverlayInputHistoryNavigatesUserMessages(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { view } = createTestOverlayView({
 		displayEntries: [
@@ -724,14 +746,15 @@ async function testSideSessionPersistence(): Promise<void> {
 			timestamp: Date.now(),
 		} as any);
 
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(agentDir);
+		const modelRegistry = new ModelRegistry(modelRuntime);
 		const bridge = new JarvisOverlayBridge();
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge,
 			cwd,
-			modelRegistry: modelRegistry as any,
-			model: undefined,
+			modelRegistry,
+			projectTrusted: true,
+			model: modelRegistry.find("fixture", "fake"),
 			thinkingLevel: undefined,
 			sessionFile,
 			systemPromptProvider: () => "main session prompt",
@@ -744,7 +767,6 @@ async function testSideSessionPersistence(): Promise<void> {
 			sendFollowUpToMain: () => {},
 			confirmSteerToMain: async () => false,
 			sendSteerToMain: () => {},
-			mcpExtensionPathProvider: () => undefined,
 			themeProvider: () => theme,
 		});
 		const entries = runtime.getDisplayEntries().map((entry) => entry.text);
@@ -986,15 +1008,23 @@ async function testSideSessionUsesMainSystemPrompt(): Promise<void> {
 			allowFollowUpToMain: false,
 			allowSteerToMain: false,
 		};
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(agentDir);
+		const modelRegistry = new ModelRegistry(modelRuntime);
+		modelRegistry.registerProvider("prompt-test", {
+			api: "openai-completions", baseUrl: "https://invalid.example/v1", apiKey: "fake-key",
+			models: [{ id: "fake", name: "Fake", reasoning: false, input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }],
+		});
+		const model = modelRegistry.find("prompt-test", "fake");
+		assert.ok(model);
 		const bridge = new JarvisOverlayBridge();
 		const sessionFile = await createSideSessionFile(cwd);
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge,
 			cwd,
-			modelRegistry: modelRegistry as any,
-			model: undefined,
+			modelRegistry,
+			projectTrusted: true,
+			model,
 			thinkingLevel: undefined,
 			sessionFile,
 			systemPromptProvider: () => mainSystemPrompt,
@@ -1004,29 +1034,29 @@ async function testSideSessionUsesMainSystemPrompt(): Promise<void> {
 			sendFollowUpToMain: () => {},
 			confirmSteerToMain: async () => false,
 			sendSteerToMain: () => {},
-			mcpExtensionPathProvider: () => undefined,
 			themeProvider: () => theme,
 		});
 
-		type BeforeAgentStartResult = { systemPrompt?: string };
-		type RuntimeProbe = {
-			session?: {
-				extensionRunner?: {
-					emitBeforeAgentStart(
-						prompt: string,
-						images: undefined,
-						systemPrompt: string,
-					): Promise<BeforeAgentStartResult | undefined>;
-				};
+		const session = (runtime as unknown as { session: AgentSession }).session;
+		assert.ok(session, "side session should expose an SDK session");
+		let capturedSystemPrompt = "";
+		// Drive the public SDK prompt lifecycle without credentials or network requests.
+		session.agent.streamFunction = (requestModel, context) => {
+			capturedSystemPrompt = session.systemPrompt;
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				role: "assistant", content: [{ type: "text", text: "ok" }],
+				api: requestModel.api, provider: requestModel.provider, model: requestModel.id,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: "stop", timestamp: Date.now(),
 			};
+			stream.push({ type: "done", reason: "stop", message });
+			stream.end(message);
+			return stream;
 		};
-
-		const probe = runtime as unknown as RuntimeProbe;
-		const extensionRunner = probe.session?.extensionRunner;
-		assert.ok(extensionRunner, "side session should expose an extension runner");
-
-		const firstResult = await extensionRunner.emitBeforeAgentStart("check prompt", undefined, "fallback prompt");
-		const firstSystemPrompt = firstResult?.systemPrompt ?? "";
+		await session.prompt("check prompt");
+		const firstSystemPrompt = capturedSystemPrompt;
 		assert.ok(firstSystemPrompt.includes("Main session system prompt"), "/jarvis should inherit the non-identity portion of the main system prompt");
 		assert.ok(firstSystemPrompt.includes("Your name is Jarvis."), "/jarvis prompt should give the side assistant the Jarvis name");
 		assert.ok(
@@ -1089,8 +1119,8 @@ async function testSideSessionUsesMainSystemPrompt(): Promise<void> {
 			allowFollowUpToMain: true,
 			allowSteerToMain: true,
 		};
-		const secondResult = await extensionRunner.emitBeforeAgentStart("check prompt again", undefined, "fallback prompt");
-		const secondSystemPrompt = secondResult?.systemPrompt ?? "";
+		await session.prompt("check prompt again");
+		const secondSystemPrompt = capturedSystemPrompt;
 		assert.ok(secondSystemPrompt.includes(currentMainContext.workStateText), "/jarvis prompt should refresh the injected work-state summary for each turn");
 		assert.ok(secondSystemPrompt.includes(currentMainContext.summaryText), "/jarvis prompt should refresh the injected main-session summary for each turn");
 		assert.ok(secondSystemPrompt.includes(currentMainContext.recentText), "/jarvis prompt should refresh the injected recent main-session window for each turn");
@@ -1109,8 +1139,8 @@ async function testSideSessionUsesMainSystemPrompt(): Promise<void> {
 		);
 
 		currentMainContext = createMainContext("SECOND_MAIN_REQUEST", "third assistant status", "SECOND_RECENT_WINDOW");
-		const thirdResult = await extensionRunner.emitBeforeAgentStart("check assistant-only delta", undefined, "fallback prompt");
-		const thirdSystemPrompt = thirdResult?.systemPrompt ?? "";
+		await session.prompt("check assistant-only delta");
+		const thirdSystemPrompt = capturedSystemPrompt;
 		assert.ok(
 			thirdSystemPrompt.includes("New assistant update: third assistant status"),
 			"/jarvis prompt should describe assistant-only main-session changes since the prior /jarvis turn",
@@ -1751,7 +1781,7 @@ async function testBuildMainSessionContextIdleStateClassification(): Promise<voi
 
 async function testOverlayInputSwallowedOnToggleFocus(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { state, view } = createTestOverlayView();
 	const overlay = new JarvisOverlayComponent(tui, theme, bridge, view, () => {});
@@ -2048,13 +2078,13 @@ async function testPackageManifestDeclaresPiPeerDependencies(): Promise<void> {
 	};
 
 	const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as PackageManifest;
-	assert.equal(packageJson.dependencies?.["pi-mcp-adapter"], undefined, "pi-mcp-adapter must remain optional so installing pi-jarvis does not pull the MCP/Pi dependency stack");
+	assert.equal(packageJson.dependencies?.["pi-mcp-adapter"], undefined, "pi-mcp-adapter is not supported by this Pi 1 release");
 	const peerDependencies = packageJson.peerDependencies ?? {};
-	assert.equal(peerDependencies["@mariozechner/pi-ai"], "*", "package.json must declare @mariozechner/pi-ai as a peer dependency for published Pi packages");
-	assert.equal(peerDependencies["@mariozechner/pi-coding-agent"], "*", "package.json must declare @mariozechner/pi-coding-agent as a peer dependency for published Pi packages");
-	assert.equal(peerDependencies["@mariozechner/pi-tui"], "*", "package.json must declare @mariozechner/pi-tui as a peer dependency for published Pi packages");
-	assert.equal(peerDependencies["pi-mcp-adapter"], "^2.2.1", "package.json should advertise the optional MCP adapter peer without forcing installation");
-	for (const optionalPeer of ["@mariozechner/pi-ai", "@mariozechner/pi-coding-agent", "@mariozechner/pi-tui", "pi-mcp-adapter"]) {
+	assert.equal(peerDependencies["@earendil-works/pi-ai"], "*", "package.json must declare @earendil-works/pi-ai as a peer dependency for published Pi packages");
+	assert.equal(peerDependencies["@earendil-works/pi-coding-agent"], "*", "package.json must declare @earendil-works/pi-coding-agent as a peer dependency for published Pi packages");
+	assert.equal(peerDependencies["@earendil-works/pi-tui"], "*", "package.json must declare @earendil-works/pi-tui as a peer dependency for published Pi packages");
+	assert.equal(peerDependencies["pi-mcp-adapter"], undefined, "Pi 1 migration must not advertise an unvalidated MCP adapter");
+	for (const optionalPeer of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"]) {
 		assert.equal(
 			packageJson.peerDependenciesMeta?.[optionalPeer]?.optional,
 			true,
@@ -2106,7 +2136,6 @@ async function withSideSessionRuntime(
 		sendFollowUpToMain?: (message: string) => void;
 		confirmSteerToMain?: (message: string) => Promise<boolean>;
 		sendSteerToMain?: (message: string) => void;
-		mcpExtensionPath?: string | null;
 	},
 	run: (runtime: JarvisSideSessionRuntime, probe: SideRuntimeToolProbe) => Promise<void>,
 ): Promise<void> {
@@ -2119,16 +2148,17 @@ async function withSideSessionRuntime(
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 
 	try {
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(agentDir);
+		const modelRegistry = new ModelRegistry(modelRuntime);
 		const bridge = new JarvisOverlayBridge();
 		const sessionFile = await createSideSessionFile(cwd);
 		let permissions = overrides.communicationPermissions ?? { allowFollowUpToMain: false, allowSteerToMain: false };
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge,
 			cwd,
-			modelRegistry: modelRegistry as any,
-			model: undefined,
+			modelRegistry,
+			projectTrusted: true,
+			model: modelRegistry.find("fixture", "fake"),
 			thinkingLevel: undefined,
 			sessionFile,
 			systemPromptProvider: () => "main session prompt",
@@ -2138,7 +2168,6 @@ async function withSideSessionRuntime(
 			sendFollowUpToMain: overrides.sendFollowUpToMain ?? (() => {}),
 			confirmSteerToMain: overrides.confirmSteerToMain ?? (async () => false),
 			sendSteerToMain: overrides.sendSteerToMain ?? (() => {}),
-			mcpExtensionPathProvider: () => ("mcpExtensionPath" in overrides ? overrides.mcpExtensionPath ?? undefined : undefined),
 			themeProvider: () => theme,
 		});
 		try {
@@ -2174,9 +2203,12 @@ type TestExtensionCommandContext = {
 	ui: {
 		theme: typeof theme;
 		notify: (message: string, type?: "info" | "warning" | "error") => void;
-		custom: (...args: unknown[]) => Promise<void>;
+		custom: (...args: unknown[]) => Promise<unknown>;
 	};
 	hasUI: boolean;
+	mode: "tui" | "rpc" | "print";
+	isProjectTrusted: () => boolean;
+	modelRuntime: ModelRuntime;
 	cwd: string;
 	sessionManager: {
 		getBranch: () => SessionEntry[];
@@ -2246,6 +2278,7 @@ class FakeJarvisRuntime {
 	sendMessageCalls: string[] = [];
 	toolAccessEnabled = false;
 	nextSendError: Error | undefined;
+	nextSyncError: Error | undefined;
 	compactCalls: Array<string | undefined> = [];
 	navigateTreeCalls: Array<{ targetId: string; summarize?: boolean; customInstructions?: string }> = [];
 	systemMessages: string[] = [];
@@ -2292,6 +2325,11 @@ class FakeJarvisRuntime {
 
 	async syncModel(model: TestModel | undefined, thinkingLevel: string | undefined): Promise<void> {
 		this.syncModelCalls.push({ model, thinkingLevel });
+		if (this.nextSyncError) {
+			const error = this.nextSyncError;
+			this.nextSyncError = undefined;
+			throw error;
+		}
 		this.currentModel = model;
 	}
 
@@ -2330,6 +2368,7 @@ type JarvisExtensionHarness = {
 function createTestExtensionCommandContext(
 	cwd: string,
 	modelRegistry: ModelRegistry,
+	modelRuntime: ModelRuntime,
 	model: TestModel | undefined,
 ): TestExtensionCommandContext {
 	const notifications: TestNotification[] = [];
@@ -2337,6 +2376,7 @@ function createTestExtensionCommandContext(
 	return {
 		model,
 		modelRegistry,
+		modelRuntime,
 		notifications,
 		branchEntries,
 		ui: {
@@ -2347,6 +2387,8 @@ function createTestExtensionCommandContext(
 			custom: async () => undefined,
 		},
 		hasUI: true,
+		mode: "tui",
+		isProjectTrusted: () => true,
 		cwd,
 		sessionManager: {
 			getBranch: () => branchEntries,
@@ -2398,10 +2440,10 @@ async function withJarvisExtensionHarness(run: (harness: JarvisExtensionHarness)
 	mkdirSync(cwd, { recursive: true });
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 
-	const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-	const modelRegistry = ModelRegistry.inMemory(authStorage);
+	const modelRuntime = await createTestModelRuntime(agentDir);
+	const modelRegistry = new ModelRegistry(modelRuntime);
 	modelRegistry.registerProvider("test-provider", {
-		api: "openai",
+		api: "openai-completions",
 		baseUrl: "https://example.com/v1",
 		apiKey: "test-key",
 		models: [
@@ -2435,7 +2477,7 @@ async function withJarvisExtensionHarness(run: (harness: JarvisExtensionHarness)
 		],
 	});
 	modelRegistry.registerProvider("xai", {
-		api: "openai",
+		api: "openai-completions",
 		baseUrl: "https://api.x.ai/v1",
 		apiKey: "xai-key",
 		models: [
@@ -2468,7 +2510,7 @@ async function withJarvisExtensionHarness(run: (harness: JarvisExtensionHarness)
 	assert.ok(nextMainModel, "expected the harness next main model to exist");
 
 	const api = new FakeExtensionAPI();
-	const ctx = createTestExtensionCommandContext(cwd, modelRegistry, mainModel);
+	const ctx = createTestExtensionCommandContext(cwd, modelRegistry, modelRuntime, mainModel);
 	api.attachBranch(ctx.branchEntries);
 	let runtime: FakeJarvisRuntime | undefined;
 
@@ -2549,8 +2591,20 @@ async function testXaiFollowMainForcesThinkingOff(): Promise<void> {
 
 async function testJarvisModelOpensModelMenuWhenNoArgs(): Promise<void> {
 	await withJarvisExtensionHarness(async (harness) => {
-		(harness.ctx.ui as any).custom = async () => harness.pinnedModel;
-		await harness.api.runCommand("jarvis-model", "", harness.ctx);
+		const originalCustom = harness.ctx.ui.custom;
+		harness.ctx.ui.custom = async (factory) => new Promise<TestModel | undefined>((done) => {
+			const tui = new TuiMainScreen(new FakeTerminal());
+			const picker = (factory as (tui: TuiMainScreen, pickerTheme: typeof theme, kb: KeybindingsManager,
+				done: (model: TestModel | undefined) => void) => Component)(tui, theme, new KeybindingsManager(TUI_KEYBINDINGS), done);
+			assert.ok(picker.handleInput, "actual public picker must accept input");
+			for (const character of "side-beta") picker.handleInput(character);
+			const lines = picker.render(80);
+			assert.ok(lines.some((line) => line.includes("test-provider/side-beta")), "real picker filters the host registry models");
+			assert.ok(!lines.some((line) => line.includes("test-provider/main-alpha")), "filtered picker excludes unrelated models");
+			picker.handleInput("\r");
+		});
+		try { await harness.api.runCommand("jarvis-model", "", harness.ctx); }
+		finally { harness.ctx.ui.custom = originalCustom; }
 
 		const runtime = await openJarvisRuntime(harness);
 		assert.equal(
@@ -2560,7 +2614,7 @@ async function testJarvisModelOpensModelMenuWhenNoArgs(): Promise<void> {
 		);
 		assert.ok(
 			harness.ctx.notifications.some((notification) =>
-				notification.message.includes(`Pinned /jarvis to ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`),
+				notification.message.includes(`Saved /jarvis model ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`),
 			),
 			"/jarvis-model menu selection should report the pinned /jarvis model",
 		);
@@ -2589,7 +2643,7 @@ async function testJarvisModelOverrideAndStateSeparation(): Promise<void> {
 		);
 		assert.ok(
 			harness.ctx.notifications.some((notification) =>
-				notification.message.includes(`Pinned /jarvis to ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`),
+				notification.message.includes(`Saved /jarvis model ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`),
 			),
 			"/jarvis-model should report the pinned /jarvis model without changing the main model",
 		);
@@ -2765,7 +2819,7 @@ async function testJarvisNewCommandStartsFreshSideSession(): Promise<void> {
 	});
 }
 
-async function testQueuedJarvisSendRetriesAfterTransientFailure(): Promise<void> {
+async function testQueuedJarvisSendFailureIsNotReplayedAutomatically(): Promise<void> {
 	await withJarvisExtensionHarness(async (harness) => {
 		const runtime = await openJarvisRuntime(harness);
 		runtime.nextSendError = new Error("boom");
@@ -2780,8 +2834,8 @@ async function testQueuedJarvisSendRetriesAfterTransientFailure(): Promise<void>
 
 		assert.deepEqual(
 			runtime.sendMessageCalls,
-			["first queued message", "first queued message", "second queued message"],
-			"/jarvis should keep the failed queued message for retry before sending later queued messages",
+			["first queued message", "second queued message"],
+			"ambiguous failed sends must not be replayed automatically or duplicated",
 		);
 	});
 }
@@ -2847,9 +2901,10 @@ async function testJarvisOverlayToolToggleSyncsRuntime(): Promise<void> {
 			assert.ok(lines.some((line) => line.includes("Since last: first /jarvis turn")), "overlay header should surface the since-last delta note");
 			assert.ok(lines.some((line) => line.includes("Access: repo tools off")), "overlay header should surface repo tool availability when tools are off");
 
+			const previousToolAccessCalls = [...runtime.toolAccessCalls];
 			capturedOverlay.handleInput("\t");
 			capturedOverlay.handleInput(" " );
-			assert.deepEqual(runtime.toolAccessCalls, [true], "toggling Tools in the overlay should update the live /jarvis runtime");
+			assert.deepEqual(runtime.toolAccessCalls, [...previousToolAccessCalls, true], "toggling Tools in the overlay should update the live /jarvis runtime");
 			lines = capturedOverlay.render(80) as string[];
 			assert.ok(lines.some((line) => line.includes("Access: local tools only")), "overlay header should surface repo tool availability when tools are enabled");
 		} finally {
@@ -2863,7 +2918,7 @@ async function testJarvisAccessControlsResetOnOverlayCloseAndNewSession(): Promi
 		const overlayCapture = createOverlayCaptureHarness(harness);
 		try {
 			const firstRuntime = await openJarvisRuntime(harness);
-			const capturedOverlay = overlayCapture.getCapturedOverlay();
+			let capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
 			capturedOverlay.focused = true;
 			capturedOverlay.handleInput("\t");
@@ -2882,6 +2937,8 @@ async function testJarvisAccessControlsResetOnOverlayCloseAndNewSession(): Promi
 
 			await harness.api.runCommand("jarvis", "", harness.ctx);
 			await waitForAsyncWork();
+			capturedOverlay = overlayCapture.getCapturedOverlay();
+			assert.ok(capturedOverlay, "reopening creates a fresh overlay instance");
 			lines = capturedOverlay.render(80) as string[];
 			assert.ok(lines.some((line) => line.includes("Repo tools: off")), "repo tools should be off when /jarvis is reopened");
 			assert.ok(lines.some((line) => line.includes("Note main: off")), "Note main should be off when /jarvis is reopened");
@@ -3014,6 +3071,7 @@ async function testJarvisModelIncompatibleGuardBlocksTogglesAndShowsWarning(): P
 			capturedOverlay.handleInput("\t"); // focus Share
 			capturedOverlay.handleInput(" " );
 
+			const previousToolAccessCalls = [...runtime.toolAccessCalls];
 			// Now switch model to incompatible
 			harness.ctx.model = harness.ctx.modelRegistry.find("xai", "grok-incompatible-multi-agent");
 			await harness.api.emit("model_select", { model: harness.ctx.model }, harness.ctx);
@@ -3028,8 +3086,7 @@ async function testJarvisModelIncompatibleGuardBlocksTogglesAndShowsWarning(): P
 				"/jarvis should use polished Follow-up casing in compatibility warnings",
 			);
 			assert.deepEqual(
-				runtime.toolAccessCalls,
-				[false, false],
+				runtime.toolAccessCalls, [...previousToolAccessCalls, false],
 				"/jarvis should refresh the live runtime tool set after compatibility changes revoke bridge permissions",
 			);
 		} finally {
@@ -3234,7 +3291,7 @@ async function testJarvisModelCommandRepairsMalformedTargetConfig(): Promise<voi
 			"/jarvis-model should overwrite and repair a malformed target config",
 		);
 		assert.ok(
-			harness.ctx.notifications.some((notification) => notification.message.includes(`Pinned /jarvis to ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`)),
+			harness.ctx.notifications.some((notification) => notification.message.includes(`Saved /jarvis model ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`)),
 			"successful repair should be reported as a normal pin",
 		);
 	});
@@ -3372,69 +3429,24 @@ async function testSideSessionToolWhitelist(): Promise<void> {
 }
 
 async function testSideSessionLocalToolsActivateWhenPermitted(): Promise<void> {
-	const fakeExtensionRoot = mkdtempSync(join(tmpdir(), "pi-jarvis-fake-mcp-extension-"));
-	const fakeExtensionPath = join(fakeExtensionRoot, "index.mjs");
-	writeFileSync(
-		fakeExtensionPath,
-		"export default function fakeMcp(pi) {\n" +
-			"  pi.registerTool({\n" +
-			"    name: 'mcp',\n" +
-			"    label: 'MCP',\n" +
-			"    description: 'Fake MCP test tool',\n" +
-			"    promptSnippet: 'Fake MCP test tool',\n" +
-			"    parameters: { type: 'object', properties: {} },\n" +
-			"    async execute() {\n" +
-			"      return { content: [{ type: 'text', text: 'fake mcp' }], details: { status: 'ok' } };\n" +
-			"    }\n" +
-			"  });\n" +
-			"}\n",
-		"utf8",
-	);
-
-	try {
-		await withSideSessionRuntime({ toolAccessEnabled: true, mcpExtensionPath: fakeExtensionPath }, async (runtime, probe) => {
-			assert.ok(probe.session, "side session runtime should expose the underlying session");
-			const activeToolNames: string[] = probe.session!.getActiveToolNames().slice().sort();
-			for (const toolName of ["read", "bash", "edit", "write", "mcp"]) {
-				assert.ok(activeToolNames.includes(toolName), `/jarvis should expose ${toolName} when local tool access is enabled and MCP is available`);
-			}
-			assert.equal(runtime.getRepoToolsDetailLabel(), "local tools + MCP available");
-		});
-	} finally {
-		rmSync(fakeExtensionRoot, { recursive: true, force: true });
-	}
-}
-
-async function testSideSessionLocalToolsReportMcpUnavailableWhenAdapterMissing(): Promise<void> {
-	await withSideSessionRuntime({ toolAccessEnabled: true, mcpExtensionPath: null }, async (runtime, probe) => {
-		assert.ok(probe.session, "side session runtime should expose the underlying session");
-		const activeToolNames: string[] = probe.session!.getActiveToolNames().slice().sort();
-		for (const toolName of ["read", "bash", "edit", "write"]) {
-			assert.ok(activeToolNames.includes(toolName), `/jarvis should still expose ${toolName} when local tool access is enabled without MCP`);
-		}
-		assert.ok(!activeToolNames.includes("mcp"), "/jarvis should hide MCP when the MCP adapter is unavailable");
-		assert.equal(runtime.getRepoToolsDetailLabel(), "local tools only (MCP unavailable)");
+	await withSideSessionRuntime({ toolAccessEnabled: true }, async (runtime, probe) => {
+		assert.ok(probe.session);
+		assert.deepEqual(probe.session.getActiveToolNames().sort(), ["bash", "edit", "read", "write"]);
+		assert.match(runtime.getRepoToolsDetailLabel(), /^local tools only \(MCP unavailable.*\)$/);
 	});
 }
 
-async function testSideSessionLocalToolsDoNotClaimMcpForArbitraryExtensionPath(): Promise<void> {
-	const fakeExtensionRoot = mkdtempSync(join(tmpdir(), "pi-jarvis-fake-extension-"));
-	const fakeExtensionPath = join(fakeExtensionRoot, "index.mjs");
-	writeFileSync(fakeExtensionPath, "export default function fakeExtension() {}\n", "utf8");
-
-	try {
-		await withSideSessionRuntime({ toolAccessEnabled: true, mcpExtensionPath: fakeExtensionPath }, async (runtime, probe) => {
-			assert.ok(probe.session, "side session runtime should expose the underlying session");
-			const activeToolNames: string[] = probe.session!.getActiveToolNames().slice().sort();
-			for (const toolName of ["read", "bash", "edit", "write"]) {
-				assert.ok(activeToolNames.includes(toolName), `/jarvis should still expose ${toolName} when local tool access is enabled with a non-MCP extension path`);
-			}
-			assert.ok(!activeToolNames.includes("mcp"), "/jarvis should not expose MCP for an arbitrary non-MCP extension path");
-			assert.equal(runtime.getRepoToolsDetailLabel(), "local tools only (MCP unavailable)", "the repo-tools label must only claim MCP availability when an MCP tool is actually loaded");
-		});
-	} finally {
-		rmSync(fakeExtensionRoot, { recursive: true, force: true });
-	}
+async function testSideSessionMcpExplicitlyUnavailable(): Promise<void> {
+	await withSideSessionRuntime({ toolAccessEnabled: true }, async (runtime, probe) => {
+		assert.ok(probe.session);
+		assert.ok(!probe.session.getAllTools().some((tool) => tool.name === "mcp"), "no adapter/native MCP tool is loaded by /jarvis");
+		runtime.setToolAccessEnabled(false);
+		assert.deepEqual(probe.session.getActiveToolNames(), []);
+		assert.equal(runtime.getRepoToolsDetailLabel(), "repo tools off");
+		runtime.setToolAccessEnabled(true);
+		assert.ok(!probe.session.getActiveToolNames().includes("mcp"));
+		assert.match(runtime.getRepoToolsDetailLabel(), /^local tools only \(MCP unavailable.*\)$/);
+	});
 }
 
 async function testSideSessionBridgeToolsActivateWhenPermitted(): Promise<void> {
@@ -3464,15 +3476,16 @@ async function testFollowUpToolPermissionGating(): Promise<void> {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 
 	try {
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(agentDir);
+		const modelRegistry = new ModelRegistry(modelRuntime);
 		const bridge = new JarvisOverlayBridge();
 		const sessionFile = await createSideSessionFile(cwd);
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge,
 			cwd,
-			modelRegistry: modelRegistry as any,
-			model: undefined,
+			modelRegistry,
+			projectTrusted: true,
+			model: modelRegistry.find("fixture", "fake"),
 			thinkingLevel: undefined,
 			sessionFile,
 			systemPromptProvider: () => "main session prompt",
@@ -3484,7 +3497,6 @@ async function testFollowUpToolPermissionGating(): Promise<void> {
 			},
 			confirmSteerToMain: async () => false,
 			sendSteerToMain: () => {},
-			mcpExtensionPathProvider: () => undefined,
 			themeProvider: () => theme,
 		});
 
@@ -3534,15 +3546,16 @@ async function testSteerToolPermissionAndConfirmGating(): Promise<void> {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 
 	try {
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(agentDir);
+		const modelRegistry = new ModelRegistry(modelRuntime);
 		const bridge = new JarvisOverlayBridge();
 		const sessionFile = await createSideSessionFile(cwd);
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge,
 			cwd,
-			modelRegistry: modelRegistry as any,
-			model: undefined,
+			modelRegistry,
+			projectTrusted: true,
+			model: modelRegistry.find("fixture", "fake"),
 			thinkingLevel: undefined,
 			sessionFile,
 			systemPromptProvider: () => "main session prompt",
@@ -3557,7 +3570,6 @@ async function testSteerToolPermissionAndConfirmGating(): Promise<void> {
 			sendSteerToMain: (message) => {
 				sentSteer = message;
 			},
-			mcpExtensionPathProvider: () => undefined,
 			themeProvider: () => theme,
 		});
 
@@ -3652,7 +3664,7 @@ async function testBridgeConfirmationPrimitive(): Promise<void> {
 
 async function testOverlayConfirmationRenderingAndKeys(): Promise<void> {
 	const terminal = new FakeTerminal();
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	const { state, view } = createTestOverlayView();
 	let closed = false;
@@ -3717,6 +3729,7 @@ async function testOverlayConfirmationRenderingAndKeys(): Promise<void> {
 		["n", false],
 	] as const) {
 		const promise = bridge.requestConfirmation("title", "body");
+		overlay.render(80); // Approval requires review of the current confirmation.
 		overlay.handleInput(key);
 		assert.equal(await promise, expected, `key '${key}' should resolve the confirmation to ${expected}`);
 	}
@@ -3730,7 +3743,7 @@ async function testOverlayConfirmationRenderingAndKeys(): Promise<void> {
 async function testOverlayShortHeightKeepsConfirmationVisible(): Promise<void> {
 	const terminal = new FakeTerminal();
 	terminal.resize(80, 12);
-	const tui = new TUI(terminal);
+	const tui = new TuiMainScreen(terminal);
 	const bridge = new JarvisOverlayBridge();
 	bridge.notify("First notice");
 	bridge.notify("Second notice");
@@ -3764,8 +3777,8 @@ async function testSteerConfirmationRoutedThroughBridge(): Promise<void> {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 
 	try {
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.inMemory(authStorage);
+		const modelRuntime = await createTestModelRuntime(agentDir);
+		const modelRegistry = new ModelRegistry(modelRuntime);
 		const bridge = new JarvisOverlayBridge();
 		bridge.attach(() => {});
 		const sessionFile = await createSideSessionFile(cwd);
@@ -3774,8 +3787,9 @@ async function testSteerConfirmationRoutedThroughBridge(): Promise<void> {
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge,
 			cwd,
-			modelRegistry: modelRegistry as any,
-			model: undefined,
+			modelRegistry,
+			projectTrusted: true,
+			model: modelRegistry.find("fixture", "fake"),
 			thinkingLevel: undefined,
 			sessionFile,
 			systemPromptProvider: () => "main session prompt",
@@ -3791,7 +3805,6 @@ async function testSteerConfirmationRoutedThroughBridge(): Promise<void> {
 			sendSteerToMain: (message) => {
 				sentSteer = message;
 			},
-			mcpExtensionPathProvider: () => undefined,
 			themeProvider: () => theme,
 		});
 
@@ -3904,9 +3917,126 @@ async function testMainSessionTrackerAnonymousSameNameToolExecutionsDoNotCollaps
 	tracker.handleToolExecutionEnd({ toolName: "read" });
 	assert.equal(tracker.snapshot().toolExecution.running.length, 0);
 }
+async function testGlobalModelWritesPreserveProjectPrecedence(): Promise<void> {
+	for (const projectMode of ["pinned", "follow-main"] as const) {
+		await withJarvisExtensionHarness(async (harness) => {
+			const projectSelection = projectMode === "follow-main" ? { mode: projectMode } : {
+				mode: projectMode, provider: harness.pinnedModel.provider, modelId: harness.pinnedModel.id,
+			};
+			saveJarvisModelSelectionSetting(harness.ctx.cwd, "project", projectSelection);
+			await harness.api.emit("session_start", {}, harness.ctx);
+			const runtime = await openJarvisRuntime(harness);
+			const expected = projectMode === "pinned" ? harness.pinnedModel : harness.mainModel;
+			for (const request of [`${harness.nextMainModel.provider}/${harness.nextMainModel.id}`, "follow-main", "clear"]) {
+				await harness.api.runCommand("jarvis-model", `--global ${request}`, harness.ctx);
+				assert.deepEqual(runtime.currentModel, expected, "global changes must not replace live project model selection");
+				assert.deepEqual(loadJarvisModelSelectionSetting(harness.ctx.cwd, "project"), projectSelection);
+				assert.deepEqual(loadJarvisModelSelectionSetting(harness.ctx.cwd, "global"), request === "clear" ? undefined : request === "follow-main" ? { mode: "follow-main" } : {
+					mode: "pinned", provider: harness.nextMainModel.provider, modelId: harness.nextMainModel.id,
+				});
+			}
+			await harness.api.emit("session_start", {}, harness.ctx);
+			assert.deepEqual((await openJarvisRuntime(harness)).currentModel, expected, "restart must agree with live project precedence");
+		});
+	}
+}
+
+async function testGlobalThinkingWritesPreserveProjectPrecedence(): Promise<void> {
+	for (const selection of [{ mode: "auto" }, { mode: "follow-main" }, { mode: "pinned", thinkingLevel: "max" }] as const) {
+		await withJarvisExtensionHarness(async (harness) => {
+			saveJarvisThinkingSelectionSetting(harness.ctx.cwd, "project", selection);
+			await harness.api.emit("session_start", {}, harness.ctx);
+			const runtime = await openJarvisRuntime(harness);
+			const expected = selection.mode === "pinned" ? "max" : "high";
+			assert.equal(runtime.initialThinkingLevel, expected);
+			for (const request of ["low", "auto", "follow-main", "clear"]) {
+				await harness.api.runCommand("jarvis-thinking", `--global ${request}`, harness.ctx);
+				assert.equal(runtime.syncModelCalls.at(-1)?.thinkingLevel, expected, "global changes must not replace live project thinking");
+				assert.deepEqual(loadJarvisThinkingSelectionSetting(harness.ctx.cwd, "project"), selection);
+			}
+			await harness.api.emit("session_start", {}, harness.ctx);
+			assert.equal((await openJarvisRuntime(harness)).initialThinkingLevel, expected);
+		});
+	}
+}
+
+async function testJarvisConfigSaveFailuresRestoreLiveState(): Promise<void> {
+	await withJarvisExtensionHarness(async (harness) => {
+		await harness.api.runCommand("jarvis-model", `${harness.pinnedModel.provider}/${harness.pinnedModel.id}`, harness.ctx);
+		await harness.api.runCommand("jarvis-thinking", "medium", harness.ctx);
+		const runtime = await openJarvisRuntime(harness);
+		const path = getJarvisConfigPath(harness.ctx.cwd, "project");
+		const initial = readFileSync(path, "utf8");
+		const originalRename = fs.renameSync;
+		fs.renameSync = (from, to) => {
+			if (to === path) throw Object.assign(new Error("injected atomic rename failure"), { code: "EACCES" });
+			originalRename(from, to);
+		};
+		syncBuiltinESMExports();
+		try {
+			for (const [command, args] of [["jarvis-model", "follow-main"], ["jarvis-thinking", "max"], ["jarvis-model", "clear"], ["jarvis-thinking", "clear"]]) {
+				await harness.api.runCommand(command, args, harness.ctx);
+				assert.equal(readFileSync(path, "utf8"), initial, "failed save/clear must leave disk unchanged");
+				assert.deepEqual(runtime.currentModel, harness.pinnedModel);
+				assert.equal(runtime.syncModelCalls.at(-1)?.thinkingLevel, "medium");
+				assert.equal(harness.ctx.notifications.at(-1)?.type, "error");
+			}
+		} finally { fs.renameSync = originalRename; syncBuiltinESMExports(); }
+	});
+}
+
+async function testJarvisRuntimeSyncFailuresDoNotPersist(): Promise<void> {
+	await withJarvisExtensionHarness(async (harness) => {
+		const runtime = await openJarvisRuntime(harness);
+		for (const [command, args] of [["jarvis-model", `${harness.pinnedModel.provider}/${harness.pinnedModel.id}`], ["jarvis-thinking", "max"]]) {
+			runtime.nextSyncError = new Error("injected runtime sync failure");
+			await harness.api.runCommand(command, args, harness.ctx);
+			assert.equal(runtime.currentModel, harness.mainModel);
+			assert.equal(runtime.syncModelCalls.at(-1)?.thinkingLevel, "high");
+			assert.ok(!existsSync(getJarvisConfigPath(harness.ctx.cwd, "project")));
+			assert.equal(harness.ctx.notifications.at(-1)?.type, "error");
+		}
+	});
+}
+
+async function testJarvisModelRefreshRejectionIsHandled(): Promise<void> {
+	await withJarvisExtensionHarness(async (harness) => {
+		harness.ctx.modelRegistry.refresh = async () => { throw new Error("injected refresh rejection"); };
+		await harness.api.runCommand("jarvis-model", `${harness.pinnedModel.provider}/${harness.pinnedModel.id}`, harness.ctx);
+		assert.ok(harness.ctx.notifications.some((n) => n.type === "error" && n.message.includes("injected refresh rejection")));
+		assert.ok(!existsSync(getJarvisConfigPath(harness.ctx.cwd, "project")));
+	});
+}
+
+async function testJarvisNonTuiModesDoNotBootOrOpenPickers(): Promise<void> {
+	for (const mode of ["rpc", "print"] as const) {
+		await withJarvisExtensionHarness(async (harness) => {
+			harness.ctx.mode = mode;
+			harness.ctx.hasUI = mode === "rpc";
+			let customCalls = 0;
+			harness.ctx.ui.custom = async () => { customCalls += 1; };
+			await harness.api.runCommand("jarvis", "", harness.ctx);
+			assert.equal(harness.getRuntime(), undefined, "non-TUI command must not create a side session");
+			await harness.api.runCommand("jarvis-model", "", harness.ctx);
+			assert.equal(customCalls, 0, "RPC hasUI must not be treated as terminal custom UI");
+			await harness.api.runCommand("jarvis-model", `${harness.pinnedModel.provider}/${harness.pinnedModel.id}`, harness.ctx);
+			assert.deepEqual(loadJarvisModelSelectionSetting(harness.ctx.cwd, "project"), {
+				mode: "pinned", provider: harness.pinnedModel.provider, modelId: harness.pinnedModel.id,
+			}, "explicit model configuration remains available without TUI");
+		});
+	}
+}
+
 type RegisteredTestCase = readonly [name: string, run: () => Promise<void>];
 
 const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
+	["testGlobalModelWritesPreserveProjectPrecedence", testGlobalModelWritesPreserveProjectPrecedence],
+	["testGlobalThinkingWritesPreserveProjectPrecedence", testGlobalThinkingWritesPreserveProjectPrecedence],
+	["testJarvisConfigSaveFailuresRestoreLiveState", testJarvisConfigSaveFailuresRestoreLiveState],
+	["testJarvisRuntimeSyncFailuresDoNotPersist", testJarvisRuntimeSyncFailuresDoNotPersist],
+	["testJarvisModelRefreshRejectionIsHandled", testJarvisModelRefreshRejectionIsHandled],
+	["testJarvisNonTuiModesDoNotBootOrOpenPickers", testJarvisNonTuiModesDoNotBootOrOpenPickers],
+
 	["testSessionRef", testSessionRef],
 	["testSessionRefDoesNotFallbackPastMalformedNewestEntry", testSessionRefDoesNotFallbackPastMalformedNewestEntry],
 	["testJarvisModelConfigRoundTrip", testJarvisModelConfigRoundTrip],
@@ -3949,7 +4079,7 @@ const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
 	["testJarvisCompactCommandRunsInsideSideSession", testJarvisCompactCommandRunsInsideSideSession],
 	["testJarvisTreeCommandListsAndNavigatesSideSessionTree", testJarvisTreeCommandListsAndNavigatesSideSessionTree],
 	["testJarvisNewCommandStartsFreshSideSession", testJarvisNewCommandStartsFreshSideSession],
-	["testQueuedJarvisSendRetriesAfterTransientFailure", testQueuedJarvisSendRetriesAfterTransientFailure],
+	["testQueuedJarvisSendFailureIsNotReplayedAutomatically", testQueuedJarvisSendFailureIsNotReplayedAutomatically],
 	["testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline", testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline],
 	["testJarvisOverlayReportsAssistantOnlyMainDelta", testJarvisOverlayReportsAssistantOnlyMainDelta],
 	["testJarvisOverlayToolToggleSyncsRuntime", testJarvisOverlayToolToggleSyncsRuntime],
@@ -3985,8 +4115,7 @@ const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
 	["testBuildMainSessionContextPassedValidationWaitsForUserWithoutCompletionSignal", testBuildMainSessionContextPassedValidationWaitsForUserWithoutCompletionSignal],
 	["testSideSessionToolWhitelist", testSideSessionToolWhitelist],
 	["testSideSessionLocalToolsActivateWhenPermitted", testSideSessionLocalToolsActivateWhenPermitted],
-	["testSideSessionLocalToolsReportMcpUnavailableWhenAdapterMissing", testSideSessionLocalToolsReportMcpUnavailableWhenAdapterMissing],
-	["testSideSessionLocalToolsDoNotClaimMcpForArbitraryExtensionPath", testSideSessionLocalToolsDoNotClaimMcpForArbitraryExtensionPath],
+	["testSideSessionMcpExplicitlyUnavailable", testSideSessionMcpExplicitlyUnavailable],
 	["testSideSessionBridgeToolsActivateWhenPermitted", testSideSessionBridgeToolsActivateWhenPermitted],
 	["testFollowUpToolPermissionGating", testFollowUpToolPermissionGating],
 	["testSteerToolPermissionAndConfirmGating", testSteerToolPermissionAndConfirmGating],
@@ -4007,14 +4136,24 @@ function assertTestRegistryCoverage(): void {
 
 async function main(): Promise<void> {
 	assertTestRegistryCoverage();
+	await runConfigRegressionTests();
 	for (const [name, run] of REGISTERED_TESTS) {
+		if (process.env.JARVIS_TEST_FILTER && !name.includes(process.env.JARVIS_TEST_FILTER)) continue;
+		if (process.env.JARVIS_TEST_VERBOSE) console.log(`running ${name}`);
 		try {
-			await run();
+			// A pending promise alone does not keep Node alive: fail instead of silently
+			// exiting with success when an interactive fixture never resolves.
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([run(), new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error(`test timeout: ${name}`)), 20_000);
+				})]);
+			} finally { if (timer) clearTimeout(timer); }
 		} catch (error) {
 			throw new Error(`test failed: ${name}`, { cause: error });
 		}
 	}
-	console.log("jarvis tests passed");
+	console.log(`jarvis tests passed${process.env.JARVIS_TEST_FILTER ? ` (filter: ${process.env.JARVIS_TEST_FILTER})` : ""}`);
 }
 
 main().catch((error) => {

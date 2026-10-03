@@ -10,10 +10,10 @@
 
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
 [![license](https://img.shields.io/badge/license-MIT-111827?style=for-the-badge)](./LICENSE)
-[![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/fluxgear/pi-jarvis)
+[![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.3.2</p>
+<p><strong>Current version:</strong> 1.4.0</p>
 
 <p>
   <strong>Persistent side session</strong> ·
@@ -57,7 +57,7 @@ The main Pi session should stay on the critical path.
 |---|---|
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
 | **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
-| **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and optional `mcp` stay off until you enable them |
+| **Permission-gated tools** | Local `read`, `bash`, `edit`, and `write` stay off until you enable them |
 | **Safe main-session handoff** | `Note main` is quiet; `Redirect` is confirmation-gated |
 | **Independent model control** | Follow the main model or pin `/jarvis` to a separate model |
 | **Cleaner UX** | Thinking-step streaming is collapsed into a cleaner animated fallback |
@@ -72,7 +72,6 @@ flowchart LR
     U -->|open /jarvis| J[Jarvis overlay]
     M -->|summary + recent delta| J
     J -->|Repo tools enabled| R[Local tools\nread • bash • edit • write]
-    J -->|optional| X[MCP]
     J -. Note main .-> M
     J -. Redirect after confirmation .-> M
 ```
@@ -116,20 +115,16 @@ Stay in the main lane when you want:
 ### 1) Install
 
 ```bash
-npm install pi-jarvis
+pi install npm:pi-jarvis
 ```
 
 This package is meant to run **inside a Pi installation** that already provides the Pi runtime packages. Those host packages are declared as optional peers so npm does not install a second copy of the full Pi/AI provider stack just to add this extension.
 
-MCP support is optional. If you want the `/jarvis` Repo tools toggle to expose the `mcp` tool, install `pi-mcp-adapter` in the same Pi environment; otherwise `/jarvis` still enables local `read`, `bash`, `edit`, and `write` tools when you opt in.
+Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. This release supports local repository tools only: automatic `pi-mcp-adapter` loading is disabled because the published adapter does not declare Pi 1.0 support. Native MCP integration is not yet enabled; the overlay reports MCP as unavailable.
 
-### 2) Register the extension in Pi
+### 2) Restart or reload Pi
 
-Use the package's published extension entrypoint:
-
-```text
-./dist/index.js
-```
+`pi install` registers the package automatically. For local development, build and load `./dist/index.js` with `pi -e ./dist/index.js`.
 ### 3) Open Jarvis
 
 ```bash
@@ -145,7 +140,7 @@ Or open it and send the first message immediately:
 ### 4) Turn on more power only when you want it
 
 - leave `Repo tools` off for pure context / analysis
-- turn `Repo tools` on when you want local `read`, `bash`, `edit`, `write`, and optional `mcp`
+- turn `Repo tools` on when you want local `read`, `bash`, `edit`, and `write`
 - turn `Note main` on when you want Jarvis to quietly message the main session
 - turn `Redirect` on when you want Jarvis to propose a redirect that you still explicitly confirm
 
@@ -157,7 +152,7 @@ Or open it and send the first message immediately:
 Opens the side overlay. If text follows the command, that text becomes the first side-session prompt.
 
 ### `/jarvis-model`
-When Pi has a UI, running `/jarvis-model` with no argument opens a model picker instead of requiring an exact provider/model string.
+In Pi's terminal UI, running `/jarvis-model` with no argument opens a searchable model picker. In RPC, JSON, and print modes it reports the current selection; exact model-setting commands still work. `/jarvis` itself requires the terminal UI and does not start hidden work in other modes.
 
 ### `/jarvis-model [--project|--global] <provider/model>`
 Pins `/jarvis` to a specific model without changing the main session model. A plain `/jarvis-model <provider/model>` writes a **project-local** override to `.pi/jarvis.json`.
@@ -168,12 +163,13 @@ Restores the chosen scope to `follow-main`. A project-scoped `follow-main` overr
 ### `/jarvis-model [--project|--global] clear`
 Removes the selected scope so `/jarvis` falls back through the remaining config layers to the built-in default.
 
-### `/jarvis-thinking [--project|--global] auto|follow-main|off|minimal|low|medium|high|xhigh`
+### `/jarvis-thinking [--project|--global] auto|follow-main|off|minimal|low|medium|high|xhigh|max`
 Sets the thinking level used by `/jarvis` without changing the main session thinking level. A plain `/jarvis-thinking <level>` writes a **project-local** override to `.pi/jarvis.json`.
 
 - `auto` preserves the built-in behavior: follow the main thinking level only when `/jarvis` follows the main model; pinned `/jarvis` models use `off`.
 - `follow-main` follows the main thinking level even when `/jarvis` is pinned to a separate model.
-- Explicit levels pin `/jarvis` thinking to that level.
+- Explicit levels request that thinking level; Pi clamps it to the selected model's supported levels.
+- Changes to main thinking immediately synchronize when `/jarvis` follows it.
 - xAI `/jarvis` models still force thinking `off`.
 
 ### `/jarvis-thinking [--project|--global] clear`
@@ -212,6 +208,8 @@ Model and thinking settings resolve through the same config layers, then fall ba
 2. global config: `~/.pi/agent/extensions/pi-jarvis.json` or the equivalent path under a custom Pi agent dir
 3. built-in defaults: model `follow-main`, thinking `auto`
 
+Global writes do not displace an existing project override. Config writes use same-directory atomic replacement and preserve unrelated keys; unreadable files are never treated as malformed JSON and overwritten. Malformed JSON can still be explicitly cleared or replaced. Avoid simultaneous configuration writes from multiple Pi processes: cross-process locking is not implemented.
+
 ---
 
 ## Overlay controls
@@ -220,11 +218,13 @@ The overlay header exposes three controls, all **off by default**:
 
 | Control | What it does | Safety model |
 |---|---|---|
-| `Repo tools` | Enables local `read`, `bash`, `edit`, `write`, and optional `mcp` | Explicit opt-in |
+| `Repo tools` | Enables local `read`, `bash`, `edit`, and `write` | Explicit opt-in |
 | `Note main` | Sends a concise, non-interrupting note to the main session | Explicit opt-in |
 | `Redirect` | Sends a redirecting instruction to the main session | Explicit opt-in + per-send confirmation |
 
-`Note main` and `Redirect` can be forcibly disabled when the active `/jarvis` model is incompatible with bridge tools.
+`Note main` and `Redirect` can be forcibly disabled when the active `/jarvis` model is incompatible with bridge tools. Closing the overlay revokes all three permissions and cancels pending confirmations. Already-running local operations are not undone; newly starting calls are blocked.
+
+Long redirects are paged: review every page with Up/Down or PageUp/PageDown before pressing Y. Resize if the terminal is too small to review safely. Configured Pi selection keybindings are respected.
 
 ### Permission flow
 
@@ -235,9 +235,7 @@ flowchart TD
     A --> D[Redirect off]
 
     B -->|enable| E[Jarvis may use local tools]
-    E --> F{MCP adapter available?}
-    F -->|yes| G[Local tools + MCP]
-    F -->|no| H[Local tools only]
+    E --> H[MCP unavailable in this release]
 
     C -->|enable| I[Jarvis may send a quiet note to main]
     D -->|enable| J[Jarvis may request redirect sends]
@@ -271,6 +269,9 @@ sequenceDiagram
 
 - `/jarvis` keeps its own isolated conversation state
 - prior side-session history is restored from a session file under `jarvis-sessions/`
+- main-tree navigation reconciles the side-session reference instead of continuing in an unrelated side thread
+- reset/shutdown invalidates old queues; failed commands and uncertain sends are not automatically replayed
+- side-session project resources honor the main session's project-trust decision
 - Jarvis sees current main-session state plus a compact delta since the last `/jarvis` turn
 - `/compact`, `/tree`, and `/new` entered inside `/jarvis` operate on the side-session, not the main session
 - plain `/jarvis-model <provider/model>` writes the project model override; use `--global` to change the global default
@@ -316,9 +317,11 @@ sequenceDiagram
 
 ## Compatibility note
 
-This repository's current validation baseline is **Pi 0.69.0**.
+This repository's validation baseline is **Pi 1.0.0**, using host-provided `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui`. Older Pi versions are not supported by this release.
 
-The package relies on Pi-provided peer dependencies, so treat other host versions as **not the validated baseline for this repo** unless you have tested them yourself.
+Physical models use the main host's public model registry for requests and credentials, including custom providers and runtime-only authentication. **Virtual/router models are not supported**: Pi's public extension registry does not expose session-aware virtual routing. Pin `/jarvis-model <provider/physical-model>` if the main session uses a virtual model.
+
+MCP is deliberately unavailable in this release. A future native integration needs execution-time permission checks for direct, deferred, and nested tool calls; installing the old adapter does not enable it.
 
 ---
 

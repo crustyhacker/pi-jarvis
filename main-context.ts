@@ -1,4 +1,4 @@
-import { getLatestCompactionEntry, type SessionEntry } from "@mariozechner/pi-coding-agent";
+import { buildSessionProjection, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { MainSessionSnapshot } from "./main-session-state.js";
 
 export const DEFAULT_MAIN_SESSION_RECENT_LIMIT = 8;
@@ -85,8 +85,13 @@ export interface MainSessionContextPayload {
 }
 
 type MessageEntry = Extract<SessionEntry, { type: "message" }>;
-type BashExecutionEntry = Extract<SessionEntry, { type: "message" }> & {
-	message: Extract<MessageEntry["message"], { role: "bashExecution" }>;
+type MainMessage = MessageEntry["message"];
+type ValidationExecution = {
+	command: string;
+	output: string;
+	cancelled: boolean;
+	failed?: boolean;
+	exitCode?: number;
 };
 type TextBlockLike = {
 	type: "text";
@@ -98,6 +103,7 @@ type ImageBlockLike = {
 };
 type ToolCallBlockLike = {
 	type: "toolCall";
+	id?: string;
 	name: string;
 	arguments?: Record<string, unknown>;
 };
@@ -172,8 +178,8 @@ export function extractRecentMainSessionEntries(
 		return [];
 	}
 
-	const boundedEntries = getEntriesAfterLatestCompaction(branchEntries);
-	const normalizedEntries = boundedEntries.flatMap((entry) => normalizeSessionEntry(entry));
+	const messages = buildSessionProjection([...branchEntries]).messages;
+	const normalizedEntries = messages.flatMap((message) => normalizeMessage(message));
 	return normalizedEntries.slice(-safeLimit);
 }
 
@@ -206,9 +212,9 @@ function deriveValidationState(snapshot: MainSessionSnapshot): MainSessionValida
 		};
 	}
 
-	const command = normalizeText(latestValidationEntry.message.command);
-	const outputSnippet = normalizeSummaryField(latestValidationEntry.message.output);
-	if (latestValidationEntry.message.cancelled) {
+	const command = normalizeText(latestValidationEntry.command);
+	const outputSnippet = normalizeSummaryField(latestValidationEntry.output);
+	if (latestValidationEntry.cancelled) {
 		return {
 			status: "failed",
 			command,
@@ -217,7 +223,7 @@ function deriveValidationState(snapshot: MainSessionSnapshot): MainSessionValida
 		};
 	}
 
-	if (latestValidationEntry.message.exitCode === 0) {
+	if (latestValidationEntry.exitCode === 0 && !latestValidationEntry.failed) {
 		return {
 			status: "passed",
 			command,
@@ -227,7 +233,7 @@ function deriveValidationState(snapshot: MainSessionSnapshot): MainSessionValida
 		};
 	}
 
-	const exitCode = latestValidationEntry.message.exitCode ?? undefined;
+	const exitCode = latestValidationEntry.exitCode ?? undefined;
 	const suffix = outputSnippet ? ` — ${outputSnippet}` : "";
 	return {
 		status: "failed",
@@ -238,19 +244,46 @@ function deriveValidationState(snapshot: MainSessionSnapshot): MainSessionValida
 	};
 }
 
-function findLatestValidationEntry(branchEntries: MainSessionSnapshot["branchEntries"]): BashExecutionEntry | undefined {
-	const boundedEntries = getEntriesAfterLatestCompaction(branchEntries);
-	for (let i = boundedEntries.length - 1; i >= 0; i--) {
-		const entry = boundedEntries[i];
-		if (entry?.type !== "message" || entry.message.role !== "bashExecution") {
-			continue;
-		}
-		const command = normalizeText(entry.message.command);
-		if (classifyValidationCommand(command)) {
-			return entry as BashExecutionEntry;
+function findLatestValidationEntry(branchEntries: MainSessionSnapshot["branchEntries"]): ValidationExecution | undefined {
+	const messages = buildSessionProjection([...branchEntries]).messages;
+	const pendingCalls = new Map<string, ToolCallBlockLike>();
+	let latest: ValidationExecution | undefined;
+	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const call of extractToolCalls(message.content)) {
+				if (call.id) {
+					pendingCalls.set(call.id, call);
+				}
+			}
+		} else if (message.role === "bashExecution") {
+			if (!message.excludeFromContext && classifyValidationCommand(message.command)) {
+				latest = message;
+			}
+		} else if (message.role === "toolResult") {
+			const call = pendingCalls.get(message.toolCallId);
+			pendingCalls.delete(message.toolCallId);
+			if (call?.name !== "bash" || message.toolName !== "bash") {
+				continue;
+			}
+			const command = typeof call.arguments?.command === "string" ? normalizeText(call.arguments.command) : "";
+			if (!classifyValidationCommand(command)) {
+				continue;
+			}
+			const output = extractVisibleTextContent(message.content);
+			// Pi's built-in bash persists isError and textual terminal status, not
+			// structuredContent.exit_code. Only parse the status on failed results,
+			// so arbitrary successful stdout cannot masquerade as a failure.
+			const exitMatch = message.isError ? output.trimEnd().match(/(?:^|\n)Command exited with code (-?\d+)$/) : undefined;
+			latest = {
+				command,
+				output,
+				failed: message.isError,
+				cancelled: message.isError && /(?:^|\n)Command aborted$/.test(output.trimEnd()),
+				exitCode: message.isError ? (exitMatch ? Number(exitMatch[1]) : undefined) : 0,
+			};
 		}
 	}
-	return undefined;
+	return latest;
 }
 
 function formatWorkStateSummary(workState: MainSessionWorkStatePayload): string {
@@ -386,9 +419,9 @@ function extractActiveFiles(runningToolCalls: readonly MainSessionSnapshot["tool
 
 function extractRecentFiles(branchEntries: MainSessionSnapshot["branchEntries"], activeFiles: readonly string[]): string[] {
 	const files = new Set<string>(activeFiles);
-	const boundedEntries = getEntriesAfterLatestCompaction(branchEntries);
-	for (let i = boundedEntries.length - 1; i >= 0; i--) {
-		for (const file of extractFilesFromSessionEntry(boundedEntries[i]!)) {
+	const messages = buildSessionProjection([...branchEntries]).messages;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		for (const file of extractFilesFromMessage(messages[i]!)) {
 			files.add(file);
 			if (files.size >= FILE_REFERENCE_LIMIT) {
 				return [...files];
@@ -481,16 +514,12 @@ function isValidationSegment(segment: string): boolean {
 	return false;
 }
 
-function extractFilesFromSessionEntry(entry: SessionEntry): string[] {
-	if (entry.type !== "message") {
-		return [];
-	}
-
-	switch (entry.message.role) {
+function extractFilesFromMessage(message: MainMessage): string[] {
+	switch (message.role) {
 		case "assistant":
-			return extractToolCalls(entry.message.content).flatMap((toolCall) => extractFilesFromToolCall({ toolName: toolCall.name, args: toolCall.arguments }));
+			return extractToolCalls(message.content).flatMap((toolCall) => extractFilesFromToolCall({ toolName: toolCall.name, args: toolCall.arguments }));
 		case "bashExecution":
-			return extractFileReferencesFromText(entry.message.command);
+			return message.excludeFromContext ? [] : extractFileReferencesFromText(message.command);
 		default:
 			return [];
 	}
@@ -579,70 +608,40 @@ function normalizeSummaryField(value: string | undefined): string | undefined {
 	return truncateText(normalized, SUMMARY_TEXT_LIMIT);
 }
 
-function getEntriesAfterLatestCompaction(branchEntries: readonly SessionEntry[]): readonly SessionEntry[] {
-	const latestCompaction = getLatestCompactionEntry([...branchEntries]);
-	if (!latestCompaction) {
-		return branchEntries;
-	}
-
-	const firstKeptIndex = branchEntries.findIndex((entry) => entry.id === latestCompaction.firstKeptEntryId);
-	if (firstKeptIndex >= 0) {
-		return branchEntries.slice(firstKeptIndex);
-	}
-
-	const compactionIndex = branchEntries.findIndex((entry) => entry.id === latestCompaction.id);
-	return compactionIndex >= 0 ? branchEntries.slice(compactionIndex + 1) : branchEntries;
-}
-
-function normalizeSessionEntry(entry: SessionEntry): MainSessionRecentEntry[] {
-	switch (entry.type) {
-		case "message":
-			return normalizeMessageEntry(entry);
-		case "custom_message":
-			return entry.display ? createRecentEntries("status", extractVisibleTextContent(entry.content)) : [];
-		case "branch_summary":
-			return createRecentEntries("status", `Branch summary: ${entry.summary}`);
-		case "compaction":
-			return createRecentEntries("status", `Compaction: ${entry.summary}`);
-		default:
-			return [];
-	}
-}
-
-function normalizeMessageEntry(entry: MessageEntry): MainSessionRecentEntry[] {
-	switch (entry.message.role) {
+function normalizeMessage(message: MainMessage): MainSessionRecentEntry[] {
+	switch (message.role) {
 		case "user":
-			return createRecentEntries("user", extractVisibleTextContent(entry.message.content));
+			return createRecentEntries("user", extractVisibleTextContent(message.content));
 		case "assistant": {
-			const entries = createRecentEntries("assistant", extractAssistantText(entry.message.content));
-			for (const toolCall of extractToolCalls(entry.message.content)) {
+			const entries = createRecentEntries("assistant", extractAssistantText(message.content));
+			for (const toolCall of extractToolCalls(message.content)) {
 				entries.push(...createRecentEntries("tool", formatToolCall(toolCall.name, toolCall.arguments)));
 			}
 			return entries;
 		}
 		case "toolResult": {
-			const output = extractVisibleTextContent(entry.message.content);
-			const prefix = entry.message.isError ? `error from ${entry.message.toolName}` : entry.message.toolName;
+			const output = extractVisibleTextContent(message.content);
+			const prefix = message.isError ? `error from ${message.toolName}` : message.toolName;
 			return createRecentEntries("tool", output ? `${prefix}: ${output}` : `${prefix}: (no text output)`);
 		}
 		case "custom":
-			return entry.message.display ? createRecentEntries("status", extractVisibleTextContent(entry.message.content)) : [];
+			return message.display ? createRecentEntries("status", extractVisibleTextContent(message.content)) : [];
 		case "bashExecution": {
-			if (entry.message.excludeFromContext) {
+			if (message.excludeFromContext) {
 				return [];
 			}
-			const status = entry.message.cancelled
+			const status = message.cancelled
 				? "cancelled"
-				: entry.message.exitCode === 0
+				: message.exitCode === 0
 					? "ok"
-					: `exit ${entry.message.exitCode ?? "?"}`;
-			const output = normalizeText(entry.message.output);
-			return createRecentEntries("tool", output ? `$ ${entry.message.command} (${status}) — ${output}` : `$ ${entry.message.command} (${status})`);
+					: `exit ${message.exitCode ?? "?"}`;
+			const output = normalizeText(message.output);
+			return createRecentEntries("tool", output ? `$ ${message.command} (${status}) — ${output}` : `$ ${message.command} (${status})`);
 		}
 		case "branchSummary":
-			return createRecentEntries("status", `Branch summary: ${entry.message.summary}`);
+			return createRecentEntries("status", `Branch summary: ${message.summary}`);
 		case "compactionSummary":
-			return createRecentEntries("status", `Compaction: ${entry.message.summary}`);
+			return createRecentEntries("status", `Compaction: ${message.summary}`);
 		default:
 			return [];
 	}
@@ -707,6 +706,7 @@ function extractToolCalls(content: unknown): ToolCallBlockLike[] {
 		if (isToolCallBlock(block)) {
 			toolCalls.push({
 				type: "toolCall",
+				id: typeof block.id === "string" ? block.id : undefined,
 				name: block.name,
 				arguments: readArgsRecord(block.arguments),
 			});

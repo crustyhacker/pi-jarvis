@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.4.0] - 2026-10-03
+
+### Changed
+- Updated the validated host to Pi 1.0.0 (`@earendil-works`) and Node.js 22.19+, retaining optional host peers and no bundled runtime stack.
+- Replaced obsolete SDK/picker APIs; physical-model requests delegate to the host registry, preserving custom providers and runtime-only authentication.
+- Disabled unvalidated legacy MCP adapter auto-loading. This release is local-tools-only; native MCP and virtual/router models are explicitly unsupported.
+- Added `max` thinking configuration and live follow-main thinking synchronization.
+
+### Fixed
+- Prevented stale boots, queues, and overlay callbacks from crossing main-session resets; side `/new` no longer starts duplicate flushes or detaches the overlay.
+- Reconciled side-session references after main-tree navigation and stopped automatic replay of failed commands or uncertain sends.
+- Preserved project override precedence during global writes; made config writes atomic and prevented destructive recovery from file I/O errors.
+- Honored project trust in side resources/settings, cleaned up failed initialization, and supplied the correct workspace for lazily created session files.
+- Rechecked local-tool and bridge permissions at execution time, cancelled pending redirects on abort/close, prevented sends after revocation, and rejected hidden terminal-control content in bridge messages.
+- Used Pi's context projection for context edits and compaction ordering; recognized normal bash tool results in validation summaries and preserved concurrent tool identity.
+- Distinguished attempt completion from final settlement during recovery; exposed side errors and refreshed live overlay state.
+- Fixed narrow/short rendering, stale history indices, keyboard protocols/keybindings, terminal-control sanitation, light-theme rendering, and clipped redirect confirmations through mandatory paged review.
+- Guarded terminal-only commands in RPC/JSON/print modes and awaited asynchronous model refresh.
+
+### Validation
+- Migrated existing tests to Pi 1.0.0 and added deterministic SDK, lifecycle, config, context, picker, and regular/fullscreen overlay regressions.
+- Strengthened release metadata, lockfile, and tarball-content checks.
+
 ## [1.3.2] - 2026-04-28
 
 ### Fixed

@@ -4,22 +4,35 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 type PackageManifest = {
+	name: string;
+	version: string;
 	files?: string[];
+	main?: string;
+	types?: string;
+	exports?: Record<string, unknown>;
+	pi?: { extensions?: string[] };
+	dependencies?: Record<string, string>;
+	devDependencies?: Record<string, string>;
+	peerDependencies?: Record<string, string>;
+	peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+	engines?: Record<string, string>;
 };
+type NpmPackEntry = { name?: string; version?: string; files?: Array<{ path: string }> };
 
-type NpmPackFileEntry = {
-	path: string;
-};
+function parsePackJson(stdout: string): NpmPackEntry[] {
+	// stderr may contain diagnostics with brackets; it must never enter this parser.
+	const entries: unknown = JSON.parse(stdout.trim());
+	assert.ok(Array.isArray(entries) && entries.length === 1, "npm pack must return exactly one package");
+	assert.ok(entries[0] && typeof entries[0] === "object" && Array.isArray(entries[0].files), "invalid npm pack metadata");
+	return entries as NpmPackEntry[];
+}
 
-type NpmPackEntry = {
-	files?: NpmPackFileEntry[];
-};
-
-function parsePackJson(rawOutput: string): NpmPackEntry[] {
-	const start = rawOutput.indexOf("[");
-	const end = rawOutput.lastIndexOf("]");
-	assert.ok(start >= 0 && end > start, "npm pack --dry-run --json did not emit JSON payload");
-	return JSON.parse(rawOutput.slice(start, end + 1)) as NpmPackEntry[];
+function runNpm(args: string[], timeout: number): string {
+	const result = spawnSync("npm", args, { encoding: "utf8", timeout, maxBuffer: 10 * 1024 * 1024 });
+	assert.ifError(result.error);
+	assert.equal(result.signal, null, `npm ${args.join(" ")} terminated by ${result.signal}`);
+	assert.equal(result.status, 0, `npm ${args.join(" ")} failed:\n${result.stdout}\n${result.stderr}`);
+	return result.stdout;
 }
 
 function normalizeManifestEntry(path: string): string {
@@ -27,58 +40,68 @@ function normalizeManifestEntry(path: string): string {
 }
 
 function main(): void {
-	for (const requiredDistPath of ["dist/index.js", "dist/index.d.ts"]) {
-		assert.ok(existsSync(join(process.cwd(), requiredDistPath)), `missing built artifact: ${requiredDistPath}`);
+	assert.throws(() => parsePackJson("warning [bad]\n[]"));
+	assert.throws(() => parsePackJson("[]"));
+	const manifest = JSON.parse(readFileSync("package.json", "utf8")) as PackageManifest;
+	const lock = JSON.parse(readFileSync("package-lock.json", "utf8")) as {
+		name: string; version: string; lockfileVersion: number;
+		packages: Record<string, PackageManifest>;
+	};
+	assert.equal(manifest.name, "pi-jarvis");
+	assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
+	assert.equal(lock.name, manifest.name);
+	assert.equal(lock.version, manifest.version);
+	assert.equal(lock.lockfileVersion, 3);
+	assert.equal(lock.packages[""].version, manifest.version);
+	for (const key of ["devDependencies", "peerDependencies", "peerDependenciesMeta", "engines"] as const) {
+		assert.deepEqual(lock.packages[""][key], manifest[key], `lockfile root ${key} must match manifest`);
+	}
+	assert.ok(readFileSync("README.md", "utf8").includes(`<strong>Current version:</strong> ${manifest.version}`), "README version must match manifest");
+	assert.ok(readFileSync("CHANGELOG.md", "utf8").includes(`## [${manifest.version}]`), "current version must have changelog entry");
+	assert.equal(manifest.main, "./dist/index.js");
+	assert.equal(manifest.types, "./dist/index.d.ts");
+	assert.deepEqual(manifest.exports?.["."], { types: "./dist/index.d.ts", default: "./dist/index.js" });
+	assert.equal(manifest.exports?.["./package.json"], "./package.json");
+	assert.deepEqual(manifest.pi?.extensions, ["./dist/index.js"]);
+	const hostPeers = ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"];
+	assert.deepEqual(Object.keys(manifest.peerDependencies ?? {}).sort(), hostPeers.slice().sort(), "only validated Pi host peers may be advertised");
+	assert.deepEqual(Object.keys(manifest.peerDependenciesMeta ?? {}).sort(), hostPeers.slice().sort());
+	assert.deepEqual(manifest.dependencies ?? {}, {}, "published extension must not install its host runtime");
+	for (const peer of hostPeers) {
+		assert.equal(manifest.peerDependencies?.[peer], "*", "Pi package docs require wildcard host peers");
+		assert.equal(manifest.peerDependenciesMeta?.[peer]?.optional, true);
+		assert.equal(manifest.devDependencies?.[peer], "1.0.0", "migration tests must use current Pi 1.0.0");
+		assert.equal(lock.packages[`node_modules/${peer}`]?.version, "1.0.0");
+	}
+	for (const forbidden of ["pi-mcp-adapter", "@mariozechner/pi-ai", "@mariozechner/pi-coding-agent", "@mariozechner/pi-tui"]) {
+		assert.equal(manifest.dependencies?.[forbidden], undefined);
+		assert.equal(manifest.devDependencies?.[forbidden], undefined);
+		assert.equal(manifest.peerDependencies?.[forbidden], undefined);
+		assert.equal(lock.packages[`node_modules/${forbidden}`], undefined);
 	}
 
-	const manifest = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as PackageManifest;
-	const packResult = spawnSync("npm", ["pack", "--dry-run", "--json"], {
-		encoding: "utf8",
-	});
-	assert.equal(packResult.status, 0, `npm pack --dry-run --json failed:\n${packResult.stdout}${packResult.stderr}`);
-
-	const packEntries = parsePackJson(`${packResult.stdout}\n${packResult.stderr}`);
-	assert.ok(packEntries.length > 0, "npm pack --dry-run --json returned no package metadata");
-	const packedPaths = new Set((packEntries[0]?.files ?? []).map((entry) => normalizeManifestEntry(entry.path)));
-	assert.ok(packedPaths.size > 0, "npm pack payload did not list packaged files");
-
-	for (const requiredPackedPath of ["package.json", "README.md", "AGENTS.md", "LICENSE", "dist/index.js", "dist/index.d.ts"]) {
-		assert.ok(packedPaths.has(requiredPackedPath), `missing expected packaged path: ${requiredPackedPath}`);
+	// Build explicitly, then inspect payload without npm implicitly running prepack again.
+	runNpm(["run", "build"], 120_000);
+	const [packed] = parsePackJson(runNpm(["pack", "--dry-run", "--json", "--ignore-scripts"], 60_000));
+	assert.equal(packed.name, manifest.name);
+	assert.equal(packed.version, manifest.version);
+	const packedPaths = new Set((packed.files ?? []).map((entry) => normalizeManifestEntry(entry.path)));
+	for (const path of ["package.json", "README.md", "AGENTS.md", "LICENSE", ...[
+		"index", "jarvis-config", "main-context", "main-session-state", "model-picker", "overlay", "session-ref", "side-session",
+	].flatMap((name) => [`dist/${name}.js`, `dist/${name}.d.ts`])]) {
+		assert.ok(existsSync(join(process.cwd(), path)), `missing built/release artifact: ${path}`);
+		assert.ok(packedPaths.has(path), `missing expected packaged path: ${path}`);
 	}
-
-	for (const manifestEntry of manifest.files ?? []) {
-		const normalizedEntry = normalizeManifestEntry(manifestEntry);
-		if (normalizedEntry === "dist") {
-			assert.ok([...packedPaths].some((packedPath) => packedPath.startsWith("dist/")), "pack payload should include dist/ artifacts");
-			continue;
-		}
-		assert.ok(packedPaths.has(normalizedEntry), `pack payload should include package.json files entry: ${normalizedEntry}`);
+	for (const entry of manifest.files ?? []) {
+		const path = normalizeManifestEntry(entry);
+		assert.ok(path === "dist" ? [...packedPaths].some((p) => p.startsWith("dist/")) : packedPaths.has(path), `missing files entry: ${path}`);
 	}
-
-	for (const forbiddenPath of [
-		"index.ts",
-		"jarvis-config.ts",
-		"main-context.ts",
-		"main-session-state.ts",
-		"overlay.ts",
-		"session-ref.ts",
-		"side-session.ts",
-		"test/jarvis.test.ts",
-		"test/release-verification.test.ts",
-		"tsconfig.json",
-		"tsconfig.build.json",
-		"plan.md",
-	]) {
-		assert.ok(!packedPaths.has(forbiddenPath), `unexpected source artifact in package payload: ${forbiddenPath}`);
+	for (const path of packedPaths) {
+		assert.ok(!/(^|\/)(test|tmp|prompts|coord|node_modules|\.pi|\.git)\//.test(path), `forbidden payload path: ${path}`);
+		assert.ok(!path.endsWith(".tgz"), `archive must not be repacked: ${path}`);
+		assert.ok(path.startsWith("dist/") || ["package.json", "README.md", "AGENTS.md", "LICENSE"].includes(path), `unexpected source artifact: ${path}`);
+		assert.ok(!path.startsWith("dist/mcp-policy."), `stale removed artifact: ${path}`);
 	}
-
-	for (const forbiddenPrefix of ["test/", "tmp/", "prompts/"]) {
-		assert.ok(
-			![...packedPaths].some((path) => path.startsWith(forbiddenPrefix)),
-			`unexpected package payload entry under ${forbiddenPrefix}`,
-		);
-	}
-
 	console.log("release verification passed");
 }
 

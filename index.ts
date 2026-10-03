@@ -1,17 +1,17 @@
 import { existsSync } from "node:fs";
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import {
-	ModelSelectorComponent,
-	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+import { JarvisModelPicker } from "./model-picker.js";
 import { buildMainSessionContext, type MainSessionContextPayload } from "./main-context.js";
 import { MainSessionTracker } from "./main-session-state.js";
 import { attachOverlayBridge, JarvisOverlayBridge, JarvisOverlayComponent, type JarvisDisplayEntry, type JarvisOverlayView } from "./overlay.js";
 import { createJarvisSessionRef, readJarvisSessionRef, JARVIS_SESSION_REF_CUSTOM_TYPE, type JarvisSessionRef } from "./session-ref.js";
 import {
+	MalformedJarvisConfigError,
 	clearJarvisModelSelectionSetting,
 	clearJarvisThinkingSelectionSetting,
 	loadJarvisModelSelectionSetting,
@@ -75,6 +75,8 @@ type MainState = {
 	bootPromise?: Promise<JarvisSideSessionRuntime>;
 	bootGeneration: number;
 	flushPromise?: Promise<void>;
+	closeOverlay?: () => void;
+	overlayOpen?: boolean;
 	queuedMessages: string[];
 	model?: Model<any>;
 	jarvisModelSelection: JarvisModelSelection;
@@ -125,7 +127,16 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("jarvis", {
 		description: "Open the /jarvis side conversation overlay",
 		handler: async (args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/jarvis requires Pi's interactive terminal UI.", "warning");
+				return;
+			}
+			if (state.overlayOpen) {
+				ctx.ui.notify("/jarvis is already open.", "info");
+				return;
+			}
 			updateContextState(pi, state, ctx);
+			state.overlayOpen = true;
 
 			void ensureRuntime(pi, state, ctx).catch((error) => {
 				if (isStaleJarvisBootError(error)) {
@@ -141,30 +152,42 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			}
 
 			const overlayView = createOverlayView(pi, state, ctx);
-			await ctx.ui.custom<void>(
-				(tui, theme, _keybindings, done) => {
-					state.themeProvider = () => theme;
-					const closeOverlay = () => {
-						resetTransientAccessControls(state);
-						done(undefined);
-						queueMicrotask(() => tui.requestRender());
-					};
-					return attachOverlayBridge(
-						new JarvisOverlayComponent(tui, theme, state.bridge, overlayView, closeOverlay),
-						state.bridge,
-						tui,
-					);
-				},
-				{
-					overlay: true,
-					overlayOptions: {
-						width: "68%",
-						minWidth: 68,
-						maxHeight: "82%",
-						anchor: "center",
+			try {
+				await ctx.ui.custom<void>(
+					(tui, theme, keybindings, done) => {
+						state.themeProvider = () => theme;
+						let closed = false;
+						const closeOverlay = () => {
+							if (closed) return;
+							closed = true;
+							resetTransientAccessControls(state);
+							state.bridge.resolveConfirmation(false);
+							done(undefined);
+							queueMicrotask(() => tui.requestRender());
+						};
+						state.closeOverlay = closeOverlay;
+						return attachOverlayBridge(
+							new JarvisOverlayComponent(tui, theme, state.bridge, overlayView, closeOverlay, keybindings),
+							state.bridge,
+							tui,
+						);
 					},
-				},
-			);
+					{
+						overlay: true,
+						overlayOptions: {
+							width: "68%",
+							minWidth: 68,
+							maxHeight: "82%",
+							anchor: "center",
+						},
+					},
+				);
+			} finally {
+				state.overlayOpen = false;
+				state.closeOverlay = undefined;
+				resetTransientAccessControls(state);
+				state.bridge.resolveConfirmation(false);
+			}
 		},
 	});
 
@@ -184,20 +207,24 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			const { request, scope, clearScope } = parsedCommand;
 			const scopeLabel = formatJarvisModelSelectionScope(scope);
 
-			const selectModelFromMenu = async (initialSearchInput?: string): Promise<Model<any> | undefined> => {
-				const selectorSettingsManager = SettingsManager.inMemory();
+			const loadModels = async (): Promise<readonly Model<any>[]> => {
+				try {
+					return await getAvailableJarvisModels(ctx.modelRegistry);
+				} catch (error) {
+					ctx.ui.notify(`Failed to refresh /jarvis models: ${error instanceof Error ? error.message : String(error)}`, "error");
+					return [];
+				}
+			};
+			const selectModelFromMenu = async (models: readonly Model<any>[], initialSearchInput?: string): Promise<Model<any> | undefined> => {
+				models = models.filter((model) => model.api !== "pi-virtual");
+				if (models.length === 0) {
+					ctx.ui.notify("No /jarvis models are currently available from the main model registry.", "warning");
+					return undefined;
+				}
 				return ctx.ui.custom<Model<any> | undefined>(
-					(tui, _theme, _keybindings, done) =>
-						new ModelSelectorComponent(
-							tui,
-							getDesiredJarvisModel(state),
-							selectorSettingsManager,
-							ctx.modelRegistry,
-							[],
-							(model) => done(model),
-							() => done(undefined),
-							initialSearchInput,
-						),
+					(tui, theme, keybindings, done) => new JarvisModelPicker(
+						tui, theme, keybindings, models, (model) => done(model), () => done(undefined), initialSearchInput,
+					),
 				);
 			};
 
@@ -212,10 +239,16 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			const persistSelection = async (selection: JarvisModelSelection): Promise<void> => {
 				const previousSelection = state.jarvisModelSelection;
 				const previousSource = state.jarvisModelSelectionSource;
-				await applyJarvisModelSelection(state, selection);
+				const stored = toStoredJarvisModelSelection(selection);
+				const resolved = resolveJarvisModelSelectionFromSettings(
+					scope === "project" ? stored : loadJarvisModelSelectionForClear(ctx.cwd, "project", ctx),
+					scope === "global" ? stored : loadJarvisModelSelectionForClear(ctx.cwd, "global", ctx),
+					ctx.modelRegistry,
+				);
+				await applyJarvisModelSelection(state, resolved.selection);
 				try {
-					saveJarvisModelSelectionSetting(ctx.cwd, scope, toStoredJarvisModelSelection(selection));
-					state.jarvisModelSelectionSource = scope;
+					saveJarvisModelSelectionSetting(ctx.cwd, scope, stored);
+					state.jarvisModelSelectionSource = resolved.source;
 				} catch (error) {
 					await rollbackSelection(previousSelection, previousSource);
 					throw error;
@@ -251,7 +284,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				}
 
 				ctx.ui.notify(
-					`Pinned /jarvis to ${formatModelLabel(model)} ${scopeLabel}. The main model is still ${formatModelLabel(state.model)}.`,
+					`Saved /jarvis model ${formatModelLabel(model)} ${scopeLabel}. /jarvis is ${describeJarvisModelSelection(state)}. The main model is still ${formatModelLabel(state.model)}.`,
 					"info",
 				);
 			};
@@ -289,12 +322,12 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 					);
 					return;
 				}
-				ctx.ui.notify(`Set /jarvis to follow the main model (${formatModelLabel(state.model)}) ${scopeLabel}.`, "info");
+				ctx.ui.notify(`Saved follow-main ${scopeLabel}. /jarvis is ${describeJarvisModelSelection(state)}.`, "info");
 				return;
 			}
 
 			if (!request) {
-				if (!ctx.hasUI) {
+				if (ctx.mode !== "tui") {
 					ctx.ui.notify(
 						`/jarvis is ${describeJarvisModelSelection(state)}. Use /jarvis-model [--project|--global] clear, /jarvis-model [--project|--global] follow-main, or /jarvis-model [--project|--global] <provider/model>.`,
 						"info",
@@ -302,7 +335,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 					return;
 				}
 
-				const selectedModel = await selectModelFromMenu();
+				const selectedModel = await selectModelFromMenu(await loadModels());
 				if (!selectedModel) {
 					return;
 				}
@@ -310,14 +343,14 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const availableModels = getAvailableJarvisModels(ctx.modelRegistry);
+			const availableModels = await loadModels();
 			const exactModel = findExactAvailableModelMatch(request, availableModels);
 			if (exactModel) {
 				await pinSelectedModel(exactModel);
 				return;
 			}
 
-			if (!ctx.hasUI) {
+			if (ctx.mode !== "tui") {
 				const errorMessage =
 					availableModels.length === 0
 						? "No /jarvis models are currently available from the main model registry."
@@ -326,7 +359,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			const selectedModel = await selectModelFromMenu(request);
+			const selectedModel = await selectModelFromMenu(availableModels, request);
 			if (!selectedModel) {
 				return;
 			}
@@ -361,10 +394,14 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			const persistSelection = async (selection: JarvisThinkingSelection): Promise<void> => {
 				const previousSelection = state.jarvisThinkingSelection;
 				const previousSource = state.jarvisThinkingSelectionSource;
-				await applyJarvisThinkingSelection(state, selection);
+				const resolved = resolveJarvisThinkingSelectionFromSettings(
+					scope === "project" ? selection : loadJarvisThinkingSelectionForClear(ctx.cwd, "project", ctx),
+					scope === "global" ? selection : loadJarvisThinkingSelectionForClear(ctx.cwd, "global", ctx),
+				);
+				await applyJarvisThinkingSelection(state, resolved.selection);
 				try {
 					saveJarvisThinkingSelectionSetting(ctx.cwd, scope, selection);
-					state.jarvisThinkingSelectionSource = scope;
+					state.jarvisThinkingSelectionSource = resolved.source;
 				} catch (error) {
 					await rollbackSelection(previousSelection, previousSource);
 					throw error;
@@ -414,7 +451,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 
 			if (!selection) {
 				ctx.ui.notify(
-					`/jarvis is ${describeJarvisThinkingSelection(state)}. Use /jarvis-thinking [--project|--global] clear, auto, follow-main, off, minimal, low, medium, high, or xhigh.`,
+					`/jarvis is ${describeJarvisThinkingSelection(state)}. Use /jarvis-thinking [--project|--global] clear, auto, follow-main, off, minimal, low, medium, high, xhigh, or max.`,
 					request ? "error" : "info",
 				);
 				return;
@@ -435,6 +472,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		state.closeOverlay?.();
 		state.bootGeneration += 1;
 		state.runtime?.dispose();
 		state.runtime = undefined;
@@ -491,6 +529,31 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		refreshMainContext(state);
 	});
 
+	pi.on("agent_settled", async (_event, ctx) => {
+		updateContextState(pi, state, ctx);
+		state.mainSession.handleAgentSettled();
+		refreshMainContext(state);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		const sessionRef = readJarvisSessionRef(ctx.sessionManager.getBranch());
+		if (sessionRef?.file !== state.sessionRef?.file) {
+			state.closeOverlay?.();
+			state.bootGeneration += 1;
+			state.runtime?.dispose();
+			state.runtime = undefined;
+			state.bootPromise = undefined;
+			state.flushPromise = undefined;
+			state.queuedMessages = [];
+			state.lastJarvisSeenMainContext = undefined;
+			state.sessionRef = sessionRef;
+			resetTransientAccessControls(state);
+			state.bridge.reset();
+		}
+		state.mainSession.reset(formatModelLabel(ctx.model));
+		updateContextState(pi, state, ctx);
+	});
+
 	pi.on("message_start", async (event, ctx) => {
 		updateContextState(pi, state, ctx);
 		state.mainSession.handleMessageStart(event);
@@ -540,7 +603,17 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		}
 	});
 
+	pi.on("thinking_level_select", async (_event, ctx) => {
+		updateContextState(pi, state, ctx);
+		try {
+			await syncRuntimeModelSelection(state);
+		} catch (error) {
+			state.bridge.notify(`Failed to sync /jarvis thinking: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	});
+
 	pi.on("session_shutdown", async () => {
+		state.closeOverlay?.();
 		state.bootGeneration += 1;
 		state.runtime?.dispose();
 		state.runtime = undefined;
@@ -575,6 +648,7 @@ function updateContextState(pi: ExtensionAPI, state: MainState, ctx: ExtensionCo
 
 function refreshMainContext(state: MainState): void {
 	state.mainContext = buildMainSessionContext(state.mainSession.snapshot());
+	state.bridge.refresh();
 }
 
 function resetTransientAccessControls(state: MainState): void {
@@ -658,7 +732,7 @@ function parseJarvisThinkingCommand(args: string): ParsedJarvisThinkingCommand {
 }
 
 function isJarvisThinkingLevel(value: string): value is JarvisThinkingLevel {
-	return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+	return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
 }
 
 function formatJarvisThinkingSelection(selection: JarvisThinkingSelection): string {
@@ -802,7 +876,8 @@ function loadJarvisModelSelectionForClear(
 	try {
 		return loadJarvisModelSelectionSetting(cwd, scope);
 	} catch (error) {
-		ctx.ui.notify(`Ignoring malformed ${scope} /jarvis model setting while clearing the requested scope: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		if (!(error instanceof MalformedJarvisConfigError)) throw error;
+		ctx.ui.notify(`Ignoring malformed ${scope} /jarvis model setting while resolving settings: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		return undefined;
 	}
 }
@@ -815,7 +890,8 @@ function loadJarvisThinkingSelectionForClear(
 	try {
 		return loadJarvisThinkingSelectionSetting(cwd, scope);
 	} catch (error) {
-		ctx.ui.notify(`Ignoring malformed ${scope} /jarvis thinking setting while clearing the requested scope: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		if (!(error instanceof MalformedJarvisConfigError)) throw error;
+		ctx.ui.notify(`Ignoring malformed ${scope} /jarvis thinking setting while resolving settings: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		return undefined;
 	}
 }
@@ -852,13 +928,9 @@ function describeJarvisModelSelection(state: MainState): string {
 		: `pinned to ${activeModelLabel} (${sourceLabel})`;
 }
 
-function getAvailableJarvisModels(modelRegistry: ExtensionContext["modelRegistry"]): readonly Model<any>[] {
-	modelRegistry.refresh();
-	try {
-		return modelRegistry.getAvailable();
-	} catch {
-		return [];
-	}
+async function getAvailableJarvisModels(modelRegistry: ExtensionContext["modelRegistry"]): Promise<readonly Model<any>[]> {
+	await modelRegistry.refresh();
+	return modelRegistry.getAvailable();
 }
 
 function findExactAvailableModelMatch(
@@ -913,6 +985,9 @@ async function syncRuntimeModelSelection(state: MainState): Promise<void> {
 }
 
 async function applyJarvisModelSelection(state: MainState, selection: JarvisModelSelection): Promise<void> {
+	if (selection.mode === "pinned" && selection.model.api === "pi-virtual") {
+		throw new Error("/jarvis requires a physical model; Pi's public registry does not expose virtual routing.");
+	}
 	const previousSelection = state.jarvisModelSelection;
 	state.jarvisModelSelection = selection;
 	try {
@@ -969,14 +1044,15 @@ async function executeJarvisSideCommand(
 		return runtime;
 	}
 
-	state.bootGeneration += 1;
+	const generation = ++state.bootGeneration;
 	state.runtime?.dispose();
 	state.runtime = undefined;
 	state.bootPromise = undefined;
-	state.flushPromise = undefined;
 	state.lastJarvisSeenMainContext = undefined;
 	resetTransientAccessControls(state);
+	state.bridge.reset();
 	const sessionFile = await createSideSessionFile(ctx.cwd);
+	if (generation !== state.bootGeneration) throw new StaleJarvisBootError();
 	const sessionRef = createJarvisSessionRef(sessionFile);
 	state.sessionRef = sessionRef;
 	pi.appendEntry(JARVIS_SESSION_REF_CUSTOM_TYPE, sessionRef);
@@ -1010,6 +1086,7 @@ function parseJarvisSideCommand(message: string): JarvisSideCommand | undefined 
 	}
 	if (text.startsWith("/tree ")) {
 		const args = text.slice("/tree ".length).trim();
+		if (args === "--summarize") throw new Error("Use /tree --summarize <entry-id> [instructions].");
 		const summarizePrefix = "--summarize ";
 		if (args.startsWith(summarizePrefix)) {
 			const rest = args.slice(summarizePrefix.length).trim();
@@ -1028,6 +1105,7 @@ function parseJarvisSideCommand(message: string): JarvisSideCommand | undefined 
 }
 
 function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCommandContext): JarvisOverlayView {
+	const queue = state.queuedMessages;
 	const syncToolAccess = () => {
 		state.runtime?.setToolAccessEnabled(state.allowSideTools);
 	};
@@ -1067,6 +1145,7 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 		},
 		getDisplayEntries: () => getOverlayEntries(state),
 		sendMessage: async (text: string) => {
+			if (state.queuedMessages !== queue) return;
 			queueMessage(state, text);
 			await flushQueuedMessages(pi, state, ctx);
 		},
@@ -1136,50 +1215,49 @@ function formatMainContextDeltaLabel(
 }
 
 async function flushQueuedMessages(pi: ExtensionAPI, state: MainState, ctx: ExtensionCommandContext): Promise<void> {
-	updateContextState(pi, state, ctx);
+	if (state.flushPromise) return state.flushPromise;
 
-	if (state.flushPromise) {
-		return state.flushPromise;
-	}
-
-	// flushQueuedMessages is awaited in fire-and-forget paths (the /jarvis command
-	// handler's initial message flush and the overlay input submit). Any error
-	// that propagates out of here becomes an unhandled promise rejection, so the
-	// IIFE must catch and surface every failure via bridge.notify rather than
-	// rethrowing.
-	state.flushPromise = (async () => {
+	// Queue identity survives a side /new, but not a main-session replacement.
+	// A stale completion must never consume or unlock a replacement queue.
+	const queue = state.queuedMessages;
+	const isCurrent = () => state.queuedMessages === queue;
+	let flushPromise: Promise<void>;
+	flushPromise = (async () => {
 		try {
+			updateContextState(pi, state, ctx);
 			let runtime = await ensureRuntime(pi, state, ctx);
-			await runtime.syncModel(getDesiredJarvisModel(state), getDesiredJarvisThinkingLevel(state));
-
-			while (state.queuedMessages.length > 0) {
-				const message = state.queuedMessages[0]!;
-				const command = parseJarvisSideCommand(message);
+			if (!isCurrent()) return;
+			while (queue.length > 0 && isCurrent()) {
+				// Consume once: a failed command must not poison the queue, and an
+				// uncertain provider/tool send must not be retried automatically.
+				const message = queue.shift()!;
 				try {
+					const command = parseJarvisSideCommand(message);
 					if (command) {
 						runtime = await executeJarvisSideCommand(pi, state, ctx, runtime, command);
 					} else {
+						await runtime.syncModel(getDesiredJarvisModel(state), getDesiredJarvisThinkingLevel(state));
+						if (!isCurrent()) return;
+						const seenContext = state.mainContext;
 						await runtime.sendMessage(message);
-						state.lastJarvisSeenMainContext = state.mainContext;
+						if (isCurrent()) state.lastJarvisSeenMainContext = seenContext;
 					}
-					state.queuedMessages.shift();
+					if (!isCurrent()) return;
 				} catch (error) {
-					const action = command ? `run ${message.split(/\s+/, 1)[0]}` : "send /jarvis message";
-					state.bridge.notify(`Failed to ${action}: ${error instanceof Error ? error.message : String(error)}`, "error");
-					break;
+					if (!isCurrent() || isStaleJarvisBootError(error)) return;
+					state.bridge.notify(`Failed to process /jarvis input: ${error instanceof Error ? error.message : String(error)}. Input was not retried.`, "error");
 				}
 			}
 		} catch (error) {
-			if (isStaleJarvisBootError(error)) {
-				return;
-			}
-			state.bridge.notify(`/jarvis startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			if (!isCurrent() || isStaleJarvisBootError(error)) return;
+			queue.length = 0;
+			state.bridge.notify(`/jarvis startup failed: ${error instanceof Error ? error.message : String(error)}. Please submit again.`, "error");
 		}
 	})().finally(() => {
-		state.flushPromise = undefined;
+		if (state.flushPromise === flushPromise) state.flushPromise = undefined;
 	});
-
-	return state.flushPromise;
+	state.flushPromise = flushPromise;
+	return flushPromise;
 }
 
 async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionCommandContext): Promise<JarvisSideSessionRuntime> {
@@ -1209,6 +1287,7 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 		const runtime = await JarvisSideSessionRuntime.create({
 			bridge: state.bridge,
 			cwd: ctx.cwd,
+			projectTrusted: ctx.isProjectTrusted(),
 			modelRegistry: ctx.modelRegistry,
 			model: getDesiredJarvisModel(state),
 			jarvisModelModeProvider: () => state.jarvisModelSelection.mode,
@@ -1216,12 +1295,13 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 			sessionFile,
 			systemPromptProvider: () => state.systemPrompt,
 			mainContextProvider: () => state.mainContext,
-			toolAccessProvider: () => state.allowSideTools,
+			toolAccessProvider: () => isCurrentBoot() && state.allowSideTools,
 			communicationPermissionsProvider: () => ({
-				allowFollowUpToMain: state.allowFollowUpToMain,
-				allowSteerToMain: state.allowSteerToMain,
+				allowFollowUpToMain: isCurrentBoot() && state.allowFollowUpToMain,
+				allowSteerToMain: isCurrentBoot() && state.allowSteerToMain,
 			}),
 			sendFollowUpToMain: (message: string) => {
+				if (!isCurrentBoot() || !state.allowFollowUpToMain) throw new Error("/jarvis follow-up permission expired.");
 				pi.sendUserMessage(message, { deliverAs: "followUp" });
 			},
 			// Route the confirmation through the /jarvis overlay itself via the
@@ -1229,12 +1309,14 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 			// the base layer (the pi editor container) and sit hidden behind the
 			// /jarvis overlay, leaving the side-session tool execute hung on a
 			// promise the user could never answer.
-			confirmSteerToMain: (message: string) =>
+			confirmSteerToMain: (message: string, signal?: AbortSignal) =>
 				state.bridge.requestConfirmation(
 					"Send /jarvis steer to main?",
 					`This will steer the main agent with:\n\n${message}`,
+					signal,
 				),
 			sendSteerToMain: (message: string) => {
+				if (!isCurrentBoot() || !state.allowSteerToMain) throw new Error("/jarvis redirect permission expired.");
 				pi.sendUserMessage(message, { deliverAs: "steer" });
 			},
 			themeProvider: state.themeProvider,
@@ -1249,6 +1331,7 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 		state.bridge.setWorkingMessage(undefined);
 		return runtime;
 	})().catch((error) => {
+		if (!isCurrentBoot()) throw new StaleJarvisBootError();
 		state.bridge.setWorkingMessage(undefined);
 		throw error;
 	}).finally(() => {
