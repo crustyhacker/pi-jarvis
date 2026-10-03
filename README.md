@@ -392,7 +392,7 @@ Preview and verify the npm payload contract:
 npm run verify:release
 ```
 
-Check the mandatory annotated-tag policy for committed history:
+Check the mandatory annotated **version-number** tag policy for committed history:
 
 ```bash
 npm run check:tags
@@ -400,9 +400,9 @@ npm run check:tags
 
 ### Release automation — unreleased
 
-GitHub Actions validate branch pushes and pull requests on Node 22.19.0 and 24. They check every reachable post-policy-baseline commit for an annotated tag and run tests, build, and package verification. Fork PR jobs are read-only.
+GitHub Actions validate branch pushes and pull requests on Node 22.19.0 and 24. They require an annotated **version-number tag** on every reachable post-policy-baseline commit and run tests, build, and package verification. Development commits use `X.Y.Z-dev.N` (for example `1.6.0-dev.1`); SHA-only `commit-*` tags do not qualify. Fork PR jobs are read-only.
 
-A matching annotated **`vX.Y.Z`** tag runs exact-tag validation and creates a GitHub release with the validated npm tarball. **`commit-*` tags do not release anything. npm publication stays manual**; no npm publishing token is configured. Existing assets are verified, never overwritten with different bytes.
+A matching annotated **`vX.Y.Z`** tag runs exact-tag validation and creates a GitHub release with the validated npm tarball. **Development version tags do not release anything. npm publication stays manual**; no npm publishing token is configured. Existing assets are verified, never overwritten with different bytes.
 
 CI reports violations; protected-branch/tag rules must be configured separately for enforcement. See [RELEASING.md](https://github.com/crustyhacker/pi-jarvis/blob/main/RELEASING.md) for atomic tagged pushes, fork/merge handling, reruns, and manual npm publication.
 

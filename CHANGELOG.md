@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - GitHub Actions for validation, annotated-tag policy checks, and release-tag packaging. Only matching annotated `vX.Y.Z` tags create GitHub releases; npm publishing remains manual.
 - Deterministic local MCP integration fixtures and release-automation regression tests, plus `RELEASING.md` and `npm run check:tags`.
 
+### Changed
+- Every new commit requires an annotated version-number tag: `X.Y.Z-dev.N` for development snapshots or matching `vX.Y.Z` for releases. CI no longer accepts SHA-only tags as coverage; development tags never publish.
+
 ### Safety and limitations
 - Jarvis uses its own MCP connections to configured servers; it does not take ownership of the main session's connections. Project MCP configuration honors project trust, and server administration stays in main Pi.
 - Revocation blocks new Jarvis executions and requests cancellation; already-started native handshakes, authentication refreshes, or remote operations can finish or time out under Pi's lifecycle. Cancellation is not immediate teardown, rollback, or a sandbox.

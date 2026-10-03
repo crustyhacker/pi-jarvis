@@ -43,9 +43,10 @@
 - Tests use temporary agent/workspace directories and local fixture servers only; never start real user MCP servers or resolve real credentials during validation.
 
 ## Git and Release Policy
-- Every commit must have an annotated git tag; this is mandatory. Release commits use `v<version>`; other commits use `commit-<short-sha>`.
-- Push each commit with its tag, preferably atomically. Keep release versions synchronized across package metadata, lockfile, README, and changelog.
-- CI checks all reachable commits after policy baseline `92734df`; branch/PR jobs validate on Node 22.19.0 and 24. Only annotated matching `vX.Y.Z` tags create GitHub releases with verified npm archives. `commit-*` tags never release; npm publication remains manual.
+- Every new commit MUST have an annotated **version-number** tag. Release commits use `vX.Y.Z`; development commits use `X.Y.Z-dev.N` (no leading `v`, positive increasing `N`, e.g. `1.6.0-dev.1`). SHA-only tags such as `commit-<sha>` do NOT satisfy this rule.
+- Before committing, choose an unused version tag. Tag every commit, including intermediate and merge commits; never leave a new commit untagged. Run `npm run check:tags`, then push the commit and its version tag atomically. Do not move or replace existing tags.
+- Development tags identify snapshots toward the next release; they do not publish or change the last released package version. Release versions must match package metadata, lockfile, README, and changelog.
+- CI checks all reachable commits after policy baseline `92734df`; branch/PR jobs validate on Node 22.19.0 and 24 and reject missing, lightweight, or SHA-only version coverage. Only annotated matching `vX.Y.Z` tags create GitHub releases with verified npm archives. Development version tags never release; npm publication remains manual.
 - Existing release assets must not be overwritten with differing bytes. See `RELEASING.md` for branch/tag protection and merge/fork constraints; CI alone cannot prevent administrator bypass.
 
 ## Validation

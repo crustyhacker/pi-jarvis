@@ -3,6 +3,9 @@ import { pathToFileURL } from "node:url";
 
 export const POLICY_BASELINE = "92734dfa452dc5def523ff2a801b78f68ebcb506";
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+// Development snapshots have version numbers too. No leading `v`: pushing a
+// development tag must not trigger the v* GitHub release workflow.
+const developmentPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-dev\.([1-9]\d*)$/;
 
 export function git(...args) {
 	return execFileSync("git", args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }).trimEnd();
@@ -92,23 +95,24 @@ export function checkTags({ head = "HEAD", baseline = POLICY_BASELINE, tagPrefix
 	for (const ref of refs) {
 		const prefix = prefixes.find((p) => ref.startsWith(p));
 		const name = ref.slice(prefix.length);
-		if (!name.startsWith("commit-") && !name.startsWith("v")) continue;
+		// Legacy commit-<sha> aliases may remain for history, but do not satisfy
+		// policy. A commit needs an annotated development or release VERSION.
+		if (!/^\d/.test(name) && !name.startsWith("v")) continue;
 		let target;
 		try { target = commit(ref); } catch { continue; }
 		if (!required.has(target)) continue;
 		try {
 			const info = annotatedTag(ref, name);
-			if (name.startsWith("commit-")) {
-				const short = /^commit-([0-9a-f]{7,40})$/.exec(name)?.[1];
-				if (!short || !target.startsWith(short) || commit(short) !== target) throw new Error(`${name}: must use an unambiguous 7–40 digit target commit SHA`);
-			} else {
+			if (name.startsWith("v")) {
 				releaseMetadata(info.commit, name);
+			} else if (!developmentPattern.test(name)) {
+				throw new Error(`${name}: invalid development version tag; expected X.Y.Z-dev.N with N >= 1 and no leading zeros`);
 			}
 			covered.add(target);
 		} catch (error) { errors.push(error.message); }
 	}
 	for (const sha of commits) {
-		if (!covered.has(sha)) errors.push(`${sha}: missing annotated commit-${sha.slice(0, 7)} or matching vX.Y.Z tag`);
+		if (!covered.has(sha)) errors.push(`${sha}: missing annotated version tag (X.Y.Z-dev.N or matching vX.Y.Z); SHA-only tags do not qualify`);
 	}
 	if (errors.length) throw new Error(errors.join("\n"));
 	return { head: tip, checked: commits.length, baseline: exempt };

@@ -25,7 +25,14 @@ function addCommit(cwd: string): string {
 	appendFileSync(join(cwd, "history.txt"), "new commit\n");
 	return commit(cwd);
 }
-function annotate(cwd: string, sha: string, name = `commit-${sha.slice(0, 7)}`): string {
+function nextDevelopmentTag(cwd: string): string {
+	const numbers = git(cwd, "tag", "--list", "1.6.0-dev.*").split("\n").filter(Boolean).map((name) => Number(name.split(".").at(-1)));
+	return `1.6.0-dev.${Math.max(0, ...numbers) + 1}`;
+}
+function developmentTagFor(cwd: string, sha: string): string {
+	return git(cwd, "tag", "--points-at", sha, "--list", "1.6.0-dev.*");
+}
+function annotate(cwd: string, sha: string, name = nextDevelopmentTag(cwd)): string {
 	git(cwd, "tag", "-a", name, sha, "-m", name);
 	return git(cwd, "rev-parse", `refs/tags/${name}`);
 }
@@ -127,21 +134,28 @@ test("PR checks use real head commits, not synthetic merge; actual merges check 
 	ok(check(r, ["--head", feature]));
 	fails(check(r), /missing annotated/);
 	annotate(r.cwd, merge);
-	git(r.cwd, "tag", "-d", `commit-${feature.slice(0, 7)}`);
+	git(r.cwd, "tag", "-d", developmentTagFor(r.cwd, feature));
 	fails(check(r), new RegExp(`${feature}: missing annotated`));
 	annotate(r.cwd, feature);
 	ok(check(r));
 });
 
-test("lightweight, wrongly named, mismatched SHA, and nested tags cannot satisfy policy", async (t) => {
-	for (const kind of ["lightweight", "wrong-sha", "wrong-prefix", "nested", "renamed-object"]) {
+test("lightweight, SHA-only, non-version, wrong-target, malformed and nested tags cannot satisfy policy", async (t) => {
+	for (const kind of ["lightweight", "sha-only", "wrong-prefix", "wrong-target", "nested", "renamed-object", "leading-zero-core", "leading-zero-dev", "zero-dev", "missing-dev-number", "unprefixed-stable", "prefixed-dev"]) {
 		await t.test(kind, (t) => {
 			const r = repo(t);
 			const head = addCommit(r.cwd);
-			const name = `commit-${head.slice(0, 7)}`;
+			const name = "1.6.0-dev.1";
 			if (kind === "lightweight") git(r.cwd, "tag", name);
-			if (kind === "wrong-sha") annotate(r.cwd, head, `commit-${r.baseline.slice(0, 7)}`);
+			if (kind === "sha-only") annotate(r.cwd, head, `commit-${head.slice(0, 7)}`);
 			if (kind === "wrong-prefix") annotate(r.cwd, head, "notes");
+			if (kind === "wrong-target") annotate(r.cwd, r.baseline, name);
+			if (kind === "leading-zero-core") annotate(r.cwd, head, "01.6.0-dev.1");
+			if (kind === "leading-zero-dev") annotate(r.cwd, head, "1.6.0-dev.01");
+			if (kind === "zero-dev") annotate(r.cwd, head, "1.6.0-dev.0");
+			if (kind === "missing-dev-number") annotate(r.cwd, head, "1.6.0-dev");
+			if (kind === "unprefixed-stable") annotate(r.cwd, head, "1.6.0");
+			if (kind === "prefixed-dev") annotate(r.cwd, head, "v1.6.0-dev.1");
 			if (kind === "nested") {
 				annotate(r.cwd, head, "inner");
 				git(r.cwd, "tag", "-a", name, "inner", "-m", "nested");
@@ -150,6 +164,26 @@ test("lightweight, wrongly named, mismatched SHA, and nested tags cannot satisfy
 			fails(check(r), /missing annotated|must be annotated|directly target|does not match|unambiguous/);
 		});
 	}
+});
+
+test("an annotated development version qualifies while a SHA-only alias does not", (t) => {
+	const r = repo(t);
+	const head = addCommit(r.cwd);
+	annotate(r.cwd, head, `commit-${head.slice(0, 7)}`);
+	fails(check(r), /missing annotated version tag.*SHA-only tags do not qualify/);
+	annotate(r.cwd, head, "1.6.0-dev.1");
+	ok(check(r)); // Legacy aliases can remain without granting policy coverage.
+	assert.equal(JSON.parse(readFileSync(join(r.cwd, "package.json"), "utf8")).version, "1.5.0", "development tags do not change the last released package metadata");
+});
+
+test("development versions in a fork namespace cover real PR commits", (t) => {
+	const r = repo(t);
+	const head = addCommit(r.cwd);
+	const object = annotate(r.cwd, head, "1.6.0-dev.1");
+	git(r.cwd, "update-ref", "refs/policy/fork-tags/1.6.0-dev.1", object);
+	git(r.cwd, "tag", "-d", "1.6.0-dev.1");
+	fails(check(r), /missing annotated version tag/);
+	ok(check(r, ["--tag-prefix", "refs/policy/fork-tags/"]));
 });
 
 test("fork tags in private namespace count without replacing colliding parent tag", (t) => {
@@ -234,7 +268,7 @@ test("remote wrapper handles reordered tag pushes with bounded retries using loc
 	const running = cliAsync(checkout, "check-remote-tags.mjs", args);
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	annotate(r.cwd, head);
-	git(r.cwd, "push", "-q", "origin", `refs/tags/commit-${head.slice(0, 7)}`);
+	git(r.cwd, "push", "-q", "origin", `refs/tags/${developmentTagFor(r.cwd, head)}`);
 	const result = await running;
 	ok(result);
 	assert.match(result.stderr, /Retrying/);
@@ -397,9 +431,9 @@ test("GitHub publication is draft-first, validated, idempotent, and never overwr
 			fails(check(r, ["--release-tag", "v1.5.0", "--event-after", r.object]), /pushed event object/);
 		} finally { git(r.cwd, "update-ref", "refs/tags/v1.5.0", r.object); }
 	});
-	await t.test("commit tag never qualifies for GitHub release", () => {
-		annotate(r.cwd, r.head);
-		fails(cli(r.cwd, "publish-github-release.mjs", ["--tag", `commit-${r.head.slice(0, 7)}`, "--tag-object", git(r.cwd, "rev-parse", `refs/tags/commit-${r.head.slice(0, 7)}`), "--bundle-dir", r.bundleDir]), /Invalid release tag/);
+	await t.test("development version tag never qualifies for GitHub release", () => {
+		const object = annotate(r.cwd, r.head);
+		fails(cli(r.cwd, "publish-github-release.mjs", ["--tag", developmentTagFor(r.cwd, r.head), "--tag-object", object, "--bundle-dir", r.bundleDir]), /Invalid release tag/);
 	});
 });
 
