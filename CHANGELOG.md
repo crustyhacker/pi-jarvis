@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
-## [Unreleased]
+## [1.6.0] - 2026-10-03
 
 ### Added
 - Native Pi MCP in the isolated side-session, sharing the explicit Repo tools opt-in; direct, deferred, codemode, and resource calls use live permission and lifetime checks.
@@ -15,13 +15,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Deterministic local MCP integration fixtures and release-automation regression tests, plus `RELEASING.md` and `npm run check:tags`.
 
 ### Changed
-- Every new commit requires an annotated version-number tag: `X.Y.Z-dev.N` for development snapshots or matching `vX.Y.Z` for releases. CI no longer accepts SHA-only tags as coverage; development tags never publish.
+- Every new commit requires an annotated stable `vX.Y.Z` tag and matching package, lockfile, README, and dated changelog versions. CI rejects prerelease and SHA-only coverage; there is no development-tag channel.
 
 ### Safety and limitations
 - Jarvis uses its own MCP connections to configured servers; it does not take ownership of the main session's connections. Project MCP configuration honors project trust, and server administration stays in main Pi.
 - Revocation blocks new Jarvis executions and requests cancellation; already-started native handshakes, authentication refreshes, or remote operations can finish or time out under Pi's lifecycle. Cancellation is not immediate teardown, rollback, or a sandbox.
 - Codemode model helpers are disabled; this integration does not add classifier/image-model dispatch or restore the legacy MCP adapter.
-- CI checks report tag-policy violations; enforcing protected branches/tags still requires repository rules. Historical commits through the 1.5.0 release are the policy baseline.
+- CI checks report tag-policy violations; enforcing protected branches/tags still requires repository rules. Stable-only tagging starts after historical commit `4b6b4e6`; already-pushed history is preserved rather than rewritten.
 
 ## [1.5.0] - 2026-10-03
 

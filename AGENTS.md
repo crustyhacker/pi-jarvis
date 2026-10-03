@@ -20,7 +20,7 @@
 - `follow-main` thinking follows the main thinking level regardless of model selection, except xAI `/jarvis` models force thinking `off`.
 - `/compact`, `/tree`, and `/new` entered inside `/jarvis` operate on the isolated `/jarvis` side-session, not the main Pi session.
 - `Note main` and `Redirect` stay disabled when the active `/jarvis` model is incompatible with bridge tools.
-- Published packages keep Pi runtime packages as optional peers, not bundled dependencies. Never load the legacy MCP adapter. Published 1.5.0 is local-only; unreleased source adds native MCP to Repo tools opt-in alongside read/bash/edit/write.
+- Published packages keep Pi runtime packages as optional peers, not bundled dependencies. Never load the legacy MCP adapter. Version 1.6.0 adds native MCP to Repo tools opt-in alongside read/bash/edit/write.
 - Physical models delegate to the host's public registry for auth and dispatch. Virtual/router models explicitly reject; do not access the registry's private backing runtime.
 - Side resources/settings honor `ctx.isProjectTrusted()`. Local tool execution and bridge delivery recheck live permissions; closing the overlay revokes them and cancels pending confirmations.
 - Use `agent_settled`, not `agent_end`, for final idle state. Main context must honor Pi context-edit/compaction projection.
@@ -34,7 +34,7 @@
 - Queue count excludes active work; processing includes boot and complete queue settlement. Keep activity separate from scrollback and never replay uncertain sends.
 - Bound overlay history (500 entries, 512K UTF-16 units total, 64K per entry) with explicit omission notices; never truncate persisted history.
 
-## Native MCP (Unreleased)
+## Native MCP (1.6.0)
 - Use Pi's root-exported native factories, not private registry/runtime/transport internals. Jarvis owns separate configured-server connections; main-only extension registrations are not inherited.
 - No native startup/credential expansion while initially off. Respect project trust, enabled states, native tool exposures, and live Repo tools permission for direct/deferred/codemode/resource execution.
 - Revocation invalidates permission generations, hides owned tools, aborts calls and invokes owned native shutdown. Stale prepared tools and late registrations cannot regain access after re-enable.
@@ -43,10 +43,10 @@
 - Tests use temporary agent/workspace directories and local fixture servers only; never start real user MCP servers or resolve real credentials during validation.
 
 ## Git and Release Policy
-- Every new commit MUST have an annotated **version-number** tag. Release commits use `vX.Y.Z`; development commits use `X.Y.Z-dev.N` (no leading `v`, positive increasing `N`, e.g. `1.6.0-dev.1`). SHA-only tags such as `commit-<sha>` do NOT satisfy this rule.
-- Before committing, choose an unused version tag. Tag every commit, including intermediate and merge commits; never leave a new commit untagged. Run `npm run check:tags`, then push the commit and its version tag atomically. Do not move or replace existing tags.
-- Development tags identify snapshots toward the next release; they do not publish or change the last released package version. Release versions must match package metadata, lockfile, README, and changelog.
-- CI checks all reachable commits after policy baseline `92734df`; branch/PR jobs validate on Node 22.19.0 and 24 and reject missing, lightweight, or SHA-only version coverage. Only annotated matching `vX.Y.Z` tags create GitHub releases with verified npm archives. Development version tags never release; npm publication remains manual.
+- Every new commit MUST have an annotated **stable version tag `vX.Y.Z`**. No `dev`, alpha, beta, release-candidate, build-metadata, or SHA-only tags. This is a released extension, not a prerelease channel.
+- Before committing, choose the next unused stable version and update package metadata, lockfile, README, and a dated changelog entry together. Tag every commit, including intermediate and merge commits; never leave a new commit untagged. Run `npm run check:tags`, then push the commit and version tag atomically. Do not move or replace existing tags or rewrite shared history.
+- Prefer fast-forwarding the exact validated commits to `main`; a new merge commit also requires its own version bump and tag. Every pushed `vX.Y.Z` tag triggers validated GitHub release packaging; npm publication remains manual.
+- Stable-only CI enforcement starts after historical baseline `4b6b4e6`, preserving already-pushed history. Branch/PR jobs validate on Node 22.19.0 and 24 and reject missing, lightweight, prerelease, or SHA-only version coverage. Each new tag must match that commit's package metadata, lockfile, README, and changelog.
 - Existing release assets must not be overwritten with differing bytes. See `RELEASING.md` for branch/tag protection and merge/fork constraints; CI alone cannot prevent administrator bypass.
 
 ## Validation

@@ -49,7 +49,7 @@ jobs:
       - run: npm run build
       - run: npm run verify:release
 
-# Development X.Y.Z-dev.N tags trigger neither this branch/PR CI nor a release.
+# Branch/PR CI checks stable vX.Y.Z coverage; tag pushes use release.yml.
 # Push commits + annotated tags atomically. A bounded tag refresh handles reordered
 # deliveries; a tag-only push does not retroactively change a failed branch check.
 # Fork PRs have only read permissions, no repository secrets, and no target event.

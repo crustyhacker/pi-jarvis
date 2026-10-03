@@ -21,18 +21,15 @@ function commit(cwd: string): string {
 	git(cwd, "commit", "-qm", "test commit");
 	return git(cwd, "rev-parse", "HEAD");
 }
-function addCommit(cwd: string): string {
+function addCommit(cwd: string, version = "1.5.0"): string {
+	metadata(cwd, version);
 	appendFileSync(join(cwd, "history.txt"), "new commit\n");
 	return commit(cwd);
 }
-function nextDevelopmentTag(cwd: string): string {
-	const numbers = git(cwd, "tag", "--list", "1.6.0-dev.*").split("\n").filter(Boolean).map((name) => Number(name.split(".").at(-1)));
-	return `1.6.0-dev.${Math.max(0, ...numbers) + 1}`;
+function versionTagFor(cwd: string, sha: string): string {
+	return `v${JSON.parse(git(cwd, "show", `${sha}:package.json`)).version}`;
 }
-function developmentTagFor(cwd: string, sha: string): string {
-	return git(cwd, "tag", "--points-at", sha, "--list", "1.6.0-dev.*");
-}
-function annotate(cwd: string, sha: string, name = nextDevelopmentTag(cwd)): string {
+function annotate(cwd: string, sha: string, name = versionTagFor(cwd, sha)): string {
 	git(cwd, "tag", "-a", name, sha, "-m", name);
 	return git(cwd, "rev-parse", `refs/tags/${name}`);
 }
@@ -112,7 +109,7 @@ test("policy baseline and all reachable historical ancestors are exempt", (t) =>
 test("multi-commit push needs tags on intermediate commits, not only its tip", (t) => {
 	const r = repo(t);
 	const first = addCommit(r.cwd);
-	const second = addCommit(r.cwd);
+	const second = addCommit(r.cwd, "1.5.1");
 	annotate(r.cwd, second);
 	fails(check(r), new RegExp(`${first}: missing annotated`));
 	annotate(r.cwd, first);
@@ -127,33 +124,34 @@ test("PR checks use real head commits, not synthetic merge; actual merges check 
 	const feature = commit(r.cwd);
 	annotate(r.cwd, feature);
 	git(r.cwd, "checkout", "-q", "main");
-	const main = addCommit(r.cwd);
+	const main = addCommit(r.cwd, "1.5.1");
 	annotate(r.cwd, main);
-	git(r.cwd, "merge", "--no-ff", "feature", "-m", "synthetic merge");
-	const merge = git(r.cwd, "rev-parse", "HEAD");
+	git(r.cwd, "merge", "--no-ff", "--no-commit", "feature");
+	metadata(r.cwd, "1.5.2");
+	const merge = commit(r.cwd);
 	ok(check(r, ["--head", feature]));
 	fails(check(r), /missing annotated/);
 	annotate(r.cwd, merge);
-	git(r.cwd, "tag", "-d", developmentTagFor(r.cwd, feature));
+	git(r.cwd, "tag", "-d", versionTagFor(r.cwd, feature));
 	fails(check(r), new RegExp(`${feature}: missing annotated`));
 	annotate(r.cwd, feature);
 	ok(check(r));
 });
 
 test("lightweight, SHA-only, non-version, wrong-target, malformed and nested tags cannot satisfy policy", async (t) => {
-	for (const kind of ["lightweight", "sha-only", "wrong-prefix", "wrong-target", "nested", "renamed-object", "leading-zero-core", "leading-zero-dev", "zero-dev", "missing-dev-number", "unprefixed-stable", "prefixed-dev"]) {
+	for (const kind of ["lightweight", "sha-only", "wrong-prefix", "wrong-target", "nested", "renamed-object", "leading-zero-core", "unprefixed-dev", "release-candidate", "build-metadata", "unprefixed-stable", "prefixed-dev"]) {
 		await t.test(kind, (t) => {
 			const r = repo(t);
 			const head = addCommit(r.cwd);
-			const name = "1.6.0-dev.1";
+			const name = "v1.5.0";
 			if (kind === "lightweight") git(r.cwd, "tag", name);
 			if (kind === "sha-only") annotate(r.cwd, head, `commit-${head.slice(0, 7)}`);
 			if (kind === "wrong-prefix") annotate(r.cwd, head, "notes");
 			if (kind === "wrong-target") annotate(r.cwd, r.baseline, name);
-			if (kind === "leading-zero-core") annotate(r.cwd, head, "01.6.0-dev.1");
-			if (kind === "leading-zero-dev") annotate(r.cwd, head, "1.6.0-dev.01");
-			if (kind === "zero-dev") annotate(r.cwd, head, "1.6.0-dev.0");
-			if (kind === "missing-dev-number") annotate(r.cwd, head, "1.6.0-dev");
+			if (kind === "leading-zero-core") annotate(r.cwd, head, "v01.5.0");
+			if (kind === "unprefixed-dev") annotate(r.cwd, head, "1.5.0-dev.1");
+			if (kind === "release-candidate") annotate(r.cwd, head, "v1.5.0-rc.1");
+			if (kind === "build-metadata") annotate(r.cwd, head, "v1.5.0+build.1");
 			if (kind === "unprefixed-stable") annotate(r.cwd, head, "1.6.0");
 			if (kind === "prefixed-dev") annotate(r.cwd, head, "v1.6.0-dev.1");
 			if (kind === "nested") {
@@ -166,22 +164,30 @@ test("lightweight, SHA-only, non-version, wrong-target, malformed and nested tag
 	}
 });
 
-test("an annotated development version qualifies while a SHA-only alias does not", (t) => {
+test("an annotated stable version qualifies while a SHA-only alias does not", (t) => {
 	const r = repo(t);
 	const head = addCommit(r.cwd);
 	annotate(r.cwd, head, `commit-${head.slice(0, 7)}`);
-	fails(check(r), /missing annotated version tag.*SHA-only tags do not qualify/);
-	annotate(r.cwd, head, "1.6.0-dev.1");
-	ok(check(r)); // Legacy aliases can remain without granting policy coverage.
-	assert.equal(JSON.parse(readFileSync(join(r.cwd, "package.json"), "utf8")).version, "1.5.0", "development tags do not change the last released package metadata");
+	fails(check(r), /missing annotated version tag.*SHA-only and prerelease tags do not qualify/);
+	annotate(r.cwd, head, "v1.5.0");
+	ok(check(r)); // Legacy SHA aliases do not grant policy coverage.
 });
 
-test("development versions in a fork namespace cover real PR commits", (t) => {
+test("a dev alias is rejected even alongside a valid stable version on a new commit", (t) => {
 	const r = repo(t);
 	const head = addCommit(r.cwd);
-	const object = annotate(r.cwd, head, "1.6.0-dev.1");
-	git(r.cwd, "update-ref", "refs/policy/fork-tags/1.6.0-dev.1", object);
-	git(r.cwd, "tag", "-d", "1.6.0-dev.1");
+	annotate(r.cwd, head, "v1.5.0");
+	ok(check(r));
+	annotate(r.cwd, head, "1.5.0-dev.1");
+	fails(check(r), /Invalid release tag/);
+});
+
+test("stable versions in a fork namespace cover real PR commits", (t) => {
+	const r = repo(t);
+	const head = addCommit(r.cwd);
+	const object = annotate(r.cwd, head, "v1.5.0");
+	git(r.cwd, "update-ref", "refs/policy/fork-tags/v1.5.0", object);
+	git(r.cwd, "tag", "-d", "v1.5.0");
 	fails(check(r), /missing annotated version tag/);
 	ok(check(r, ["--tag-prefix", "refs/policy/fork-tags/"]));
 });
@@ -199,7 +205,7 @@ test("fork tags in private namespace count without replacing colliding parent ta
 	fails(check(r, ["--tag-prefix", "refs/tags/"]), /refs\/policy/);
 });
 
-test("release metadata and dated first released changelog must match even with an ordinary tag", async (t) => {
+test("release metadata and dated first released changelog must match on every new commit", async (t) => {
 	const mutations: Array<[string, (cwd: string) => void]> = [
 		["manifest", (cwd) => { const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")); pkg.version = "1.6.0"; writeFileSync(join(cwd, "package.json"), JSON.stringify(pkg)); }],
 		["lock root", (cwd) => { const lock = JSON.parse(readFileSync(join(cwd, "package-lock.json"), "utf8")); lock.packages[""].version = "1.6.0"; writeFileSync(join(cwd, "package-lock.json"), JSON.stringify(lock)); }],
@@ -213,7 +219,6 @@ test("release metadata and dated first released changelog must match even with a
 		const r = repo(t);
 		mutate(r.cwd);
 		const head = commit(r.cwd);
-		annotate(r.cwd, head);
 		annotate(r.cwd, head, "v1.5.0");
 		fails(check(r), /mismatch|changelog entry|empty/);
 	});
@@ -268,7 +273,7 @@ test("remote wrapper handles reordered tag pushes with bounded retries using loc
 	const running = cliAsync(checkout, "check-remote-tags.mjs", args);
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	annotate(r.cwd, head);
-	git(r.cwd, "push", "-q", "origin", `refs/tags/${developmentTagFor(r.cwd, head)}`);
+	git(r.cwd, "push", "-q", "origin", `refs/tags/${versionTagFor(r.cwd, head)}`);
 	const result = await running;
 	ok(result);
 	assert.match(result.stderr, /Retrying/);
@@ -432,8 +437,9 @@ test("GitHub publication is draft-first, validated, idempotent, and never overwr
 		} finally { git(r.cwd, "update-ref", "refs/tags/v1.5.0", r.object); }
 	});
 	await t.test("development version tag never qualifies for GitHub release", () => {
-		const object = annotate(r.cwd, r.head);
-		fails(cli(r.cwd, "publish-github-release.mjs", ["--tag", developmentTagFor(r.cwd, r.head), "--tag-object", object, "--bundle-dir", r.bundleDir]), /Invalid release tag/);
+		const tag = "1.6.0-dev.1";
+		const object = annotate(r.cwd, r.head, tag);
+		fails(cli(r.cwd, "publish-github-release.mjs", ["--tag", tag, "--tag-object", object, "--bundle-dir", r.bundleDir]), /Invalid release tag/);
 	});
 });
 

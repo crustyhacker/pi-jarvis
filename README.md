@@ -13,7 +13,7 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.5.0</p>
+<p><strong>Current version:</strong> 1.6.0</p>
 
 <p>
   <strong>Persistent side session</strong> ·
@@ -120,7 +120,7 @@ pi install npm:pi-jarvis
 
 This package is meant to run **inside a Pi installation** that already provides the Pi runtime packages. Those host packages are declared as optional peers so npm does not install a second copy of the full Pi/AI provider stack just to add this extension.
 
-Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Published **1.5.0** supports local repository tools only. The unreleased source adds native Pi MCP as described below; it does not load the legacy `pi-mcp-adapter` or bundle another Pi runtime.
+Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Version **1.6.0** supports local repository tools and opt-in native Pi MCP as described below; it does not load the legacy `pi-mcp-adapter` or bundle another Pi runtime.
 
 ### 2) Restart or reload Pi
 
@@ -218,7 +218,7 @@ The overlay header exposes three controls, all **off by default**:
 
 | Control | What it does | Safety model |
 |---|---|---|
-| `Repo tools` | Enables local `read`, `bash`, `edit`, and `write`; unreleased source also enables configured native MCP | Explicit opt-in |
+| `Repo tools` | Enables local `read`, `bash`, `edit`, and `write`, plus configured native MCP | Explicit opt-in |
 | `Note main` | Sends a concise, non-interrupting note to the main session | Explicit opt-in |
 | `Redirect` | Sends a redirecting instruction to the main session | Explicit opt-in + per-send confirmation |
 
@@ -259,7 +259,7 @@ flowchart TD
     A --> D[Redirect off]
 
     B -->|enable| E[Jarvis may use local tools]
-    E --> H[Native MCP in unreleased source]
+    E --> H[Configured native MCP]
 
     C -->|enable| I[Jarvis may send a quiet note to main]
     D -->|enable| J[Jarvis may request redirect sends]
@@ -345,9 +345,9 @@ This repository's validation baseline is **Pi 1.0.0**, using host-provided `@ear
 
 Physical models use the main host's public model registry for requests and credentials, including custom providers and runtime-only authentication. **Virtual/router models are not supported**: Pi's public extension registry does not expose session-aware virtual routing. Pin `/jarvis-model <provider/physical-model>` if the main session uses a virtual model.
 
-### Native MCP — unreleased
+### Native MCP
 
-Pi already provides MCP; Jarvis now opts its separate SDK session into Pi's native factories. The published 1.5.0 package remains local-tools-only until the next release.
+Pi already provides MCP; Jarvis 1.6.0 opts its separate SDK session into Pi's native factories when Repo tools is enabled.
 
 - **Repo tools is the opt-in for both local tools and native MCP.** While initially off, Jarvis does not start MCP connections or expand MCP configuration credentials/commands.
 - Enabling it starts **separate, side-owned connections** to configured servers from the active agent directory's `mcp.json` and, only when trusted, the project's `.pi/mcp.json`. Main-session connections are neither reused nor disconnected. Servers registered only by main-session extensions are not automatically inherited.
@@ -398,11 +398,11 @@ Check the mandatory annotated **version-number** tag policy for committed histor
 npm run check:tags
 ```
 
-### Release automation — unreleased
+### Release automation
 
-GitHub Actions validate branch pushes and pull requests on Node 22.19.0 and 24. They require an annotated **version-number tag** on every reachable post-policy-baseline commit and run tests, build, and package verification. Development commits use `X.Y.Z-dev.N` (for example `1.6.0-dev.1`); SHA-only `commit-*` tags do not qualify. Fork PR jobs are read-only.
+GitHub Actions validate branch pushes and pull requests on Node 22.19.0 and 24. They require an annotated **stable `vX.Y.Z` tag** on every reachable post-policy-baseline commit and run tests, build, and package verification. Every commit bumps the matching package and documentation versions; prerelease (`dev`, alpha, beta, RC), build-metadata, and SHA-only tags do not qualify. Fork PR jobs are read-only.
 
-A matching annotated **`vX.Y.Z`** tag runs exact-tag validation and creates a GitHub release with the validated npm tarball. **Development version tags do not release anything. npm publication stays manual**; no npm publishing token is configured. Existing assets are verified, never overwritten with different bytes.
+A matching annotated **`vX.Y.Z`** tag runs exact-tag validation and creates a GitHub release with the validated npm tarball. **npm publication stays manual**; no npm publishing token is configured. Existing assets are verified, never overwritten with different bytes.
 
 CI reports violations; protected-branch/tag rules must be configured separately for enforcement. See [RELEASING.md](https://github.com/crustyhacker/pi-jarvis/blob/main/RELEASING.md) for atomic tagged pushes, fork/merge handling, reruns, and manual npm publication.
 
