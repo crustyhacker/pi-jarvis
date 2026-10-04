@@ -10,7 +10,7 @@
 
 `pi-jarvis` adds `/jarvis`: a polished overlay where you can ask for status, inspect the repo when you explicitly allow it, and send a quiet note or a confirmed redirect back to the main lane.
 
-**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects. **New in 1.9.0: bulk-import existing Pi sessions with a preview and explicit confirmation.**
+**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects. **New in the 1.9 series: bulk-import existing Pi sessions with a preview and explicit confirmation.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -18,7 +18,7 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.9.0</p>
+<p><strong>Current version:</strong> 1.9.1</p>
 
 <p>
   <strong>Shared persistent memory</strong> ·

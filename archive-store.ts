@@ -429,17 +429,41 @@ export class ArchiveStore {
 			this.db = new DatabaseSync(this.databasePath, { enableDoubleQuotedStringLiterals: false, allowExtension: false });
 			const db = this.db;
 			db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY`);
-			db.exec("BEGIN IMMEDIATE");
+			const deadline = performance.now() + BUSY_TIMEOUT_MS;
+			const sleep = new Int32Array(new SharedArrayBuffer(4));
 			try {
-				const version = db.prepare("PRAGMA user_version").get()?.user_version;
-				const schema = db.prepare(`SELECT sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' LIMIT ${SCHEMA_LIMIT}`).all();
-				if (create && version === 0 && schema.length === 0) {
-					for (const sql of SCHEMA) db.exec(sql);
-					db.exec(`PRAGMA user_version=${VERSION}`);
-				} else if (version !== VERSION) failure("database version");
-				this.validateSchema();
-				db.exec("COMMIT");
-			} catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+				for (;;) {
+					// Inspection must not reserve the write lock: a cooperating creator
+					// may have made the OS file but not yet initialized SQLite.
+					db.exec(create ? "BEGIN IMMEDIATE" : "BEGIN");
+					let pending = false;
+					try {
+						const version = db.prepare("PRAGMA user_version").get()?.user_version;
+						// Include internal schema objects too: only a truly empty schema
+						// is a possible creation gap, never an unknown/foreign database.
+						const empty = version === 0 && !db.prepare("SELECT 1 FROM sqlite_schema LIMIT 1").get();
+						if (create && empty) {
+							for (const sql of SCHEMA) db.exec(sql);
+							db.exec(`PRAGMA user_version=${VERSION}`);
+						} else if (!create && empty) pending = true;
+						else if (version !== VERSION) failure("database version");
+						if (!pending) this.validateSchema();
+						db.exec(pending ? "ROLLBACK" : "COMMIT");
+					} catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
+					if (!pending) break;
+					// Drop the empty snapshot before waiting, so the creator can commit.
+					// Retry observations only, never initialization or record writes.
+					let remaining = deadline - performance.now();
+					if (remaining <= 0) failure("database version");
+					Atomics.wait(sleep, 0, 0, Math.min(20, remaining));
+					remaining = deadline - performance.now();
+					if (remaining <= 0) failure("database version");
+					if (!this.checkDirectories(false)) failure("missing storage directory");
+					this.checkFiles();
+					// Native read-lock waits must also fit the observation deadline.
+					db.exec(`PRAGMA busy_timeout=${Math.ceil(remaining)}`);
+				}
+			} finally { db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`); }
 			initializeWal(db);
 			db.exec("PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=1000; PRAGMA journal_size_limit=16777216");
 			this.checkFiles();

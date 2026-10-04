@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.9.1] - 2026-10-04
+
+### Fixed
+- Close a cold-start archive-reader race exposed by clean-runner release validation: readers can observe a newly created empty file before a concurrent writer finishes initializing it. Wait only within a bounded initialization window, without initializing/resetting the file or replaying record writes. Unknown nonempty schemas remain errors.
+- Retain the 1.9.0 commit/tag without rewriting history; its GitHub package workflow was blocked by validation. This patch carries the bulk-import feature forward to a validated package release.
+
 ## [1.9.0] - 2026-10-04
 
 ### Added

@@ -660,11 +660,65 @@ test("unknown/foreign/corrupt storage is never reset, and reads cannot initializ
 		const f = fixture(t), store = f.store(); fs.mkdirSync(dirname(store.path), { recursive: true }); fs.writeFileSync(store.path, "fixture not SQLite");
 		assert.throws(() => store.stats(f.a)); assert.equal(fs.readFileSync(store.path, "utf8"), "fixture not SQLite");
 	});
-	await t.test("empty file is not initialized by inspection", (t) => {
-		const f = fixture(t), store = f.store(); fs.mkdirSync(dirname(store.path), { recursive: true }); fs.writeFileSync(store.path, "");
-		assert.throws(() => store.stats(f.a), /version/); assert.equal(fs.statSync(store.path).size, 0);
-		assert.equal(store.append(f.input()), "saved");
+	for (const kind of ["empty file", "empty SQLite schema"] as const) await t.test(`${kind} is not initialized by inspection within a finite observation budget`, (t) => {
+		const f = fixture(t), store = f.store(); fs.mkdirSync(dirname(store.path), { recursive: true }); fs.writeFileSync(store.path, "", { mode: 0o600 });
+		if (kind === "empty SQLite schema") { const db = database(store.path); try { db.exec("PRAGMA user_version=0"); } finally { db.close(); } }
+		const before = fs.readFileSync(store.path), inode = fs.statSync(store.path).ino;
+		const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite"), exec = DatabaseSync.prototype.exec;
+		let elapsed = 0, snapshots = 0, transaction = false;
+		t.mock.method(performance, "now", () => elapsed);
+		t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+			assert.notEqual(sql, "BEGIN IMMEDIATE", "inspection must not reserve the creator's write lock");
+			assert.doesNotMatch(sql, /CREATE|PRAGMA (?:user_version=|journal_mode=WAL)/);
+			const result = exec.call(this, sql);
+			if (sql === "BEGIN") { transaction = true; snapshots++; }
+			if (sql === "COMMIT" || sql === "ROLLBACK") transaction = false;
+			return result;
+		});
+		t.mock.method(Atomics, "wait", (_buffer: Int32Array, _index: number, _value: number, timeout: number) => {
+			assert.equal(transaction, false, "release the empty snapshot before waiting for the creator");
+			assert.ok(timeout > 0 && timeout <= 20); elapsed += timeout; return "timed-out";
+		});
+		assert.throws(() => store.stats(f.a), /version/);
+		assert.equal(elapsed, 5000); assert.equal(snapshots, 250); assert.equal(transaction, false);
+		assert.equal(fs.statSync(store.path).ino, inode); assert.deepEqual(fs.readFileSync(store.path), before);
+		assert.deepEqual(fs.readdirSync(dirname(store.path)), ["archive.sqlite"]);
+		t.mock.restoreAll(); assert.equal(store.append(f.input()), "saved", "only an explicit writer can initialize empty storage");
 	});
+});
+
+test("nonempty/future foreign schemas reject immediately without waiting, WAL setup or storage changes", async (t) => {
+	for (const sql of [
+		"CREATE TABLE foreign_data(value TEXT); INSERT INTO foreign_data VALUES('fixture')",
+		"CREATE TABLE temporary_fixture(id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE temporary_fixture", // sqlite_sequence remains.
+		"PRAGMA user_version=2",
+		"CREATE TABLE foreign_data(value TEXT); PRAGMA user_version=1",
+	]) await t.test(sql, (t) => {
+		const f = fixture(t), store = f.store(); fs.mkdirSync(dirname(store.path), { recursive: true });
+		const db = database(store.path); try { db.exec(sql); } finally { db.close(); }
+		const before = fs.readFileSync(store.path), inode = fs.statSync(store.path).ino;
+		t.mock.method(Atomics, "wait", () => assert.fail("only version zero + completely empty schema may wait"));
+		const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite"), exec = DatabaseSync.prototype.exec;
+		t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+			assert.doesNotMatch(sql, /CREATE|PRAGMA (?:user_version=|journal_mode=WAL)/);
+			return exec.call(this, sql);
+		});
+		assert.throws(() => store.stats(f.a), /database (?:version|schema)/);
+		assert.throws(() => store.search({ project: f.a }), /database (?:version|schema)/);
+		assert.throws(() => store.append(f.input()), /database (?:version|schema)/);
+		assert.equal(fs.statSync(store.path).ino, inode); assert.deepEqual(fs.readFileSync(store.path), before);
+		assert.deepEqual(fs.readdirSync(dirname(store.path)), ["archive.sqlite"]);
+	});
+});
+
+test("inspection opens with a deferred snapshot while a peer holds the write reservation", (t) => {
+	const f = fixture(t), writer = f.store(); writer.append(f.input());
+	const blocker = database(writer.path);
+	try {
+		blocker.exec("BEGIN IMMEDIATE");
+		assert.equal(f.store().stats(f.a).records, 1);
+		assert.equal(f.store().search({ project: f.a, query: "fixture" }).records.length, 1);
+	} finally { blocker.close(); }
 });
 
 test("I/O failures propagate without replacing data and can recover with the same path", (t) => {
@@ -779,6 +833,69 @@ test("failed FTS writes/deletions roll back bodies/tombstones; uncertain commits
 		assert.throws(() => store.append(f.input())); assert.equal(commits, 2);
 		t.mock.restoreAll(); assert.equal(store.append(f.input()), "duplicate"); assert.equal(store.stats(f.a).records, 1);
 	});
+});
+
+function pausedWorker(t: TestContext, script: string, args: string[]) {
+	const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, ...args], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
+	let stderr = "", readyResolve!: () => void, readyReject!: (error: Error) => void;
+	const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+	child.on("message", message => { if (message === "ready") readyResolve(); });
+	child.stderr!.on("data", data => { stderr += data; });
+	const done = new Promise<void>((resolve, reject) => {
+		child.once("error", error => { readyReject(error); reject(error); });
+		child.once("close", code => {
+			const error = new Error(`worker exit ${code}: ${stderr}`);
+			readyReject(error); code === 0 ? resolve() : reject(error);
+		});
+	});
+	// These workers can fail while their counterpart is still starting.
+	void ready.catch(() => {}); void done.catch(() => {});
+	t.after(() => { if (child.exitCode === null) child.kill(); });
+	return { ready, done };
+}
+
+test("reader observes a paused creator's empty OS file without initializing or locking it", { timeout: 20_000 }, async (t) => {
+	const f = fixture(t), release = join(f.root, "release-writer"), input = f.input();
+	const writerScript = `import assert from 'node:assert/strict'; import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+		const {ArchiveStore}=await import(${JSON.stringify(storeUrl)}); const [agent,raw,release]=process.argv.slice(1); const s=new ArchiveStore(agent);
+		const open=fs.openSync; let paused=false;
+		fs.openSync=(path,...args)=>{const fd=open(path,...args); if(path===s.path && !paused) {
+			paused=true; assert.equal(fs.statSync(path).size,0); process.send('ready');
+			const deadline=Date.now()+10000, sleep=new Int32Array(new SharedArrayBuffer(4));
+			while(!fs.existsSync(release)) { if(Date.now()>=deadline) throw new Error('creator release timed out'); Atomics.wait(sleep,0,0,10); }
+		} return fd;}; syncBuiltinESMExports();
+		try { assert.equal(s.append(JSON.parse(raw)),'saved'); assert.equal(paused,true); }
+		finally {fs.openSync=open; syncBuiltinESMExports(); s.close(); process.disconnect();}`;
+	const writer = pausedWorker(t, writerScript, [f.agent, JSON.stringify(input), release]);
+	await writer.ready;
+	const path = f.store().path, inode = fs.statSync(path).ino;
+	assert.equal(fs.statSync(path).size, 0);
+	const readerScript = `import assert from 'node:assert/strict'; import fs from 'node:fs'; import {createRequire} from 'node:module';
+		const {ArchiveStore}=await import(${JSON.stringify(storeUrl)}); const [agent,project]=process.argv.slice(1); const s=new ArchiveStore(agent);
+		const {DatabaseSync}=createRequire(import.meta.url)('node:sqlite'), exec=DatabaseSync.prototype.exec;
+		let observed=false, transaction=false;
+		DatabaseSync.prototype.exec=function(sql) {
+			assert.notEqual(sql,'BEGIN IMMEDIATE'); assert.doesNotMatch(sql,/CREATE|INSERT|PRAGMA user_version=/);
+			if(sql==='PRAGMA journal_mode=WAL') { assert.equal(observed,true); assert.equal(this.prepare('PRAGMA user_version').get().user_version,1); }
+			const result=exec.call(this,sql);
+			if(sql==='BEGIN') transaction=true;
+			if(sql==='COMMIT'||sql==='ROLLBACK') transaction=false;
+			if(sql==='ROLLBACK'&&!observed) { observed=true; assert.equal(fs.statSync(s.path).size,0); process.send('ready'); }
+			return result;
+		};
+		const wait=Atomics.wait; Atomics.wait=(...args)=>{assert.equal(transaction,false); return wait(...args);};
+		try { const page=s.search({project,query:'fixture'}); assert.ok(page.records.length<=1); assert.equal(observed,true); }
+		finally {s.close(); process.disconnect();}`;
+	const reader = pausedWorker(t, readerScript, [f.agent, f.a]);
+	await reader.ready; // Reader has actually released a version-zero empty snapshot; no timing assumption.
+	assert.equal(fs.statSync(path).ino, inode); assert.equal(fs.statSync(path).size, 0);
+	assert.deepEqual(fs.readdirSync(dirname(path)), ["archive.sqlite"]);
+	fs.writeFileSync(release, "continue");
+	await Promise.all([writer.done, reader.done]);
+	const store = f.store();
+	assert.equal(fs.statSync(path).ino, inode);
+	assert.equal(store.search({ project: f.a, query: "fixture" }).records[0].id, opaqueId(input));
+	assert.equal(readAll(store, opaqueId(input), f.a), JSON.stringify(input.entry));
 });
 
 test("simultaneous writer/deleter/reader processes initialize safely with no resurrection or lost updates", { timeout: 40_000 }, async (t) => {
