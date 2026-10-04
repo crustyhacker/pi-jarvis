@@ -114,15 +114,7 @@ function clearJarvisConfigSetting(
 	agentDir: string,
 ): void {
 	const path = getJarvisConfigPath(cwd, scope, agentDir);
-	let config: JarvisConfigFile | undefined;
-	try {
-		config = readJarvisConfigFileIfPresent(path);
-	} catch (error) {
-		if (!(error instanceof MalformedJarvisConfigError)) throw error;
-		// Explicit clear intentionally recovers malformed JSON, not unreadable files.
-		rmSync(path, { force: true });
-		return;
-	}
+	const config = readJarvisConfigFileIfPresent(path);
 	if (!config) return;
 
 	delete config[setting];
@@ -146,29 +138,31 @@ function readJarvisConfigFileIfPresent(path: string): JarvisConfigFile | undefin
 }
 
 function readJarvisConfigFile(path: string): JarvisConfigFile {
-	// Keep I/O errors distinct from intentional malformed-content recovery.
+	// Keep I/O errors distinct from malformed content; neither permits overwriting existing settings.
 	const text = readFileSync(path, "utf-8");
 	let raw: unknown;
 	try {
 		raw = JSON.parse(text);
 	} catch (error) {
-		throw new MalformedJarvisConfigError(`Failed to parse ${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+		// Parser messages can contain private input snippets; expose only safe repair guidance.
+		throw new MalformedJarvisConfigError(
+			`Invalid JSON in ${path}. Repair this file manually before changing settings to preserve memory/privacy settings.`,
+			{ cause: error },
+		);
 	}
 
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-		throw new MalformedJarvisConfigError(`Expected ${path} to contain a JSON object.`);
+		throw new MalformedJarvisConfigError(
+			`Expected ${path} to contain a JSON object. Repair this file manually before changing settings to preserve memory/privacy settings.`,
+		);
 	}
 
 	return { ...(raw as Record<string, unknown>) };
 }
 
 function readExistingJarvisConfigFileForWrite(path: string): JarvisConfigFile {
-	try {
-		return readJarvisConfigFileIfPresent(path) ?? {};
-	} catch (error) {
-		if (!(error instanceof MalformedJarvisConfigError)) throw error;
-		return {};
-	}
+	// Shared files can contain memory kill switches and unknown settings. Never recover by discarding them.
+	return readJarvisConfigFileIfPresent(path) ?? {};
 }
 
 function writeJarvisConfigFile(path: string, config: JarvisConfigFile): void {

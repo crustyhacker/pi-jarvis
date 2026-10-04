@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import {
-	clearJarvisModelSelectionSetting, clearJarvisThinkingSelectionSetting, getJarvisConfigPath,
+	clearJarvisModelSelectionSetting, clearJarvisThinkingSelectionSetting, getJarvisConfigPath, MalformedJarvisConfigError,
 	loadJarvisModelSelectionSetting, loadJarvisThinkingSelectionSetting,
 	saveJarvisModelSelectionSetting, saveJarvisThinkingSelectionSetting,
 } from "../jarvis-config.js";
@@ -34,6 +34,7 @@ export async function runConfigRegressionTests(): Promise<void> {
 			const initial = JSON.stringify({
 				modelSelection: { mode: "follow-main" },
 				thinkingSelection: { mode: "pinned", thinkingLevel: "high" },
+				memory: { enabled: false, capture: false, recall: false },
 				unknown: { keep: [1, 2] },
 			});
 			const reset = () => fs.writeFileSync(path, initial);
@@ -45,7 +46,10 @@ export async function runConfigRegressionTests(): Promise<void> {
 			assert.deepEqual(JSON.parse(fs.readFileSync(path, "utf8")).unknown, { keep: [1, 2] });
 			assert.deepEqual(loadJarvisThinkingSelectionSetting(cwd, scope, agentDir), { mode: "pinned", thinkingLevel: "max" });
 			clearJarvisThinkingSelectionSetting(cwd, scope, agentDir);
-			assert.deepEqual(JSON.parse(fs.readFileSync(path, "utf8")), { unknown: { keep: [1, 2] } });
+			assert.deepEqual(JSON.parse(fs.readFileSync(path, "utf8")), {
+				memory: { enabled: false, capture: false, recall: false },
+				unknown: { keep: [1, 2] },
+			});
 
 			for (const code of ["EACCES", "EIO", "EPERM"] as const) {
 				reset();
@@ -95,6 +99,7 @@ export async function runConfigRegressionTests(): Promise<void> {
 			}
 
 			reset();
+			if (process.platform !== "win32") fs.chmodSync(path, 0o640);
 			const originalRename = fs.renameSync;
 			let renamed = false;
 			withFsFault("renameSync", ((from, to) => {
@@ -106,16 +111,81 @@ export async function runConfigRegressionTests(): Promise<void> {
 				originalRename(from, to);
 			}) as typeof fs.renameSync, () => saveJarvisThinkingSelectionSetting(cwd, scope, { mode: "auto" }, agentDir));
 			assert.ok(renamed, "successful writes replace atomically");
+			if (process.platform !== "win32") assert.equal(fs.statSync(path).mode & 0o777, 0o640, "replacement preserves existing permissions");
 
-			for (const malformed of ["{broken", "null", "[]", "42"]) {
-				fs.writeFileSync(path, malformed);
-				assert.throws(() => loadJarvisModelSelectionSetting(cwd, scope, agentDir));
-				saveJarvisModelSelectionSetting(cwd, scope, { mode: "follow-main" }, agentDir);
-				assert.deepEqual(loadJarvisModelSelectionSetting(cwd, scope, agentDir), { mode: "follow-main" });
-				fs.writeFileSync(path, malformed);
-				clearJarvisThinkingSelectionSetting(cwd, scope, agentDir);
-				assert.ok(!fs.existsSync(path), "explicit clear still recovers malformed content");
+			const settingActions = [
+				{
+					name: "set model", setting: "modelSelection", replacement: { mode: "follow-main" },
+					run: () => saveJarvisModelSelectionSetting(cwd, scope, { mode: "follow-main" }, agentDir),
+				},
+				{
+					name: "clear model", setting: "modelSelection", replacement: undefined,
+					run: () => clearJarvisModelSelectionSetting(cwd, scope, agentDir),
+				},
+				{
+					name: "set thinking", setting: "thinkingSelection", replacement: { mode: "auto" },
+					run: () => saveJarvisThinkingSelectionSetting(cwd, scope, { mode: "auto" }, agentDir),
+				},
+				{
+					name: "clear thinking", setting: "thinkingSelection", replacement: undefined,
+					run: () => clearJarvisThinkingSelectionSetting(cwd, scope, agentDir),
+				},
+			] as const;
+			const privateConfig = '{"memory":{"enabled":false},"private":"fixture-private-sentinel"}';
+			const malformedFiles = [
+				{ text: '{"memory":{"enabled":false},"private":"fixture-private-sentinel","invalid":fixture-parser-snippet}', parseError: true },
+				{ text: ` \t${privateConfig}\n// fixture-parser-snippet\n`, parseError: true },
+				{ text: "{broken", parseError: true },
+				{ text: `[${privateConfig}]`, parseError: false },
+				{ text: JSON.stringify(privateConfig), parseError: false },
+				...["null", "[]", "42", "false"].map((text) => ({ text, parseError: false })),
+			];
+			for (const { text, parseError } of malformedFiles) {
+				const bytes = Buffer.from(text);
+				fs.writeFileSync(path, bytes);
+				const before = fs.statSync(path);
+				for (const { name, run } of [
+					...settingActions,
+					{ name: "load model", run: () => loadJarvisModelSelectionSetting(cwd, scope, agentDir) },
+					{ name: "load thinking", run: () => loadJarvisThinkingSelectionSetting(cwd, scope, agentDir) },
+				]) {
+					assert.throws(run, (error) => {
+						assert.ok(error instanceof MalformedJarvisConfigError);
+						assert.equal(error.message, parseError
+							? `Invalid JSON in ${path}. Repair this file manually before changing settings to preserve memory/privacy settings.`
+							: `Expected ${path} to contain a JSON object. Repair this file manually before changing settings to preserve memory/privacy settings.`);
+						assert.ok(!String(error).includes("fixture-private-sentinel"), "UI error must not expose private input");
+						assert.ok(!String(error).includes("fixture-parser-snippet"), "UI error must not expose parser snippets");
+						if (parseError) assert.ok(error.cause instanceof SyntaxError, "original parse error stays available as cause only");
+						return true;
+					}, `${scope} ${name} must fail closed on malformed JSON/nonobjects`);
+					assert.deepEqual(fs.readFileSync(path), bytes, `${scope} ${name} must preserve exact corrupted bytes and any memory kill switch`);
+					const after = fs.statSync(path);
+					assert.equal(after.ino, before.ino, "refusal must not replace the file");
+					assert.equal(after.mode, before.mode, "refusal must not change permissions");
+					assert.equal(after.mtimeMs, before.mtimeMs, "refusal must not write the file");
+					assert.deepEqual(fs.readdirSync(dirname(path)), [scope === "project" ? "jarvis.json" : "pi-jarvis.json"], "refusal must not leave temporary files");
+				}
 			}
+
+			// Repairing/clearing an owned field in a valid object must retain all other settings.
+			const malformedFields = {
+				...JSON.parse(initial),
+				modelSelection: { mode: "invalid-model" },
+				thinkingSelection: { mode: "pinned", thinkingLevel: "invalid-thinking" },
+			};
+			for (const { name, setting, replacement, run } of settingActions) {
+				fs.writeFileSync(path, JSON.stringify(malformedFields));
+				assert.throws(() => loadJarvisModelSelectionSetting(cwd, scope, agentDir), MalformedJarvisConfigError);
+				assert.throws(() => loadJarvisThinkingSelectionSetting(cwd, scope, agentDir), MalformedJarvisConfigError);
+				run();
+				const expected: Record<string, unknown> = { ...malformedFields };
+				if (replacement === undefined) delete expected[setting];
+				else expected[setting] = replacement;
+				assert.deepEqual(JSON.parse(fs.readFileSync(path, "utf8")), expected, `${scope} ${name} must preserve memory, unknown keys, and the other field`);
+			}
+
+			fs.rmSync(path);
 			assert.equal(loadJarvisModelSelectionSetting(cwd, scope, agentDir), undefined);
 			clearJarvisModelSelectionSetting(cwd, scope, agentDir);
 			saveJarvisThinkingSelectionSetting(cwd, scope, { mode: "auto" }, agentDir);

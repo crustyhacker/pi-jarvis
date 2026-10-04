@@ -105,7 +105,11 @@ function harness(root: string, id: number) {
 	};
 	const pi: any = {
 		registerCommand: (name: string, command: any) => commands.set(name, command),
-		on: (name: string, handler: any) => handlers.set(name, handler),
+		registerTool() {},
+		on: (name: string, handler: any) => {
+			const previous = handlers.get(name);
+			handlers.set(name, async (event, context) => { await previous?.(event, context); await handler(event, context); });
+		},
 		getThinkingLevel: () => "high",
 		appendEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
 		sendUserMessage() { assert.fail("status feedback must never deliver to the main session"); },

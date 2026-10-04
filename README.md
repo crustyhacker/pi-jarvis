@@ -16,9 +16,10 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.6.1</p>
+<p><strong>Current version:</strong> 1.7.0</p>
 
 <p>
+  <strong>Shared persistent memory</strong> ·
   <strong>Persistent side session</strong> ·
   <strong>Live main-session awareness</strong> ·
   <strong>Opt-in local tools + native MCP</strong> ·
@@ -77,6 +78,7 @@ The main Pi session should stay on the critical path.
 
 | Capability | What you get |
 |---|---|
+| **Shared memory** | Main Pi and Jarvis remember useful discussions across sessions; enabled by default, with global/project controls and a master off switch |
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
 | **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
 | **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and configured native MCP stay off until you enable Repo tools |
@@ -93,6 +95,8 @@ flowchart LR
     U[You] -->|primary work| M[Main Pi session]
     U -->|open /jarvis| J[Jarvis overlay]
     M -->|summary + recent delta| J
+    M <-->|independent memory controls| S[Shared local memory]
+    J <-->|independent memory controls| S
     J -->|Repo tools enabled| R[Local tools\nread • bash • edit • write]
     J -->|Repo tools enabled| C[Configured native MCP\nside-owned connections]
     J -. Note main .-> M
@@ -148,6 +152,8 @@ Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Version **1.6.0** suppor
 ### 2) Restart or reload Pi
 
 `pi install` registers the package automatically. For local development, build and load `./dist/index.js` with `pi -e ./dist/index.js`.
+**New in 1.7.0: shared memory is enabled by default in trusted projects**, including main Pi even if you never open the overlay. A first-use notice explains capture and recall. Already using another memory extension? Run `/jarvis-memory off` before your first prompt; this disables both main and Jarvis memory without deleting anything.
+
 ### 3) Open Jarvis
 
 ```bash
@@ -162,7 +168,7 @@ Or open it and send the first message immediately:
 
 ### 4) Turn on more power only when you want it
 
-- leave `Repo tools` off for pure context / analysis
+- leave `Repo tools` off for context / analysis without repository or MCP access; shared memory has separate controls
 - turn `Repo tools` on when you want local `read`, `bash`, `edit`, `write`, and configured native MCP capabilities
 - turn `Note main` on when you want Jarvis to quietly message the main session
 - turn `Redirect` on when you want Jarvis to propose a redirect that you still explicitly confirm
@@ -198,6 +204,9 @@ Sets the thinking level used by `/jarvis` without changing the main session thin
 ### `/jarvis-thinking [--project|--global] clear`
 Removes the selected scope so `/jarvis` thinking falls back through the remaining config layers to the built-in `auto` default.
 
+### `/jarvis-memory`
+Reports shared-memory status. Use `/jarvis-memory help` for controls and data-management commands. Memory controls default to **global**, unlike model/thinking controls. See [Shared memory](#shared-memory) below.
+
 ### Side-session commands inside `/jarvis`
 The `/jarvis` input handles a small set of built-in commands against the isolated side-session:
 
@@ -206,6 +215,74 @@ The `/jarvis` input handles a small set of built-in commands against the isolate
 - `/tree <entry-id>` navigates the `/jarvis` session tree to that entry.
 - `/tree --summarize <entry-id> [instructions]` navigates and summarizes the branch being left.
 - `/new` starts a fresh `/jarvis` side-session without changing the main Pi session.
+- `/memory …` or `/jarvis-memory …` manages shared memory immediately, without sending a model prompt or waiting for queued side work. Initial forms such as `/jarvis /memory off` are also handled locally, without booting a side session.
+
+---
+
+## Shared memory
+
+Main Pi and Jarvis use **one local memory service**, independent of the overlay lifecycle. Useful Jarvis discussions can inform a later main session and vice versa—even when `Note main` is off. Memory does not steer or queue messages into the other session; it supplies historical context when recalled. Close/reopen, `/new`, and project changes do not erase it.
+
+### What is remembered
+
+- **Conversation archive:** only newly finalized user/assistant text observed after loading this feature, labeled with project, main/Jarvis lane, session ID, event identity and timestamps. No silent historical import or reconstruction from old session files.
+- **Curated notes:** your active model can save concise preferences, corrections, project decisions and references during normal foreground work. Stable scoped titles update/deduplicate notes. You can save or edit notes explicitly too. Curation depends on the model choosing the tool; it is not a separate background summarizer.
+- **Bounded recall:** a small request-local selection of global/current-project notes and matching conversation excerpts, using local keyword search. Other projects are available through explicit `search --all` or the model's cross-project search tool. Project scope uses the canonical working directory, not a remote repository name; separate worktrees remain separate scopes unless a note is global.
+
+There are **no embeddings, background model calls, telemetry, or memory-server connections**. Retrieval and saving tools can add normal foreground model turns/tokens. Recalled text is sent to the active model as untrusted historical data, not instructions. Automatic recall is capped at 6,000 UTF-8 bytes of record JSON plus a short notice; tool search results are capped at 12,000 bytes with explicit excerpt/omission markers. Automatically injected memory guidance and recall are request-local, not appended to Pi's persisted transcript. Explicit memory-tool calls/results are recorded normally by Pi and may contain saved facts; model replies may repeat them too.
+
+### Controls
+
+```text
+/jarvis-memory                         # status, without reading stored memories
+/jarvis-memory off                     # global MASTER OFF for main + Jarvis
+/jarvis-memory on                      # enable globally; project restrictions still apply
+/jarvis-memory capture off             # saving default off (project overrides apply)
+/jarvis-memory recall off              # recall default off (project overrides apply)
+/jarvis-memory --project off           # pause memory in this project
+/jarvis-memory --project clear         # remove this project's memory settings
+/jarvis-memory --global clear          # remove global settings, not stored data
+```
+
+`enabled`, `capture`, and `recall` default to `true`. Each field resolves project → global → default, **except global `enabled: false` is a master switch that no project can override**. Untrusted projects and unreadable/malformed settings pause all memory. Use `--project capture off` or `--project recall off` to pause that capability specifically here; inspect status for the effective setting. The full off switch means no capture, memory-record reads, injection, tool execution, or background work; existing data remains on disk. Even inspection requires re-enabling memory. Explicit management commands still work with only capture or recall turned off. Turning memory off does not erase facts/tool results already in the current conversation or already-viewed output.
+
+Controls share the existing settings files and preserve model/thinking/unknown keys:
+
+```json
+{
+  "memory": { "enabled": false }
+}
+```
+
+Place this in `<agentDir>/extensions/pi-jarvis.json` to disable memory before installation/startup (normally `~/.pi/agent/extensions/pi-jarvis.json`; honors `PI_CODING_AGENT_DIR`). Project overrides live in `.pi/jarvis.json`. Memory settings writes are atomic and use a bounded cooperative lock; legacy model/thinking writers do not share that lock, so avoid concurrent configuration changes. Corrupt shared settings are never automatically repaired or overwritten—even by model/thinking set or clear commands. Repair the JSON manually while preserving privacy settings. A crashed config writer can leave a `.memory.lock` file; remove it only after confirming no writer is running.
+
+### Inspect, edit and forget
+
+```text
+/jarvis-memory list                    # recent global/current-project records
+/jarvis-memory search deployment       # local keyword search
+/jarvis-memory search --all deployment # explicitly search every project
+/jarvis-memory show <id>
+/jarvis-memory remember --global Answer style | Prefer concise answers.
+/jarvis-memory remember Build choice | This project uses npm, not pnpm.
+/jarvis-memory edit <id> Replacement fact, preserving the note's scope/title.
+/jarvis-memory forget <id>
+/jarvis-memory forget-all --confirm     # this project's records only
+/jarvis-memory forget-all --confirm --global
+/jarvis-memory forget-all --confirm --all
+```
+
+Put data scope flags **after the action**. `list --global` and `search --global …` restrict results to global records; `show --all <id>` and `forget --all <id>` explicitly allow another project's record. Lists and searches are bounded; narrow your query to find older records. Model-requested deletion is limited to one current/global record and requires human confirmation; commands above are explicit user actions. Confirmation is cancelled on observed permission change, abort or disposal, and a concurrently changed record must be reviewed again. Settings are rechecked at operation boundaries; other processes do not receive a live push notification.
+
+### Storage and privacy
+
+The store is `<agentDir>/extensions/pi-jarvis-memory/memory.sqlite`, with SQLite transaction/WAL coordination across processes. It is opened lazily; Node 22/24 may print an experimental SQLite warning on first actual use. On POSIX, the owned directory is mode `0700` and database mode `0600`; this is **local plaintext, not encryption or a sandbox**. Backups of your agent directory may include it.
+
+Only newly finalized visible text is captured—not thinking blocks, tool results/calls, images, custom/system messages, failed/aborted assistant outputs, or old session files. Metadata-only event anchors are resolved after Pi's message-finalization/redaction hooks, at turn/settlement boundaries. Pending captures are discarded on permission/session changes or disposal, not replayed after re-enable. Recognizable credential blocks are omitted and common secret formats redacted, but **filtering is best-effort and cannot detect every sensitive detail**. Pause capture or disable memory for sensitive work. Notes containing detected secrets are rejected rather than silently changed. Oversized captures (over 16 KiB UTF-8) are omitted, not truncated into misleading facts; curated-note writes over that limit fail explicitly.
+
+Retention is bounded to the newest 10,000 captured messages and 1,000 curated notes. Archive rollover never truncates Pi's original history; notes are not automatically discarded at their limit. Forgetting tombstones the record identity so the same captured event/scoped note title is not automatically restored; an explicit `remember` command can restore a forgotten title. This is not semantic erasure of every mention: other records, original Pi transcripts, already-sent model context and backups may still contain the fact. SQLite deletion is logical, **not forensic secure erasure**.
+
+The combined live-record/tombstone budget is 100,000 identities: new identity saves fail at capacity rather than dropping deletion markers; existing records always reserve room for forgetting. First database open performs synchronous integrity checks and can briefly pause on a large archive. SQLite WAL files can temporarily grow while another process holds a reader snapshot; there is no strict total-directory disk quota. To completely reset/delete this local store without re-enabling memory, stop every Pi process using it, then remove only the `pi-jarvis-memory` directory yourself. This also removes tombstones, not original Pi transcripts.
 
 ---
 
@@ -231,7 +308,7 @@ Model and thinking settings resolve through the same config layers, then fall ba
 2. global config: `~/.pi/agent/extensions/pi-jarvis.json` or the equivalent path under a custom Pi agent dir
 3. built-in defaults: model `follow-main`, thinking `auto`
 
-Global writes do not displace an existing project override. Config writes use same-directory atomic replacement and preserve unrelated keys; unreadable files are never treated as malformed JSON and overwritten. Malformed JSON can still be explicitly cleared or replaced. Avoid simultaneous configuration writes from multiple Pi processes: cross-process locking is not implemented.
+Global writes do not displace an existing project override. Config writes use same-directory atomic replacement and preserve unrelated keys; unreadable files are never treated as malformed JSON and overwritten. Malformed JSON must be manually repaired: set/clear commands will not replace or delete a corrupt shared file and risk resetting memory privacy controls. Avoid simultaneous configuration writes from multiple Pi processes: cross-process locking is not implemented.
 
 ---
 
@@ -277,7 +354,7 @@ The compact header keeps main status, the side model, main focus, and permission
 
 The multiline editor uses Pi's public editor and configured editing keybindings. Up/Down move within a draft; Up at the beginning of the first line (or in an empty editor) recalls prompts. Down past recalled prompts restores the draft. Pasted indentation and newlines are preserved, with Pi's normal tab-to-spaces normalization. Oversized drafts (over 64 KiB) and terminal-control payloads are rejected explicitly, never silently truncated or sent.
 
-Unsent drafts survive closing and reopening `/jarvis` in the same running Pi session. They are not saved to disk. Side `/new`, main-session replacement, and switching to an unrelated side-session reference clear them; navigating the side tree only resets the transcript view. Closing still revokes every permission.
+Unsent drafts survive closing and reopening `/jarvis` in the same running Pi session. They are not saved to disk. Side `/new`, main-session replacement, and switching to an unrelated side-session reference clear them; navigating the side tree only resets the transcript view. Closing still revokes all three overlay permissions; shared memory follows its separate persistent controls.
 
 Scrollback follows new output until you scroll up. To bound rendering work, the overlay retains up to 500 recent entries and 512K UTF-16 code units of source text, with a 64K-unit per-entry limit. Omitted content is marked explicitly; these display limits do not modify persisted conversation history. Resizing preserves the reading position on a best-effort basis.
 

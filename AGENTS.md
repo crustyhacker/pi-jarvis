@@ -2,7 +2,7 @@
 
 ## Project Scope
 - `pi-jarvis` is a Pi extension that opens a `/jarvis` side-conversation overlay.
-- Core runtime files: `index.ts`, `side-session.ts`, `native-mcp.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `jarvis-branding.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
+- Core runtime files: `index.ts`, `side-session.ts`, `native-mcp.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `jarvis-branding.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`, and `memory-{types,config,content,store,service,extension}.ts`.
 - Current baseline: Pi 1.0.0 (`@earendil-works` packages), Node.js >=22.19.0. Older Pi hosts are not supported.
 
 ## Current `/jarvis-model` and `/jarvis-thinking` Behavior
@@ -15,7 +15,7 @@
 - `/jarvis-thinking [--project|--global] auto|follow-main|off|minimal|low|medium|high|xhigh|max` stores a scoped thinking override without changing the main session thinking level.
 - `/jarvis-thinking [--project|--global] clear` removes that scope's thinking override so fallback applies.
 - Resolution order is: project config, then global config, then built-in defaults (`follow-main` for model, `auto` for thinking). Global writes never override an active project setting.
-- Config writes use atomic same-directory replacement. I/O errors must not trigger malformed-JSON recovery. Cross-process concurrent config writes are not locked.
+- Config writes use atomic same-directory replacement. Malformed shared JSON requires manual repair: model/thinking set/clear must never replace/delete it and reset unknown memory privacy controls. Keep I/O errors distinct and parser input snippets out of UI errors. Legacy model/thinking cross-process writes remain unlocked.
 - `auto` thinking follows main only when `/jarvis` follows the main model; pinned `/jarvis` models default to thinking `off`.
 - `follow-main` thinking follows the main thinking level regardless of model selection, except xAI `/jarvis` models force thinking `off`.
 - `/compact`, `/tree`, and `/new` entered inside `/jarvis` operate on the isolated `/jarvis` side-session, not the main Pi session.
@@ -48,6 +48,17 @@
 - Pi cancellation is best effort: already-started handshake/authentication/remote work may finish or time out after shutdown is requested. Do not promise immediate child teardown, rollback, or sandboxing.
 - Keep server administration in main Pi. Disable codemode model helpers (`models: false`); preserve independent Note main/Redirect gates and the overlay-owned bridge subscription.
 - Tests use temporary agent/workspace directories and local fixture servers only; never start real user MCP servers or resolve real credentials during validation.
+
+## Shared memory (1.7.0)
+- Main Pi and the isolated Jarvis SDK session explicitly mount one shared local service. Memory is enabled by default in trusted projects, independently of Repo tools, Note main, Redirect, and overlay open/close. It can share historical facts even when bridge delivery is off; it never steers or queues work.
+- `/jarvis-memory` reports status; `help` documents controls. `[--global|--project] on|off|capture on|off|recall on|off|clear` controls default to GLOBAL (unlike model/thinking). Per-field project > global > defaults, except global enabled=false is a master kill switch. Untrusted projects and config errors pause all memory. Full off means no memory-record reads/capture/injection/tool execution; retain data. Explicit admin inspection still requires enabled memory; capture/recall-only pauses do not block manual commands.
+- Inside the overlay, `/memory …` and `/jarvis-memory …` execute immediately without model/boot/queue work. `clear` removes settings, never data; `forget-all --confirm [--global|--all]` defaults to only the current project's records. Data scope flags follow the action.
+- Disclose capture/recall before first use and only then persist the global disclosure marker. No silent historical import, background providers, embeddings, real user credential access, or real MCP servers during tests. Isolate every test's agent/workspace directories.
+- Capture only new finalized user/assistant text, not thinking/tool/custom/system/attachment data or aborted/error output. Stage only event metadata (max 256 anchors); resolve at turn/settlement boundaries from at most 1,024 newly persisted parent-chain entries, stopping before the old leaf. Never archive intermediate message_end payloads before later redaction hooks. Discard pending anchors on revocation, session/tree change or disposal; never backfill. Secret filtering is best-effort, not a guarantee; reject suspected secrets in curated notes. Cap text at 16 KiB UTF-8; omit oversized archive captures, reject oversized notes. Archive retains newest 10,000 records; curated notes cap at 1,000 without automatic deletion.
+- Keep auto recall scoped to global + canonical current cwd; explicit all-project search is supported. Request-local context injection is bounded to 6,000 bytes of untrusted record JSON plus notice; search results 12,000 bytes with excerpt/omission markers. Never persist automatically injected context via appendEntry/sendMessage or treat stored instructions as authority. Explicit tool calls/results still follow normal Pi persistence; don't promise that disabling/forgetting erases earlier tool results or already-viewed output.
+- Store is lazy local SQLite under the active agent directory (`extensions/pi-jarvis-memory/memory.sqlite`), not a project-selected path. SQLite coordinates record writers; memory settings use atomic cooperative locking that legacy model/thinking writes do not participate in. Fail closed on malformed settings; never repair automatically.
+- Memory guidance is also request-local: use a custom advisory so Pi's later forced-prompt projection cannot discard it. Preserve other prompt/tool state; a mid-turn disable removes both advisory and recalled records from future requests.
+- Model tools recheck live trust/settings/cancellation and permission generations at execution, including captured definitions. Broadcast observed policy changes across mounted lanes and revoke per-binding generations at session/tree boundaries; don't promise live push delivery across processes. Model forget requires cancellable human review and transactionally compares the reviewed version. Tombstones prevent identical event/title resurrection, not every semantic mention; Pi transcripts, backups and already-sent context remain. Do not promise encryption, a sandbox, or forensic erasure.
 
 ## Git and Release Policy
 - Every new commit MUST have an annotated **stable version tag `vX.Y.Z`**. No `dev`, alpha, beta, release-candidate, build-metadata, or SHA-only tags. This is a released extension, not a prerelease channel.

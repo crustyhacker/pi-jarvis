@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.7.0] - 2026-10-04
+
+### Added
+- Persistent local memory shared by main Pi and Jarvis across sessions and projects, enabled by default in trusted workspaces with first-use disclosure and a global master off switch.
+- Separate automatic capture/recall controls, per-project overrides, and `/jarvis-memory` status, search, inspect, remember, edit, and forget commands. `/memory` inside the overlay manages memory immediately, independently of queued side work and Repo tools.
+- Bounded new-message archive plus model-curated preferences, corrections, decisions and references with project/session provenance. Local keyword retrieval supplies request-local, explicitly untrusted context; all-project search is explicit. No old-session import, embeddings or background model calls.
+- Lazy, permission-restricted SQLite persistence, concurrent-writer transactions, deterministic deduplication, identity tombstones, bounded retention, and isolated content/config/store/runtime regression coverage.
+
+### Safety and limitations
+- All model/thinking set/clear commands now preserve malformed shared JSON and require manual repair, rather than silently discarding memory privacy settings during recovery. Parse errors no longer echo input snippets.
+- Capture waits for Pi's final message replacements/redaction hooks; bounded metadata-only staging never imports historical branches. Memory guidance survives Pi's forced side-prompt projection without becoming persisted prompt history.
+- Full disable blocks capture, memory reads, injection and tool execution while retaining data. Untrusted projects and malformed/unreadable settings fail closed. Memory can share facts between lanes even with Note main off; it follows separate persistent controls, not overlay lifetime.
+- Exclude thinking, tool results/calls, custom/system messages, attachments and failed/aborted outputs from automatic capture. Best-effort secret filtering is not a guarantee; local memory is plaintext, and recalled data reaches the active model.
+- Recheck settings/trust and permission generations at execution. Model-requested forgetting requires cancellable confirmation and an atomic reviewed-version comparison; explicit user commands support scoped bulk deletion.
+- Forgetting does not erase other mentions, original Pi transcripts, already-sent model context or backups, and SQLite deletion is not forensic erasure. Record writers coordinate across processes; legacy model/thinking config writes do not participate in the new memory-settings lock.
+
 ## [1.6.1] - 2026-10-03
 
 ### Added

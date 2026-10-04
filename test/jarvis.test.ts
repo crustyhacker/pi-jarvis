@@ -33,6 +33,7 @@ import { buildMainSessionContext, DEFAULT_MAIN_SESSION_RECENT_LIMIT } from "../m
 import { MainSessionTracker } from "../main-session-state.js";
 import { createJarvisSessionRef, readJarvisSessionRef, JARVIS_SESSION_REF_CUSTOM_TYPE } from "../session-ref.js";
 import {
+	MalformedJarvisConfigError,
 	clearJarvisModelSelectionSetting,
 	clearJarvisThinkingSelectionSetting,
 	getJarvisConfigPath,
@@ -362,7 +363,7 @@ async function testJarvisThinkingConfigRoundTrip(): Promise<void> {
 	}
 }
 
-async function testMalformedProjectJarvisModelConfigCanBeCleared(): Promise<void> {
+async function testMalformedProjectJarvisModelConfigIsPreserved(): Promise<void> {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const tempRoot = mkdtempSync(join(tmpdir(), "pi-jarvis-config-test-"));
 	const agentDir = join(tempRoot, "agent");
@@ -376,10 +377,8 @@ async function testMalformedProjectJarvisModelConfigCanBeCleared(): Promise<void
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, "{ invalid json\n", "utf8");
 
-		clearJarvisModelSelectionSetting(cwd, "project");
-
-		assert.equal(existsSync(path), false, "clearing a malformed project /jarvis config should remove the broken file");
-		assert.equal(loadJarvisModelSelectionSetting(cwd, "project"), undefined);
+		assert.throws(() => clearJarvisModelSelectionSetting(cwd, "project"), MalformedJarvisConfigError);
+		assert.equal(readFileSync(path, "utf8"), "{ invalid json\n", "malformed shared settings must not be deleted, potentially resetting memory privacy controls");
 	} finally {
 		if (originalAgentDir === undefined) {
 			delete process.env.PI_CODING_AGENT_DIR;
@@ -390,7 +389,7 @@ async function testMalformedProjectJarvisModelConfigCanBeCleared(): Promise<void
 	}
 }
 
-async function testMalformedGlobalJarvisModelConfigCanBeCleared(): Promise<void> {
+async function testMalformedGlobalJarvisModelConfigIsPreserved(): Promise<void> {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const tempRoot = mkdtempSync(join(tmpdir(), "pi-jarvis-config-test-"));
 	const agentDir = join(tempRoot, "agent");
@@ -404,10 +403,8 @@ async function testMalformedGlobalJarvisModelConfigCanBeCleared(): Promise<void>
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, "{ invalid json\n", "utf8");
 
-		clearJarvisModelSelectionSetting(cwd, "global");
-
-		assert.equal(existsSync(path), false, "clearing a malformed global /jarvis config should remove the broken file");
-		assert.equal(loadJarvisModelSelectionSetting(cwd, "global"), undefined);
+		assert.throws(() => clearJarvisModelSelectionSetting(cwd, "global"), MalformedJarvisConfigError);
+		assert.equal(readFileSync(path, "utf8"), "{ invalid json\n", "malformed global settings must preserve the possible memory master-off value");
 	} finally {
 		if (originalAgentDir === undefined) {
 			delete process.env.PI_CODING_AGENT_DIR;
@@ -418,7 +415,7 @@ async function testMalformedGlobalJarvisModelConfigCanBeCleared(): Promise<void>
 	}
 }
 
-async function testMalformedJarvisConfigCanBeRepairedBySavingSetting(): Promise<void> {
+async function testMalformedJarvisConfigCannotBeOverwrittenBySavingSetting(): Promise<void> {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const tempRoot = mkdtempSync(join(tmpdir(), "pi-jarvis-config-test-"));
 	const agentDir = join(tempRoot, "agent");
@@ -431,14 +428,14 @@ async function testMalformedJarvisConfigCanBeRepairedBySavingSetting(): Promise<
 		const projectPath = getJarvisConfigPath(cwd, "project");
 		mkdirSync(dirname(projectPath), { recursive: true });
 		writeFileSync(projectPath, "{ invalid json\n", "utf8");
-		saveJarvisModelSelectionSetting(cwd, "project", { mode: "pinned", provider: "test-provider", modelId: "side-beta" });
-		assert.deepEqual(loadJarvisModelSelectionSetting(cwd, "project"), { mode: "pinned", provider: "test-provider", modelId: "side-beta" });
+		assert.throws(() => saveJarvisModelSelectionSetting(cwd, "project", { mode: "pinned", provider: "test-provider", modelId: "side-beta" }), MalformedJarvisConfigError);
+		assert.equal(readFileSync(projectPath, "utf8"), "{ invalid json\n");
 
 		const globalPath = getJarvisConfigPath(cwd, "global");
 		mkdirSync(dirname(globalPath), { recursive: true });
 		writeFileSync(globalPath, "{ invalid json\n", "utf8");
-		saveJarvisThinkingSelectionSetting(cwd, "global", { mode: "pinned", thinkingLevel: "low" });
-		assert.deepEqual(loadJarvisThinkingSelectionSetting(cwd, "global"), { mode: "pinned", thinkingLevel: "low" });
+		assert.throws(() => saveJarvisThinkingSelectionSetting(cwd, "global", { mode: "pinned", thinkingLevel: "low" }), MalformedJarvisConfigError);
+		assert.equal(readFileSync(globalPath, "utf8"), "{ invalid json\n");
 	} finally {
 		if (originalAgentDir === undefined) {
 			delete process.env.PI_CODING_AGENT_DIR;
@@ -2265,6 +2262,8 @@ class FakeExtensionAPI {
 
 	sendUserMessage(): void {}
 
+	registerTool(): void {}
+
 	getThinkingLevel(): string | undefined {
 		return this.thinkingLevel;
 	}
@@ -3292,7 +3291,7 @@ async function testJarvisClearGlobalSettingFallsBackToDefault(): Promise<void> {
 	});
 }
 
-async function testJarvisModelCommandRepairsMalformedTargetConfig(): Promise<void> {
+async function testJarvisModelCommandPreservesMalformedTargetConfig(): Promise<void> {
 	await withJarvisExtensionHarness(async (harness) => {
 		const projectPath = getJarvisConfigPath(harness.ctx.cwd, "project");
 		mkdirSync(dirname(projectPath), { recursive: true });
@@ -3300,19 +3299,12 @@ async function testJarvisModelCommandRepairsMalformedTargetConfig(): Promise<voi
 
 		await harness.api.runCommand("jarvis-model", "side-beta", harness.ctx);
 
-		assert.deepEqual(
-			loadJarvisModelSelectionSetting(harness.ctx.cwd, "project"),
-			{ mode: "pinned", provider: harness.pinnedModel.provider, modelId: harness.pinnedModel.id },
-			"/jarvis-model should overwrite and repair a malformed target config",
-		);
-		assert.ok(
-			harness.ctx.notifications.some((notification) => notification.message.includes(`Saved /jarvis model ${harness.pinnedModel.provider}/${harness.pinnedModel.id}`)),
-			"successful repair should be reported as a normal pin",
-		);
+		assert.equal(readFileSync(projectPath, "utf8"), "{ invalid json\n", "model changes cannot reset unknown memory privacy controls");
+		assert.ok(harness.ctx.notifications.some((notification) => notification.type === "error" && notification.message.includes("Failed to pin")));
 	});
 }
 
-async function testJarvisThinkingCommandRepairsMalformedTargetConfig(): Promise<void> {
+async function testJarvisThinkingCommandPreservesMalformedTargetConfig(): Promise<void> {
 	await withJarvisExtensionHarness(async (harness) => {
 		const projectPath = getJarvisConfigPath(harness.ctx.cwd, "project");
 		mkdirSync(dirname(projectPath), { recursive: true });
@@ -3320,15 +3312,8 @@ async function testJarvisThinkingCommandRepairsMalformedTargetConfig(): Promise<
 
 		await harness.api.runCommand("jarvis-thinking", "low", harness.ctx);
 
-		assert.deepEqual(
-			loadJarvisThinkingSelectionSetting(harness.ctx.cwd, "project"),
-			{ mode: "pinned", thinkingLevel: "low" },
-			"/jarvis-thinking should overwrite and repair a malformed target config",
-		);
-		assert.ok(
-			harness.ctx.notifications.some((notification) => notification.message.includes("Set /jarvis thinking to low")),
-			"successful repair should be reported as a normal thinking change",
-		);
+		assert.equal(readFileSync(projectPath, "utf8"), "{ invalid json\n", "thinking changes cannot reset unknown memory privacy controls");
+		assert.ok(harness.ctx.notifications.some((notification) => notification.type === "error" && notification.message.includes("Failed")));
 	});
 }
 
@@ -4057,9 +4042,9 @@ const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
 	["testSessionRefDoesNotFallbackPastMalformedNewestEntry", testSessionRefDoesNotFallbackPastMalformedNewestEntry],
 	["testJarvisModelConfigRoundTrip", testJarvisModelConfigRoundTrip],
 	["testJarvisThinkingConfigRoundTrip", testJarvisThinkingConfigRoundTrip],
-	["testMalformedProjectJarvisModelConfigCanBeCleared", testMalformedProjectJarvisModelConfigCanBeCleared],
-	["testMalformedGlobalJarvisModelConfigCanBeCleared", testMalformedGlobalJarvisModelConfigCanBeCleared],
-	["testMalformedJarvisConfigCanBeRepairedBySavingSetting", testMalformedJarvisConfigCanBeRepairedBySavingSetting],
+	["testMalformedProjectJarvisModelConfigIsPreserved", testMalformedProjectJarvisModelConfigIsPreserved],
+	["testMalformedGlobalJarvisModelConfigIsPreserved", testMalformedGlobalJarvisModelConfigIsPreserved],
+	["testMalformedJarvisConfigCannotBeOverwrittenBySavingSetting", testMalformedJarvisConfigCannotBeOverwrittenBySavingSetting],
 	["testJarvisSessionDirectoryAvoidsWorkspacePathCollisions", testJarvisSessionDirectoryAvoidsWorkspacePathCollisions],
 	["testOverlayFocusAndEscRouting", testOverlayFocusAndEscRouting],
 	["testOverlayRenderDistinctness", testOverlayRenderDistinctness],
@@ -4110,8 +4095,8 @@ const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
 	["testJarvisProjectSettingOverridesGlobalSetting", testJarvisProjectSettingOverridesGlobalSetting],
 	["testJarvisClearProjectSettingFallsBackToGlobal", testJarvisClearProjectSettingFallsBackToGlobal],
 	["testJarvisClearGlobalSettingFallsBackToDefault", testJarvisClearGlobalSettingFallsBackToDefault],
-	["testJarvisModelCommandRepairsMalformedTargetConfig", testJarvisModelCommandRepairsMalformedTargetConfig],
-	["testJarvisThinkingCommandRepairsMalformedTargetConfig", testJarvisThinkingCommandRepairsMalformedTargetConfig],
+	["testJarvisModelCommandPreservesMalformedTargetConfig", testJarvisModelCommandPreservesMalformedTargetConfig],
+	["testJarvisThinkingCommandPreservesMalformedTargetConfig", testJarvisThinkingCommandPreservesMalformedTargetConfig],
 	["testJarvisClearProjectModelIgnoresMalformedGlobalFallback", testJarvisClearProjectModelIgnoresMalformedGlobalFallback],
 	["testJarvisClearProjectThinkingIgnoresMalformedGlobalFallback", testJarvisClearProjectThinkingIgnoresMalformedGlobalFallback],
 	["testMalformedProjectJarvisModelSettingFallsBackToValidGlobalOnStartup", testMalformedProjectJarvisModelSettingFallsBackToValidGlobalOnStartup],

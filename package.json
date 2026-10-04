@@ -1,6 +1,6 @@
 {
   "name": "pi-jarvis",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "engines": {
     "node": ">=22.19.0"
   },
@@ -48,7 +48,7 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "prepack": "npm run build",
-    "test": "npm run check && node --import tsx --test test/jarvis.test.ts test/config-regression.test.ts test/index-regression.test.ts test/main-context-regression.test.ts test/overlay-regression.test.ts test/side-runtime.test.ts test/editor-polish.test.ts test/layout-polish.test.ts test/scroll-polish.test.ts test/status-polish.test.ts test/ux-polish.test.ts test/native-mcp.test.ts test/release-automation.test.ts test/branding.test.ts",
+    "test": "npm run check && node --import tsx --test test/jarvis.test.ts test/config-regression.test.ts test/index-regression.test.ts test/main-context-regression.test.ts test/overlay-regression.test.ts test/side-runtime.test.ts test/editor-polish.test.ts test/layout-polish.test.ts test/scroll-polish.test.ts test/status-polish.test.ts test/ux-polish.test.ts test/native-mcp.test.ts test/release-automation.test.ts test/branding.test.ts test/memory-config.test.ts test/memory-content.test.ts test/memory-store.test.ts test/memory-integration.test.ts",
     "verify:release": "node --import tsx test/release-verification.test.ts",
     "check:tags": "node scripts/check-tags.mjs",
     "render:branding": "npm run build && node scripts/render-branding.mjs"

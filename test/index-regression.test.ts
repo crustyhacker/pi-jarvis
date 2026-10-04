@@ -83,7 +83,11 @@ function harness(mode = "tui") {
 	};
 	const pi: any = {
 		registerCommand: (name: string, command: any) => commands.set(name, command),
-		on: (name: string, handler: any) => handlers.set(name, handler),
+		registerTool() {},
+		on: (name: string, handler: any) => {
+			const previous = handlers.get(name);
+			handlers.set(name, async (event, context) => { await previous?.(event, context); await handler(event, context); });
+		},
 		getThinkingLevel: () => "high",
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 		sendUserMessage() {},
@@ -115,6 +119,19 @@ try {
 	{
 		const h = harness();
 		await h.event("session_start");
+		for (const initial of ["/memory off", "/jarvis-memory --project off", "/memory remember private | must not become a model prompt", "/jarvis-memory status"]) {
+			const command = h.command("jarvis", initial);
+			await tick();
+			assert.equal(h.runtimes.length, 0, "initial memory commands must not boot a side runtime");
+			assert.equal(h.customCalls, 0, "initial memory commands are local management, not an overlay/model prompt");
+			await command;
+		}
+		assert.ok(h.notices.some((notice) => notice.includes("global memory settings updated")));
+		await h.event("session_shutdown");
+	}
+	{
+		const h = harness();
+		await h.event("session_start");
 		const oldOverlay = h.command("jarvis");
 		await until(() => h.runtimes.length === 1);
 		const oldRuntime = h.runtimes[0]!;
@@ -122,6 +139,8 @@ try {
 		const firstSend = h.overlay.view.sendMessage("old prompt");
 		await until(() => oldRuntime.sent.length === 1);
 		const oldView = h.overlay.view;
+		await oldView.sendMessage("/memory --project off");
+		assert.deepEqual(oldRuntime.sent, ["old prompt"], "memory controls execute immediately without joining a busy provider queue");
 		h.clearBranch();
 		await h.event("session_start");
 		await oldOverlay;

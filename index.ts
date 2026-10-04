@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import type { Model } from "@earendil-works/pi-ai";
 import {
+	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -24,6 +25,8 @@ import {
 	type StoredJarvisThinkingSelection,
 } from "./jarvis-config.js";
 import { JarvisSideSessionRuntime, createSideSessionFile } from "./side-session.js";
+import { SharedMemoryService } from "./memory-service.js";
+import { createMemoryExtensionFactory } from "./memory-extension.js";
 
 type JarvisModelSelection =
 	| { mode: "follow-main" }
@@ -67,6 +70,7 @@ type JarvisSideCommand =
 
 type MainState = {
 	bridge: JarvisOverlayBridge;
+	memory: SharedMemoryService;
 	mainSession: MainSessionTracker;
 	mainContext: MainSessionContextPayload;
 	lastJarvisSeenMainContext?: MainSessionContextPayload;
@@ -109,6 +113,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	const mainSession = new MainSessionTracker();
 	const state: MainState = {
 		bridge: new JarvisOverlayBridge(),
+		memory: new SharedMemoryService(getAgentDir()),
 		mainSession,
 		mainContext: buildMainSessionContext(mainSession.snapshot()),
 		lastJarvisSeenMainContext: undefined,
@@ -132,6 +137,11 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/jarvis requires Pi's interactive terminal UI.", "warning");
+				return;
+			}
+			const memoryRequest = parseMemoryCommand(args);
+			if (memoryRequest !== undefined) {
+				dispatchMemoryCommand(state, memoryRequest, ctx, Boolean(state.overlayOpen));
 				return;
 			}
 			if (state.overlayOpen) {
@@ -478,6 +488,11 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("jarvis-memory", {
+		description: "Shared main Pi/Jarvis memory: status, on/off, capture/recall, search, remember, edit, forget (help for syntax)",
+		handler: async (args, ctx) => { dispatchMemoryCommand(state, args, ctx, false); },
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		state.closeOverlay?.();
 		state.bootGeneration += 1;
@@ -645,6 +660,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		// hang while the session is torn down.
 		state.bridge.reset();
 	});
+
+	createMemoryExtensionFactory(state.memory, "main")(pi);
 }
 
 function updateContextState(pi: ExtensionAPI, state: MainState, ctx: ExtensionContext): void {
@@ -1085,6 +1102,26 @@ function queueMessage(state: MainState, message: string): void {
 	state.bridge.refresh();
 }
 
+function parseMemoryCommand(message: string): string | undefined {
+	const match = /^\/(?:jarvis-memory|memory)(?:\s+([\s\S]*))?$/.exec(message.trim());
+	return match ? match[1] ?? "" : undefined;
+}
+
+function dispatchMemoryCommand(state: MainState, args: string, ctx: ExtensionContext, overlay: boolean): void {
+	try {
+		const text = state.memory.command(args, ctx);
+		if (overlay && state.runtime) state.runtime.addSystemMessage(text);
+		else if (overlay) state.bridge.notify(text, "info");
+		else if (ctx.hasUI) ctx.ui.notify(text, "info");
+		else process.stderr.write(`${text}\n`);
+	} catch (error) {
+		const text = error instanceof Error ? error.message : "Shared memory operation failed.";
+		if (overlay) state.bridge.notify(text, "error");
+		else if (ctx.hasUI) ctx.ui.notify(text, "error");
+		else process.stderr.write(`${text}\n`);
+	}
+}
+
 function parseJarvisSideCommand(message: string): JarvisSideCommand | undefined {
 	const text = message.trim();
 	if (text === "/new") {
@@ -1163,6 +1200,12 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 		getDisplayEntries: () => getOverlayEntries(state),
 		sendMessage: async (text: string) => {
 			if (state.queuedMessages !== queue) return;
+			// Memory controls must work immediately, even while a side turn is busy.
+			const memoryCommand = parseMemoryCommand(text);
+			if (memoryCommand !== undefined) {
+				dispatchMemoryCommand(state, memoryCommand, ctx, true);
+				return;
+			}
 			queueMessage(state, text);
 			if (state.queuedMessages !== queue) return;
 			await flushQueuedMessages(pi, state, ctx);
@@ -1311,6 +1354,8 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 			bridge: state.bridge,
 			cwd: ctx.cwd,
 			projectTrusted: ctx.isProjectTrusted(),
+			memory: state.memory,
+			memoryTrustProvider: () => isCurrentBoot() && ctx.isProjectTrusted(),
 			modelRegistry: ctx.modelRegistry,
 			model: getDesiredJarvisModel(state),
 			jarvisModelModeProvider: () => state.jarvisModelSelection.mode,
