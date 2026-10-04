@@ -106,6 +106,8 @@ function harness(root: string, id: number) {
 	const pi: any = {
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		registerTool() {},
+		getActiveTools: () => [],
+		setActiveTools() {},
 		on: (name: string, handler: any) => {
 			const previous = handlers.get(name);
 			handlers.set(name, async (event, context) => { await previous?.(event, context); await handler(event, context); });

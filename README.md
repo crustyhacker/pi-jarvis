@@ -6,9 +6,11 @@
 
 ## A cinematic side-conversation overlay for Pi
 
-**Open a second lane of thought without derailing the main session.**
+**A second lane of thought—with shared memory and an optional searchable history archive.**
 
 `pi-jarvis` adds `/jarvis`: a polished overlay where you can ask for status, inspect the repo when you explicitly allow it, and send a quiet note or a confirmed redirect back to the main lane.
+
+**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -16,10 +18,11 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.7.0</p>
+<p><strong>Current version:</strong> 1.8.0</p>
 
 <p>
   <strong>Shared persistent memory</strong> ·
+  <strong>Optional indexed session archive</strong> ·
   <strong>Persistent side session</strong> ·
   <strong>Live main-session awareness</strong> ·
   <strong>Opt-in local tools + native MCP</strong> ·
@@ -74,11 +77,28 @@ The main Pi session should stay on the critical path.
 
 ---
 
+## Two complementary memory features
+
+| | Shared memory | Optional full-session archive |
+|---|---|---|
+| **Purpose** | Remember useful preferences, corrections, decisions and references | Find original recorded conversations, tool activity and session history |
+| **What it keeps** | Curated notes plus bounded finalized user/assistant text captures | Complete accepted finalized Pi journal entries, with provenance and paged raw reads |
+| **Default** | **On in trusted projects**, with separate capture/recall controls | **Off**; recording and model access are separately controlled |
+| **Retrieval** | Automatic recall from global/current-project memory; explicit broader search | Local indexed search and session browsing; no automatic context injection |
+| **Manage it** | `/jarvis-memory` · overlay `/memory` | `/jarvis-archive` · overlay `/archive` |
+
+Both work across main Pi and Jarvis, independently of **Repo tools** and whether the overlay is open. Each has its own local SQLite store and global/project controls. Turning one off does not turn the other off.
+
+**Privacy matters:** storage is local plaintext. Archive content is unredacted and can include secrets; granting model access can send retrieved content to your model provider. “Full” means accepted finalized data exposed by Pi—not hidden provider reasoning or a crash-safe audit log. Historical import is explicit. See the [memory controls](#shared-memory) and [archive limits](#full-session-archive) before enabling more access.
+
+---
+
 ## At a glance
 
 | Capability | What you get |
 |---|---|
 | **Shared memory** | Main Pi and Jarvis remember useful discussions across sessions; enabled by default, with global/project controls and a master off switch |
+| **Optional full-session archive** | Off by default; raw finalized entries, local indexed cross-session search, separate model permission and explicit historical import |
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
 | **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
 | **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and configured native MCP stay off until you enable Repo tools |
@@ -97,6 +117,10 @@ flowchart LR
     M -->|summary + recent delta| J
     M <-->|independent memory controls| S[Shared local memory]
     J <-->|independent memory controls| S
+    M -->|recording opt-in| A[Separate local history archive]
+    J -->|recording opt-in| A
+    A -. separately authorized model reads .-> M
+    A -. separately authorized model reads .-> J
     J -->|Repo tools enabled| R[Local tools\nread • bash • edit • write]
     J -->|Repo tools enabled| C[Configured native MCP\nside-owned connections]
     J -. Note main .-> M
@@ -154,6 +178,8 @@ Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Version **1.6.0** suppor
 `pi install` registers the package automatically. For local development, build and load `./dist/index.js` with `pi -e ./dist/index.js`.
 **New in 1.7.0: shared memory is enabled by default in trusted projects**, including main Pi even if you never open the overlay. A first-use notice explains capture and recall. Already using another memory extension? Run `/jarvis-memory off` before your first prompt; this disables both main and Jarvis memory without deleting anything.
 
+**New in 1.8.0: the separate full-session archive is OFF by default.** Nothing is imported or recorded by that subsystem until you opt in. See [Full-session archive](#full-session-archive).
+
 ### 3) Open Jarvis
 
 ```bash
@@ -207,6 +233,9 @@ Removes the selected scope so `/jarvis` thinking falls back through the remainin
 ### `/jarvis-memory`
 Reports shared-memory status. Use `/jarvis-memory help` for controls and data-management commands. Memory controls default to **global**, unlike model/thinking controls. See [Shared memory](#shared-memory) below.
 
+### `/jarvis-archive`
+Reports the separate full-session archive's status. It defaults **OFF**, with independent capture and model-access controls. `/jarvis-archive help` documents enablement warnings, paging, explicit import, and deletion. See [Full-session archive](#full-session-archive).
+
 ### Side-session commands inside `/jarvis`
 The `/jarvis` input handles a small set of built-in commands against the isolated side-session:
 
@@ -216,6 +245,69 @@ The `/jarvis` input handles a small set of built-in commands against the isolate
 - `/tree --summarize <entry-id> [instructions]` navigates and summarizes the branch being left.
 - `/new` starts a fresh `/jarvis` side-session without changing the main Pi session.
 - `/memory …` or `/jarvis-memory …` manages shared memory immediately, without sending a model prompt or waiting for queued side work. Initial forms such as `/jarvis /memory off` are also handled locally, without booting a side session.
+- `/archive …` or `/jarvis-archive …` manages the separate optional archive locally, without model/queue work; initial `/jarvis /archive …` works without booting a side session.
+
+---
+
+## Full-session archive
+
+This is a **separate, optional subsystem**, not a change to shared memory's curated notes or bounded text captures. It is **OFF by default**, independent of Repo tools, Note main, Redirect, and overlay open/close. Model reads are **also off by default**, even after recording is enabled. No archive content is automatically injected into prompts.
+
+### Enable only after reviewing the risks
+
+```text
+/jarvis-archive                                    # status; no archive-record reads
+/jarvis-archive --project on --confirm-sensitive    # record here only
+/jarvis-archive on --confirm-sensitive              # enable globally
+/jarvis-archive model-access on --confirm-sensitive # allow model search/read; recording alone doesn't
+/jarvis-archive capture off                         # pause recording default, retain access
+/jarvis-archive off                                 # global MASTER OFF; keep stored data
+/jarvis-archive clear --confirm-sensitive           # remove global settings; fallback may re-enable
+```
+
+Controls default to **global**; use `--project` for an override. Resolution is per-field project > global > defaults (`enabled: false`, `capture: true`, `modelAccess: false`), except an **explicit global off overrides every project**. `capture off` and `model-access off` set defaults that a project can override; inspect effective status. Use `clear --confirm-sensitive` to remove a scoped setting, never data. Malformed/unreadable settings and untrusted projects pause **all** archive access. Full off blocks even manual record inspection; recording-only/model-only pauses do not prevent explicit human reads. Separate files avoid interfering with memory/model settings:
+
+- Global: `<active-agent-dir>/extensions/pi-jarvis-archive.json`
+- Project: `.pi/jarvis-archive.json`
+- Shape: `{ "archive": { "enabled": true, "capture": true, "modelAccess": false } }`
+
+Enabling/model-access commands require the literal warning acknowledgment, and direct-file enablement shows a first-use warning. **This archive is unredacted plaintext and may retain passwords, tokens, private files, and sensitive tool output.** Model access can send retrieved data to the active provider. It is not a sandbox, encryption mechanism, or a substitute for carefully managing secrets.
+
+### What “full” means
+
+Accepted **new, finalized Pi journal entries** are retained as complete JSON, without memory's secret filtering, 16 KiB text cap, or 10,000-record eviction. This includes user/assistant/system messages, exposed thinking, tool calls/results and details, failed/aborted output that Pi retained, inline image payloads, custom entries, compaction/context edits, and branch metadata. Session headers retain provenance, including parent-session links. Search indexes textual content locally with SQLite FTS5; binary image data and opaque signatures are retained but not text-indexed. There is no OCR, embedding service, or background model call.
+
+“Full” **does not mean an infallible wire/stream audit log**. Hidden provider reasoning, keystrokes, intermediate stream/tool updates, non-persisted commands/events, external attachment files, and output already truncated by Pi/tools are not recovered. Referenced files are **never automatically opened or copied**. Later message-redaction hooks run before capture. Raw history includes abandoned branches and superseded context, not just the effective current model context.
+
+Recording begins after an activation baseline, never by importing pre-existing entries. Captures occur at finalized turn/settlement and supported session boundaries, not per token. The side owner takes a final snapshot of already-finalized entries before disposal, while recording remains authorized. Crashes, late shutdown hooks, unsupported journal APIs, failed storage, or permission transitions can leave gaps; warnings report observation/storage failures without replaying uncertain writes. Pending/disabled-period content is not backfilled after re-enable. Explicit **64 MiB raw-entry and indexing ceilings reject oversized work rather than truncating it**. Normalization uses bounded chunks; pathological Unicode combining/composition contexts beyond 64K UTF-16 units also reject explicitly. Conservative index budgeting can reject excessive whitespace/normalization expansion even if its final folded text would be smaller. No automatic eviction or strict total-disk quota is imposed: monitor space and prune deliberately. Large synchronous writes/indexing can pause the UI. Search/page order may change as other sessions append/delete records; pagination is not a frozen snapshot.
+
+### Search and inspect
+
+```text
+/jarvis-archive search deployment decision
+/jarvis-archive search --all --offset 20 deployment
+/jarvis-archive session --all <session-id> 0
+/jarvis-archive read --all <record-id> 0
+/jarvis-archive read --all --metadata <record-id> 0
+/jarvis-archive stats --all
+```
+
+Search/session pages return bounded excerpts of normalized indexing text with IDs, project, lane, timestamps and parent entry IDs. Excerpts are not exact quotations; use `read` for original case and content. Follow `nextOffset` to continue. Exceptionally large/escape-heavy provenance is explicitly labeled with `abbreviated` field names, never allowed to block record access; `read --metadata` (model tool `part: "metadata"`) pages the exact original metadata. `read` returns complete raw JSON **through pages**; its offsets count Unicode codepoints, not bytes or UTF-16 units. Results are bounded to 24,000 bytes of JSON plus an untrusted-data notice; stored payloads are not shortened. Use explicit `--all` to access other projects. Models get only three read-only tools—`jarvis_archive_search`, `jarvis_archive_read`, and `jarvis_archive_session`—when model access is enabled. No model controls, import, or deletion tools exist. Tools recheck current permissions/trust/cancellation and reject stale definitions.
+
+Global accessibility is within the **same active Pi agent directory**, not cloud sync or other users' machines. Project controls govern operations initiated here; existing records from a paused project remain accessible through explicit all-project queries from another allowed project. Disabling is not deletion. Returned model-tool results persist normally in Pi and can be captured again as part of a later journal entry.
+
+### Explicit import and retention
+
+```text
+/jarvis-archive import --confirm-sensitive /absolute/path/to/session.jsonl
+/jarvis-archive forget-session --confirm <session-id>
+/jarvis-archive prune --confirm 2026-01-01T00:00:00.000Z
+/jarvis-archive prune --all --confirm 2026-01-01T00:00:00.000Z
+```
+
+Import is **human-only**, requires enabled recording and an explicit regular v3 JSONL file, and preserves the source header's project/session identity—even if different from the current project. No directory scan or silent historical import occurs; legacy session versions require a separately reviewed conversion first. Completed entries survive a partial/cancelled import, with counts reported; duplicate entries are skipped, differing payloads for an existing identity are rejected, and originals are never modified. Deletion defaults to this project; `--all` is explicit. Stable identity tombstones prevent re-import of deleted entries, not every semantic copy or other previously unarchived entry.
+
+Storage is lazy SQLite under `<active-agent-dir>/extensions/pi-jarvis-archive/archive.sqlite`, defaulting to `~/.pi/agent/extensions/pi-jarvis-archive/archive.sqlite`. Owned directories/files use private permissions where supported, with defensive link/type checks and concurrent-writer transactions. There is no background watcher: observed settings changes are propagated between mounted lanes, while other processes recheck at operation boundaries. Deletion does not erase original Pi files, prior search-result copies, already-sent model context or backups, and does not guarantee reclaimed disk space or forensic erasure. For a complete reset, stop all Pi processes using the store and remove only its archive directory yourself; that also removes tombstones. Shared memory stays separate and unchanged. To stop both Jarvis persistence layers, use both `/jarvis-archive off` and `/jarvis-memory off`; neither disables Pi's original session transcripts.
 
 ---
 
@@ -225,7 +317,7 @@ Main Pi and Jarvis use **one local memory service**, independent of the overlay 
 
 ### What is remembered
 
-- **Conversation archive:** only newly finalized user/assistant text observed after loading this feature, labeled with project, main/Jarvis lane, session ID, event identity and timestamps. No silent historical import or reconstruction from old session files.
+- **Bounded conversation captures (not the optional full-session archive):** only newly finalized user/assistant text observed after loading this feature, labeled with project, main/Jarvis lane, session ID, event identity and timestamps. No silent historical import or reconstruction from old session files.
 - **Curated notes:** your active model can save concise preferences, corrections, project decisions and references during normal foreground work. Stable scoped titles update/deduplicate notes. You can save or edit notes explicitly too. Curation depends on the model choosing the tool; it is not a separate background summarizer.
 - **Bounded recall:** a small request-local selection of global/current-project notes and matching conversation excerpts, using local keyword search. Other projects are available through explicit `search --all` or the model's cross-project search tool. Project scope uses the canonical working directory, not a remote repository name; separate worktrees remain separate scopes unless a note is global.
 

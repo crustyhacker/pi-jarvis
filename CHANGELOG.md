@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.8.0] - 2026-10-04
+
+### Added
+- Separate optional full-session archive, OFF by default, explicitly mounted in main Pi and Jarvis independently of shared memory, Repo tools and bridge permissions.
+- Global/project recording controls, a global master off switch, separately opt-in model access, and explicit sensitive-data acknowledgment. `/jarvis-archive` and overlay `/archive` controls run locally without model/queue work.
+- Local SQLite FTS5 search, cross-project queries by explicit request, paged session browsing and raw-entry reads, session provenance/parent links, and complete accepted finalized entry payloads including exposed thinking, tool details and inline images.
+- Human-only explicit v3 JSONL import with duplicate detection, partial/cancellation reporting, scoped deletion/pruning and identity tombstones. No automatic history import, context injection, eviction, external attachment reads, embeddings or background model calls.
+
+### Documentation
+- Promote both complementary memory features in the README: default-on shared memory and the separate, disabled-by-default full-session archive, with a side-by-side comparison of controls, retrieval and privacy.
+
+### Safety and limitations
+- Raw archive storage is unredacted plaintext and can retain credentials/private data; model reads can send it to the active provider. Off blocks record reads/writes while retaining data; trust/config failures pause access.
+- Capture uses finalized journal snapshots after message-redaction hooks. It is not a crash-safe event/wire log: hidden/unpersisted content, earlier truncation, disabled periods and late shutdown writes cannot be recovered automatically. Oversized raw/index data beyond 64 MiB and pathological normalization contexts beyond 64K UTF-16 units are rejected explicitly, never silently shortened. Conflicting payloads for an existing identity fail without overwriting history.
+- Bounds apply to search/read output, not accepted persisted payloads. Storage grows until explicit cleanup or filesystem limits; large writes/indexing can pause the UI. Deletion does not erase transcripts, result copies, backups or already-sent context, and is not forensic erasure.
+
 ## [1.7.0] - 2026-10-04
 
 ### Added

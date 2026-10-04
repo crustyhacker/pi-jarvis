@@ -84,6 +84,8 @@ function harness(mode = "tui") {
 	const pi: any = {
 		registerCommand: (name: string, command: any) => commands.set(name, command),
 		registerTool() {},
+		getActiveTools: () => [],
+		setActiveTools() {},
 		on: (name: string, handler: any) => {
 			const previous = handlers.get(name);
 			handlers.set(name, async (event, context) => { await previous?.(event, context); await handler(event, context); });
@@ -119,11 +121,12 @@ try {
 	{
 		const h = harness();
 		await h.event("session_start");
-		for (const initial of ["/memory off", "/jarvis-memory --project off", "/memory remember private | must not become a model prompt", "/jarvis-memory status"]) {
+		for (const initial of ["/memory off", "/jarvis-memory --project off", "/memory remember private | must not become a model prompt", "/jarvis-memory status",
+			"/archive off", "/jarvis-archive status", "/archive on", "/archive search private"]) {
 			const command = h.command("jarvis", initial);
 			await tick();
-			assert.equal(h.runtimes.length, 0, "initial memory commands must not boot a side runtime");
-			assert.equal(h.customCalls, 0, "initial memory commands are local management, not an overlay/model prompt");
+			assert.equal(h.runtimes.length, 0, "initial memory/archive commands must not boot a side runtime");
+			assert.equal(h.customCalls, 0, "initial memory/archive commands are local management, not an overlay/model prompt");
 			await command;
 		}
 		assert.ok(h.notices.some((notice) => notice.includes("global memory settings updated")));
@@ -140,9 +143,14 @@ try {
 		await until(() => oldRuntime.sent.length === 1);
 		const oldView = h.overlay.view;
 		await oldView.sendMessage("/memory --project off");
-		assert.deepEqual(oldRuntime.sent, ["old prompt"], "memory controls execute immediately without joining a busy provider queue");
+		await oldView.sendMessage("/archive off");
+		assert.deepEqual(oldRuntime.sent, ["old prompt"], "memory/archive controls execute immediately without joining a busy provider queue");
+		const snapshotTrust: boolean[] = [];
+		h.ctx.isProjectTrusted = () => true;
+		Object.assign(oldRuntime, { flushArchive: () => snapshotTrust.push(oldRuntime.options.archiveTrustProvider()) });
 		h.clearBranch();
 		await h.event("session_start");
+		assert.deepEqual(snapshotTrust, [true], "owner snapshots before its boot generation invalidates archive trust");
 		await oldOverlay;
 		const newOverlay = h.command("jarvis");
 		await until(() => h.runtimes.length === 2);

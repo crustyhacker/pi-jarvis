@@ -2263,6 +2263,8 @@ class FakeExtensionAPI {
 	sendUserMessage(): void {}
 
 	registerTool(): void {}
+	getActiveTools(): string[] { return []; }
+	setActiveTools(_names: string[]): void {}
 
 	getThinkingLevel(): string | undefined {
 		return this.thinkingLevel;

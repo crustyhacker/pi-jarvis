@@ -27,6 +27,8 @@ import {
 import { JarvisSideSessionRuntime, createSideSessionFile } from "./side-session.js";
 import { SharedMemoryService } from "./memory-service.js";
 import { createMemoryExtensionFactory } from "./memory-extension.js";
+import { SharedArchiveService } from "./archive-service.js";
+import { createArchiveExtensionFactory } from "./archive-extension.js";
 
 type JarvisModelSelection =
 	| { mode: "follow-main" }
@@ -71,6 +73,7 @@ type JarvisSideCommand =
 type MainState = {
 	bridge: JarvisOverlayBridge;
 	memory: SharedMemoryService;
+	archive: SharedArchiveService;
 	mainSession: MainSessionTracker;
 	mainContext: MainSessionContextPayload;
 	lastJarvisSeenMainContext?: MainSessionContextPayload;
@@ -114,6 +117,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	const state: MainState = {
 		bridge: new JarvisOverlayBridge(),
 		memory: new SharedMemoryService(getAgentDir()),
+		archive: new SharedArchiveService(getAgentDir()),
 		mainSession,
 		mainContext: buildMainSessionContext(mainSession.snapshot()),
 		lastJarvisSeenMainContext: undefined,
@@ -137,6 +141,11 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/jarvis requires Pi's interactive terminal UI.", "warning");
+				return;
+			}
+			const archiveRequest = parseArchiveCommand(args);
+			if (archiveRequest !== undefined) {
+				await dispatchArchiveCommand(state, archiveRequest, ctx, Boolean(state.overlayOpen));
 				return;
 			}
 			const memoryRequest = parseMemoryCommand(args);
@@ -488,12 +497,22 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("jarvis-archive", {
+		description: "Optional full-session archive: controls, indexed search, explicit import and deletion (help for syntax)",
+		handler: async (args, ctx) => { await dispatchArchiveCommand(state, args, ctx, false); },
+	});
+
 	pi.registerCommand("jarvis-memory", {
 		description: "Shared main Pi/Jarvis memory: status, on/off, capture/recall, search, remember, edit, forget (help for syntax)",
 		handler: async (args, ctx) => { dispatchMemoryCommand(state, args, ctx, false); },
 	});
 
+	pi.on("session_before_switch", () => { state.runtime?.flushArchive?.(); state.archive.cancelImports(); });
+	pi.on("session_before_fork", () => { state.runtime?.flushArchive?.(); state.archive.cancelImports(); });
+	pi.on("session_before_tree", () => { state.runtime?.flushArchive?.(); state.archive.cancelImports(); });
 	pi.on("session_start", async (_event, ctx) => {
+		state.runtime?.flushArchive?.();
+		state.archive.cancelImports();
 		state.closeOverlay?.();
 		state.bootGeneration += 1;
 		state.runtime?.dispose();
@@ -561,6 +580,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", async (_event, ctx) => {
 		const sessionRef = readJarvisSessionRef(ctx.sessionManager.getBranch());
 		if (sessionRef?.file !== state.sessionRef?.file) {
+			state.runtime?.flushArchive?.();
 			state.closeOverlay?.();
 			state.bootGeneration += 1;
 			state.runtime?.dispose();
@@ -637,6 +657,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		state.runtime?.flushArchive?.();
 		state.closeOverlay?.();
 		state.bootGeneration += 1;
 		state.runtime?.dispose();
@@ -662,6 +683,9 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	});
 
 	createMemoryExtensionFactory(state.memory, "main")(pi);
+	createArchiveExtensionFactory(state.archive, "main")(pi);
+	// Close shared storage only after the archive lane's final snapshot/disposal.
+	pi.on("session_shutdown", () => { state.archive.close(); });
 }
 
 function updateContextState(pi: ExtensionAPI, state: MainState, ctx: ExtensionContext): void {
@@ -1075,6 +1099,7 @@ async function executeJarvisSideCommand(
 		return runtime;
 	}
 
+	state.runtime?.flushArchive?.();
 	const generation = ++state.bootGeneration;
 	state.runtime?.dispose();
 	state.runtime = undefined;
@@ -1100,6 +1125,30 @@ function normalizeInitialMessage(args: string): string | undefined {
 function queueMessage(state: MainState, message: string): void {
 	state.queuedMessages.push(message);
 	state.bridge.refresh();
+}
+
+function parseArchiveCommand(message: string): string | undefined {
+	const match = /^\/(?:jarvis-archive|archive)(?:\s+([\s\S]*))?$/.exec(message.trim());
+	return match ? match[1] ?? "" : undefined;
+}
+
+async function dispatchArchiveCommand(state: MainState, args: string, ctx: ExtensionContext, overlay: boolean): Promise<void> {
+	const generation = state.bootGeneration;
+	try {
+		const text = await state.archive.command(args, ctx);
+		// Never deliver an old import completion into a replaced main/side thread.
+		if (generation !== state.bootGeneration) return;
+		if (overlay && state.runtime) state.runtime.addSystemMessage(text);
+		else if (overlay) state.bridge.notify(text, "info");
+		else if (ctx.hasUI) ctx.ui.notify(text, "info");
+		else process.stderr.write(`${text}\n`);
+	} catch (error) {
+		if (generation !== state.bootGeneration) return;
+		const text = error instanceof Error ? error.message : "Archive operation failed.";
+		if (overlay) state.bridge.notify(text, "error");
+		else if (ctx.hasUI) ctx.ui.notify(text, "error");
+		else process.stderr.write(`${text}\n`);
+	}
 }
 
 function parseMemoryCommand(message: string): string | undefined {
@@ -1200,6 +1249,11 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 		getDisplayEntries: () => getOverlayEntries(state),
 		sendMessage: async (text: string) => {
 			if (state.queuedMessages !== queue) return;
+			const archiveCommand = parseArchiveCommand(text);
+			if (archiveCommand !== undefined) {
+				await dispatchArchiveCommand(state, archiveCommand, ctx, true);
+				return;
+			}
 			// Memory controls must work immediately, even while a side turn is busy.
 			const memoryCommand = parseMemoryCommand(text);
 			if (memoryCommand !== undefined) {
@@ -1356,6 +1410,8 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 			projectTrusted: ctx.isProjectTrusted(),
 			memory: state.memory,
 			memoryTrustProvider: () => isCurrentBoot() && ctx.isProjectTrusted(),
+			archive: state.archive,
+			archiveTrustProvider: () => isCurrentBoot() && ctx.isProjectTrusted(),
 			modelRegistry: ctx.modelRegistry,
 			model: getDesiredJarvisModel(state),
 			jarvisModelModeProvider: () => state.jarvisModelSelection.mode,

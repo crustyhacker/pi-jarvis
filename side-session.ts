@@ -27,6 +27,8 @@ import { JarvisOverlayBridge, type JarvisDisplayEntry } from "./overlay.js";
 import { NativeMcpController, stripMcpServerSection } from "./native-mcp.js";
 import { createMemoryExtensionFactory, stripMemoryPrompt } from "./memory-extension.js";
 import { MEMORY_TOOL_NAMES, type SharedMemoryService } from "./memory-service.js";
+import { ARCHIVE_TOOL_NAMES, createArchiveExtensionFactory } from "./archive-extension.js";
+import type { SharedArchiveService } from "./archive-service.js";
 
 const SIDE_SYSTEM_PROMPT = `
 Authoritative /jarvis addendum:
@@ -57,6 +59,8 @@ type SideRuntimeCreateOptions = {
 	/** Main and side sessions share one service, independent of Repo tools. */
 	memory?: SharedMemoryService;
 	memoryTrustProvider?: () => boolean;
+	archive?: SharedArchiveService;
+	archiveTrustProvider?: () => boolean;
 	/** Optional public factory options for isolated MCP fixtures. Defaults use Pi config/auth. */
 	nativeMcpOptions?: McpExtensionOptions;
 	modelRegistry: ExtensionContext["modelRegistry"];
@@ -182,6 +186,7 @@ export class JarvisSideSessionRuntime {
 	private syncHostModels?: (model?: Model<any>) => Promise<void>;
 	private readonly lifetime = new AbortController();
 	private syncActiveTools?: () => void;
+	private archiveFinalSnapshot?: () => void;
 	private nativeMcp?: NativeMcpController;
 	private disposal: Promise<void> = Promise.resolve();
 
@@ -368,11 +373,22 @@ export class JarvisSideSessionRuntime {
 		this.modelLabel = formatModelLabel(this.session.model);
 	}
 
+	/** Flush already-finalized archive entries while the old context is still live. */
+	flushArchive(): void {
+		if (this.lifetime.signal.aborted) return;
+		try { this.archiveFinalSnapshot?.(); }
+		catch {
+			try { this.bridge.notify("Archive final snapshot failed; some finalized side entries may be missing. Pi history is unchanged.", "warning"); } catch { /* Teardown must still revoke permissions. */ }
+		}
+	}
+
 	dispose(): void {
 		// Retained public native shutdown handlers run BEFORE SDK ctx invalidation.
 		// AgentSession.dispose() does not emit session_shutdown on Pi 1.0.
 		this.disposal = this.nativeMcp?.dispose() ?? this.disposal;
 		void this.disposal.catch(() => {});
+		this.flushArchive();
+		this.archiveFinalSnapshot = undefined;
 		this.lifetime.abort();
 		this.ready = false;
 		this.toolAccessEnabled = false;
@@ -438,12 +454,19 @@ export class JarvisSideSessionRuntime {
 					this.lifetime.signal,
 					this.nativeMcp,
 					options.memory,
+					options.archive,
 				),
 				...(options.memory ? [createMemoryExtensionFactory(options.memory, "jarvis", {
 					lifetimeSignal: this.lifetime.signal,
 					isProjectTrusted: () => !this.lifetime.signal.aborted && (options.memoryTrustProvider?.() ?? options.projectTrusted ?? false),
 					onToolsChanged: () => this.syncActiveTools?.(),
 					confirmForget: (review, signal) => this.bridge.requestConfirmation("Forget shared memory?", review, signal),
+				})] : []),
+				...(options.archive ? [createArchiveExtensionFactory(options.archive, "jarvis", {
+					lifetimeSignal: this.lifetime.signal,
+					registerFinalSnapshot: (snapshot) => { this.archiveFinalSnapshot = snapshot; },
+					isProjectTrusted: () => !this.lifetime.signal.aborted && (options.archiveTrustProvider?.() ?? options.projectTrusted ?? false),
+					onToolsChanged: () => this.syncActiveTools?.(),
 				})] : []),
 				// Permission preflight is registered BEFORE native await/connect hooks.
 				this.nativeMcp.extensionFactory,
@@ -702,6 +725,7 @@ function createSideExtensionFactory(
 	lifetimeSignal?: AbortSignal,
 	nativeMcp?: Pick<NativeMcpController, "getActiveToolNames" | "isToolAvailable">,
 	memory?: SharedMemoryService,
+	archive?: SharedArchiveService,
 ) {
 	let previousMainContext: MainSessionContextPayload | undefined;
 	const followUpToolName = "jarvis_send_follow_up_to_main";
@@ -796,13 +820,14 @@ function createSideExtensionFactory(
 		}
 		const allTools = pi.getAllTools();
 		if (memory) activeToolNames.push(...allTools.filter((tool) => MEMORY_TOOL_NAMES.some((name) => name === tool.name) && tool.exposure === "direct").map((tool) => tool.name));
+		if (archive) activeToolNames.push(...allTools.filter((tool) => ARCHIVE_TOOL_NAMES.some((name) => name === tool.name) && tool.exposure === "direct").map((tool) => tool.name));
 		const availableToolNames = new Set(allTools.map((tool) => tool.name));
 		return activeToolNames.filter((toolName) => availableToolNames.has(toolName));
 	};
 	const getToolAccessPrompt = () =>
 		hasToolAccess()
 			? "Local /jarvis tool access for this turn:\n- Repo and system tools are enabled right now. You may use read, bash, edit, and write if those tools are active. Native Pi MCP shares this permission; use active direct tools, tool_search, or codemode as configured. MCP tools and resources belong to this isolated side session, not the main session. Use main Pi /mcp to manage server configuration and authentication."
-			: "Local /jarvis tool access for this turn:\n- Repo and system tools are disabled right now. Use injected context and enabled bridge or shared-memory tools only. Shared memory has its own independent controls.";
+			: "Local /jarvis tool access for this turn:\n- Repo and system tools are disabled right now. Use injected context and enabled bridge, shared-memory or archive tools only. Memory and archive have their own independent controls.";
 	const getCommunicationPrompt = () => {
 		const permissions = getCommunicationPermissions();
 		return [
@@ -946,6 +971,9 @@ function createSideExtensionFactory(
 			} else if (memory && MEMORY_TOOL_NAMES.some((name) => name === event.toolName)) {
 				// The separately mounted memory extension and each execute() enforce
 				// live trust/config/generation; Repo tools cannot grant memory access.
+				return;
+			} else if (archive && ARCHIVE_TOOL_NAMES.some((name) => name === event.toolName)) {
+				// Archive model access is separately opt-in, not granted by Repo tools.
 				return;
 			} else if (!hasToolAccess() || (!OPTIONAL_SIDE_TOOL_NAMES.some((name) => name === event.toolName) && !nativeMcp?.isToolAvailable(event.toolName))) {
 				return { block: true, reason: "/jarvis local tool is disabled or unsupported." };
