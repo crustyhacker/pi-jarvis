@@ -3,6 +3,7 @@ import { CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, truncateToWidt
 import { JarvisDraftEditor } from "./draft-editor.js";
 import { renderJarvisHeader, renderJarvisActivity } from "./overlay-layout.js";
 import { TranscriptViewport } from "./transcript-viewport.js";
+import { JarvisIntroAnimation, renderJarvisIntro } from "./jarvis-branding.js";
 
 export interface JarvisDisplayEntry {
 	kind: "user" | "assistant" | "tool" | "system" | "status";
@@ -217,6 +218,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	private confirmationCanApprove = false;
 	private renderedRows = 0;
 	private renderedColumns = 0;
+	private readonly intro: JarvisIntroAnimation;
 	private thinkingAnimationTick = 0;
 	private thinkingAnimationTimer?: NodeJS.Timeout;
 	private transcriptCacheWidth = -1;
@@ -231,7 +233,10 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		private readonly view: JarvisOverlayView,
 		private readonly close: () => void,
 		private readonly keybindings: KeybindingsManager = getKeybindings(),
+		options: { showIntro?: boolean } = {},
 	) {
+		this.intro = new JarvisIntroAnimation(() => { if (!this.disposed) this.tui.requestRender(); },
+			options.showIntro === true && process.env.PI_JARVIS_NO_ANIMATION !== "1" && !process.env.NO_COLOR && process.env.TERM !== "dumb");
 		this.maxHeightProvider = () => Math.max(0, Math.min(this.tui.terminal.rows, Math.max(1, Math.floor(this.tui.terminal.rows * 0.78))));
 
 		this.threadGeneration = bridge.getThreadGeneration();
@@ -301,6 +306,9 @@ export class JarvisOverlayComponent implements Component, Focusable {
 
 	handleInput(data: string): void {
 		if (this.disposed) return;
+		// Dismiss only the decoration; deliver this very same input normally.
+		// Paste framing is still consumed before shortcuts in handleKey().
+		if (!isKeyRelease(data)) this.intro.finish();
 		try {
 			this.syncThread();
 			this.handleKey(data);
@@ -388,15 +396,18 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		const maxHeight = this.maxHeightProvider();
 		const snapshot = this.bridge.snapshot();
 		const hasConfirmation = Boolean(snapshot.pendingConfirmation);
+		if (hasConfirmation || snapshot.notifications.some((item) => item.type !== "info")) this.intro.finish();
 		this.input.focused = this.focused && !hasConfirmation && this.focusTarget === "input";
 		this.renderedRows = this.tui.terminal.rows;
 		this.renderedColumns = this.tui.terminal.columns;
 		this.confirmationCanApprove = false;
 		if (width === 0 || maxHeight === 0) {
+			this.intro.finish();
 			this.stopThinkingAnimation();
 			return [];
 		}
 		if (width < 5 || maxHeight < 3) {
+			this.intro.finish();
 			this.stopThinkingAnimation();
 			return hasConfirmation ? [truncateToWidth("Enlarge to review; Esc cancel", width, "", true)] : this.renderInputLines(width, 1);
 		}
@@ -446,7 +457,11 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			top.push(...visibleNotices);
 			remaining -= count;
 		}
-		if (remaining > 0) {
+		if (remaining < 3) this.intro.finish();
+		const introFrame = this.intro.frame();
+		if (introFrame !== undefined) {
+			top.push(...renderJarvisIntro(this.theme, innerWidth, remaining, introFrame));
+		} else if (remaining > 0) {
 			const transcript = this.renderTranscript(innerWidth, Math.max(0, remaining - 1), snapshot);
 			const position = this.viewport.getStatus();
 			const label = position.following ? "Conversation · live" : `History · ${position.hiddenBelow} lines below · ctrl+end live`;
@@ -497,6 +512,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.intro.finish();
 		this.input.focused = false;
 		this.input.dispose();
 		this.stopThinkingAnimation();

@@ -2,27 +2,49 @@
 
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-logo.svg" alt="JARVIS — Pi / A second lane of thought. Cyan, violet, and pink ASCII chrome." width="720">
+
 ## A cinematic side-conversation overlay for Pi
 
 **Open a second lane of thought without derailing the main session.**
 
 `pi-jarvis` adds `/jarvis`: a polished overlay where you can ask for status, inspect the repo when you explicitly allow it, and send a quiet note or a confirmed redirect back to the main lane.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
 [![license](https://img.shields.io/badge/license-MIT-111827?style=for-the-badge)](./LICENSE)
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.6.0</p>
+<p><strong>Current version:</strong> 1.6.1</p>
 
 <p>
   <strong>Persistent side session</strong> ·
   <strong>Live main-session awareness</strong> ·
-  <strong>Permission-gated tools</strong> ·
+  <strong>Opt-in local tools + native MCP</strong> ·
   <strong>Safe redirect flow</strong>
 </p>
 
 </div>
+
+<details>
+<summary>Plain-text wordmark</summary>
+
+```text
+     _    _    ____ __     _____ ____
+    | |  / \  |  _ \\ \   / /_ _/ ___|
+ _  | | / _ \ | |_) |\ \ / / | |\___ \
+| |_| |/ ___ \|  _ <  \ V /  | | ___) |
+ \___//_/   \_\_| \_\  \_/  |___|____/
+
+       PI / A SECOND LANE OF THOUGHT
+```
+
+</details>
+
+![Jarvis compact overlay, rendered with deterministic demo data](https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-overlay.svg)
+
+*Renderer preview with a custom dark palette and demo conversation—not a live provider session. Your Pi theme controls the normal overlay.*
 
 ---
 
@@ -57,10 +79,10 @@ The main Pi session should stay on the critical path.
 |---|---|
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
 | **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
-| **Permission-gated tools** | Local `read`, `bash`, `edit`, and `write` stay off until you enable them |
+| **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and configured native MCP stay off until you enable Repo tools |
 | **Safe main-session handoff** | `Note main` is quiet; `Redirect` is confirmation-gated |
 | **Independent model control** | Follow the main model or pin `/jarvis` to a separate model |
-| **Cleaner UX** | Compact header, scrollable history, multiline drafts, and independent activity/queue feedback |
+| **Cleaner UX** | A one-time neon ASCII intro, then compact diagnostics, scrollback, multiline drafts, and independent activity/queue feedback |
 
 ---
 
@@ -72,6 +94,7 @@ flowchart LR
     U -->|open /jarvis| J[Jarvis overlay]
     M -->|summary + recent delta| J
     J -->|Repo tools enabled| R[Local tools\nread • bash • edit • write]
+    J -->|Repo tools enabled| C[Configured native MCP\nside-owned connections]
     J -. Note main .-> M
     J -. Redirect after confirmation .-> M
 ```
@@ -140,7 +163,7 @@ Or open it and send the first message immediately:
 ### 4) Turn on more power only when you want it
 
 - leave `Repo tools` off for pure context / analysis
-- turn `Repo tools` on when you want local `read`, `bash`, `edit`, and `write`
+- turn `Repo tools` on when you want local `read`, `bash`, `edit`, `write`, and configured native MCP capabilities
 - turn `Note main` on when you want Jarvis to quietly message the main session
 - turn `Redirect` on when you want Jarvis to propose a redirect that you still explicitly confirm
 
@@ -225,6 +248,14 @@ The overlay header exposes three controls, all **off by default**:
 `Note main` and `Redirect` can be forcibly disabled when the active `/jarvis` model is incompatible with bridge tools. Closing the overlay revokes all three permissions and cancels pending confirmations. Already-running local operations are not undone; newly starting calls are blocked.
 
 Long redirects are paged: review every page with Up/Down or PageUp/PageDown before pressing Y. Resize if the terminal is too small to review safely. Configured Pi selection keybindings are respected.
+
+### First-open neon intro
+
+The first `/jarvis` open for each main-session ID shows the ASCII wordmark with a **1.8-second cyan/violet/pink chrome sweep**. It is decorative, not a loading screen: startup and queued prompts continue normally, and the editor and permission controls remain usable. Type or paste to dismiss it immediately; your input is preserved. Escape still closes the overlay. Confirmation review and warnings/errors take priority.
+
+Reopening Jarvis, side `/new`, tree navigation, and returning to a previously opened main session do not replay it. The once-per-session memory lives in the loaded extension; restarting Pi or `/reload` resets it. Small terminals use a compact wordmark or skip the intro entirely. Light themes and 256-color terminals are supported; there is no flashing or terminal blinking.
+
+To skip the intro, start Pi with `PI_JARVIS_NO_ANIMATION=1`. A non-empty `NO_COLOR` or `TERM=dumb` also suppresses it. These switches affect the intro, not Pi's other animations or colors.
 
 ### Keyboard and drafts
 
@@ -397,6 +428,14 @@ Check the mandatory annotated **version-number** tag policy for committed histor
 ```bash
 npm run check:tags
 ```
+
+Regenerate the shared logo and actual-renderer demo artwork after visual changes:
+
+```bash
+npm run render:branding
+```
+
+This uses deterministic fixtures, without opening a terminal, calling a provider, or connecting to MCP servers.
 
 ### Release automation
 

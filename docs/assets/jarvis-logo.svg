@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="628" height="196" viewBox="0 0 628 196" role="img" aria-labelledby="title desc">
+<title id="title">Jarvis / Pi</title><desc id="desc">Original ASCII wordmark with a cyan, violet, and pink chrome sweep. A second lane of thought.</desc>
+<defs><linearGradient id="edge"><stop stop-color="#5de2ff"/><stop offset="0.5" stop-color="#bd8aff"/><stop offset="1" stop-color="#ff70cd"/></linearGradient></defs>
+<rect width="628" height="196" rx="14" fill="#100c1e"/>
+<rect x="1" y="1" width="626" height="194" rx="13" fill="none" stroke="url(#edge)" stroke-width="2"/>
+<g font-family="'DejaVu Sans Mono', Consolas, monospace" font-size="14" xml:space="preserve"><text x="187.6" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="229.60000000000002" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="271.6" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="280" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="288.40000000000003" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="296.8" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="313.6" y="28" fill="rgb(154,235,255)" font-weight="bold">_</text>
+<text x="322" y="28" fill="rgb(194,241,255)" font-weight="bold">_</text>
+<text x="372.40000000000003" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="380.8" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="389.2" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="397.6" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="406" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="422.8" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="431.20000000000005" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="439.6" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="448" y="28" fill="rgb(93,226,255)" font-weight="bold">_</text>
+<text x="179.20000000000002" y="48" fill="rgb(118,177,255)" font-weight="bold">|</text>
+<text x="196" y="48" fill="rgb(118,177,255)" font-weight="bold">|</text>
+<text x="221.20000000000002" y="48" fill="rgb(118,177,255)" font-weight="bold">/</text>
+<text x="238" y="48" fill="rgb(118,177,255)" font-weight="bold">\</text>
+<text x="263.20000000000005" y="48" fill="rgb(118,177,255)" font-weight="bold">|</text>
+<text x="288.40000000000003" y="48" fill="rgb(135,186,255)" font-weight="bold">_</text>
+<text x="305.2" y="48" fill="rgb(204,223,255)" font-weight="bold">\</text>
+<text x="313.6" y="48" fill="rgb(238,241,255)" font-weight="bold">\</text>
+<text x="330.40000000000003" y="48" fill="rgb(204,223,255)" font-weight="bold">\</text>
+<text x="364" y="48" fill="rgb(118,177,255)" font-weight="bold">/</text>
+<text x="380.8" y="48" fill="rgb(118,177,255)" font-weight="bold">/</text>
+<text x="389.2" y="48" fill="rgb(118,177,255)" font-weight="bold">_</text>
+<text x="406" y="48" fill="rgb(118,177,255)" font-weight="bold">_</text>
+<text x="414.40000000000003" y="48" fill="rgb(118,177,255)" font-weight="bold">/</text>
+<text x="431.20000000000005" y="48" fill="rgb(118,177,255)" font-weight="bold">_</text>
+<text x="439.6" y="48" fill="rgb(118,177,255)" font-weight="bold">_</text>
+<text x="448" y="48" fill="rgb(118,177,255)" font-weight="bold">_</text>
+<text x="456.40000000000003" y="48" fill="rgb(118,177,255)" font-weight="bold">|</text>
+<text x="154" y="68" fill="rgb(191,138,255)" font-weight="bold">_</text>
+<text x="179.20000000000002" y="68" fill="rgb(191,138,255)" font-weight="bold">|</text>
+<text x="196" y="68" fill="rgb(191,138,255)" font-weight="bold">|</text>
+<text x="212.8" y="68" fill="rgb(191,138,255)" font-weight="bold">/</text>
+<text x="229.60000000000002" y="68" fill="rgb(191,138,255)" font-weight="bold">_</text>
+<text x="246.4" y="68" fill="rgb(191,138,255)" font-weight="bold">\</text>
+<text x="263.20000000000005" y="68" fill="rgb(191,138,255)" font-weight="bold">|</text>
+<text x="280" y="68" fill="rgb(215,180,255)" font-weight="bold">|</text>
+<text x="288.40000000000003" y="68" fill="rgb(231,208,255)" font-weight="bold">_</text>
+<text x="296.8" y="68" fill="rgb(247,236,255)" font-weight="bold">)</text>
+<text x="313.6" y="68" fill="rgb(231,208,255)" font-weight="bold">|</text>
+<text x="322" y="68" fill="rgb(215,180,255)" font-weight="bold">\</text>
+<text x="338.8" y="68" fill="rgb(191,138,255)" font-weight="bold">\</text>
+<text x="355.6" y="68" fill="rgb(191,138,255)" font-weight="bold">/</text>
+<text x="372.40000000000003" y="68" fill="rgb(191,138,255)" font-weight="bold">/</text>
+<text x="389.2" y="68" fill="rgb(191,138,255)" font-weight="bold">|</text>
+<text x="406" y="68" fill="rgb(191,138,255)" font-weight="bold">|</text>
+<text x="414.40000000000003" y="68" fill="rgb(191,138,255)" font-weight="bold">\</text>
+<text x="422.8" y="68" fill="rgb(191,138,255)" font-weight="bold">_</text>
+<text x="431.20000000000005" y="68" fill="rgb(191,138,255)" font-weight="bold">_</text>
+<text x="439.6" y="68" fill="rgb(191,138,255)" font-weight="bold">_</text>
+<text x="456.40000000000003" y="68" fill="rgb(191,138,255)" font-weight="bold">\</text>
+<text x="145.60000000000002" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="162.4" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="170.8" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="179.20000000000002" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="196" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="204.4" y="88" fill="rgb(255,112,205)" font-weight="bold">/</text>
+<text x="221.20000000000002" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="229.60000000000002" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="238" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="254.8" y="88" fill="rgb(255,129,211)" font-weight="bold">\</text>
+<text x="263.20000000000005" y="88" fill="rgb(255,164,224)" font-weight="bold">|</text>
+<text x="288.40000000000003" y="88" fill="rgb(255,233,249)" font-weight="bold">_</text>
+<text x="305.2" y="88" fill="rgb(255,164,224)" font-weight="bold">&lt;</text>
+<text x="330.40000000000003" y="88" fill="rgb(255,112,205)" font-weight="bold">\</text>
+<text x="347.2" y="88" fill="rgb(255,112,205)" font-weight="bold">V</text>
+<text x="364" y="88" fill="rgb(255,112,205)" font-weight="bold">/</text>
+<text x="389.2" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="406" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="422.8" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="431.20000000000005" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="439.6" y="88" fill="rgb(255,112,205)" font-weight="bold">_</text>
+<text x="448" y="88" fill="rgb(255,112,205)" font-weight="bold">)</text>
+<text x="464.8" y="88" fill="rgb(255,112,205)" font-weight="bold">|</text>
+<text x="154" y="108" fill="rgb(255,185,126)" font-weight="bold">\</text>
+<text x="162.4" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="170.8" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="179.20000000000002" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="187.6" y="108" fill="rgb(255,185,126)" font-weight="bold">/</text>
+<text x="196" y="108" fill="rgb(255,185,126)" font-weight="bold">/</text>
+<text x="204.4" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="212.8" y="108" fill="rgb(255,185,126)" font-weight="bold">/</text>
+<text x="246.4" y="108" fill="rgb(255,209,174)" font-weight="bold">\</text>
+<text x="254.8" y="108" fill="rgb(255,226,207)" font-weight="bold">_</text>
+<text x="263.20000000000005" y="108" fill="rgb(255,242,239)" font-weight="bold">\</text>
+<text x="271.6" y="108" fill="rgb(255,242,239)" font-weight="bold">_</text>
+<text x="280" y="108" fill="rgb(255,226,207)" font-weight="bold">|</text>
+<text x="296.8" y="108" fill="rgb(255,193,142)" font-weight="bold">\</text>
+<text x="305.2" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="313.6" y="108" fill="rgb(255,185,126)" font-weight="bold">\</text>
+<text x="338.8" y="108" fill="rgb(255,185,126)" font-weight="bold">\</text>
+<text x="347.2" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="355.6" y="108" fill="rgb(255,185,126)" font-weight="bold">/</text>
+<text x="380.8" y="108" fill="rgb(255,185,126)" font-weight="bold">|</text>
+<text x="389.2" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="397.6" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="406" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="414.40000000000003" y="108" fill="rgb(255,185,126)" font-weight="bold">|</text>
+<text x="422.8" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="431.20000000000005" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="439.6" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="448" y="108" fill="rgb(255,185,126)" font-weight="bold">_</text>
+<text x="456.40000000000003" y="108" fill="rgb(255,185,126)" font-weight="bold">/</text>
+<text x="187.6" y="148" fill="rgb(93,226,255)">P</text>
+<text x="196" y="148" fill="rgb(93,226,255)">I</text>
+<text x="212.8" y="148" fill="rgb(93,226,255)">/</text>
+<text x="229.60000000000002" y="148" fill="rgb(93,226,255)">A</text>
+<text x="246.4" y="148" fill="rgb(93,226,255)">S</text>
+<text x="254.8" y="148" fill="rgb(93,226,255)">E</text>
+<text x="263.20000000000005" y="148" fill="rgb(93,226,255)">C</text>
+<text x="271.6" y="148" fill="rgb(93,226,255)">O</text>
+<text x="280" y="148" fill="rgb(93,226,255)">N</text>
+<text x="288.40000000000003" y="148" fill="rgb(93,226,255)">D</text>
+<text x="305.2" y="148" fill="rgb(93,226,255)">L</text>
+<text x="313.6" y="148" fill="rgb(93,226,255)">A</text>
+<text x="322" y="148" fill="rgb(93,226,255)">N</text>
+<text x="330.40000000000003" y="148" fill="rgb(93,226,255)">E</text>
+<text x="347.2" y="148" fill="rgb(93,226,255)">O</text>
+<text x="355.6" y="148" fill="rgb(93,226,255)">F</text>
+<text x="372.40000000000003" y="148" fill="rgb(93,226,255)">T</text>
+<text x="380.8" y="148" fill="rgb(93,226,255)">H</text>
+<text x="389.2" y="148" fill="rgb(93,226,255)">O</text>
+<text x="397.6" y="148" fill="rgb(93,226,255)">U</text>
+<text x="406" y="148" fill="rgb(93,226,255)">G</text>
+<text x="414.40000000000003" y="148" fill="rgb(93,226,255)">H</text>
+<text x="422.8" y="148" fill="rgb(93,226,255)">T</text></g>
+</svg>

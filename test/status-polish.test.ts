@@ -91,7 +91,7 @@ function harness(root: string, id: number) {
 		mode: "tui", hasUI: true, cwd: join(root, `project-${id}`), model,
 		isProjectTrusted: () => false, isIdle: () => true, hasPendingMessages: () => false,
 		getSystemPrompt: () => "Main prompt remains unchanged.", getContextUsage: () => undefined,
-		sessionManager: { getBranch: () => branch },
+		sessionManager: { getBranch: () => branch, getSessionId: () => `test-main-${id}` },
 		modelRegistry: { find: () => model },
 		ui: {
 			theme, notify: (text: string) => hostNotices.push(text),
@@ -332,6 +332,7 @@ test("truthful /jarvis queue and processing feedback", async (t) => {
 				await until(() => h.view.isReady() && !h.view.getIsProcessing());
 				const runtime = h.runtimes[0]!;
 				runtime.entries.push({ kind: "assistant", text: Array.from({ length: 100 }, (_, i) => `History line ${i}`).join("\n") });
+				h.overlay.handleInput("\x1b[1;5F"); // Real scroll input dismisses the first-open decoration.
 				const editor = h.overlay.input;
 				editor.addToHistory("Prior accepted prompt"); editor.setText("Unsent draft stays");
 				h.bridge.setDraft("Unsent draft stays");

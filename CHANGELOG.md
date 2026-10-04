@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.6.1] - 2026-10-03
+
+### Added
+- Original ASCII wordmark with a short, one-time cyan/violet/pink chrome intro on the first Jarvis open for each main session in the loaded extension.
+- Immediate input/paste dismissal without losing input; confirmation and error precedence, tiny-terminal fallback, light/256-color support, and a reduced-motion opt-out via `PI_JARVIS_NO_ANIMATION=1`. Non-empty `NO_COLOR` and `TERM=dumb` also skip the intro.
+- Matching GitHub README artwork, an actual-renderer demo preview, CI badge, and clearer native MCP feature coverage. Artwork is reproducible with `npm run render:branding` using local fixtures only.
+
+### Safety and lifecycle
+- The intro never delays runtime startup or queued prompts, changes permissions, or writes to session history. Its unreferenced timer stops on expiry, input, or overlay disposal.
+- Reopen, side reset/tree navigation, and returning to an already-opened main session do not replay it. Restarting Pi or reloading the extension resets the in-memory first-open tracking.
+
 ## [1.6.0] - 2026-10-03
 
 ### Added

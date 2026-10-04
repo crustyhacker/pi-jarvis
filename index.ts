@@ -103,6 +103,9 @@ function isStaleJarvisBootError(error: unknown): error is StaleJarvisBootError {
 }
 
 export default function jarvisExtension(pi: ExtensionAPI): void {
+	// Presentation-only memory, keyed by MAIN identity, never by the side tree.
+	// Reopening or returning to a session does not replay the intro.
+	const introSeenSessions = new Set<string>();
 	const mainSession = new MainSessionTracker();
 	const state: MainState = {
 		bridge: new JarvisOverlayBridge(),
@@ -166,11 +169,15 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 							queueMicrotask(() => tui.requestRender());
 						};
 						state.closeOverlay = closeOverlay;
-						return attachOverlayBridge(
-							new JarvisOverlayComponent(tui, theme, state.bridge, overlayView, closeOverlay, keybindings),
+						const sessionId = ctx.sessionManager.getSessionId();
+						const component = attachOverlayBridge(
+							new JarvisOverlayComponent(tui, theme, state.bridge, overlayView, closeOverlay, keybindings,
+								{ showIntro: !introSeenSessions.has(sessionId) }),
 							state.bridge,
 							tui,
 						);
+						introSeenSessions.add(sessionId);
+						return component;
 					},
 					{
 						overlay: true,

@@ -2,7 +2,7 @@
 
 ## Project Scope
 - `pi-jarvis` is a Pi extension that opens a `/jarvis` side-conversation overlay.
-- Core runtime files: `index.ts`, `side-session.ts`, `native-mcp.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
+- Core runtime files: `index.ts`, `side-session.ts`, `native-mcp.ts`, `overlay.ts`, `overlay-layout.ts`, `draft-editor.ts`, `transcript-viewport.ts`, `jarvis-branding.ts`, `model-picker.ts`, `jarvis-config.ts`, `session-ref.ts`.
 - Current baseline: Pi 1.0.0 (`@earendil-works` packages), Node.js >=22.19.0. Older Pi hosts are not supported.
 
 ## Current `/jarvis-model` and `/jarvis-thinking` Behavior
@@ -33,6 +33,13 @@
 - Consume bracketed paste before global shortcuts and confirmation keys; pasted content must not toggle permissions or approve a redirect.
 - Queue count excludes active work; processing includes boot and complete queue settlement. Keep activity separate from scrollback and never replay uncertain sends.
 - Bound overlay history (500 entries, 512K UTF-16 units total, 64K per entry) with explicit omission notices; never truncate persisted history.
+
+## Branding intro (1.6.1)
+- The first overlay for each main-session ID in the loaded extension shows a 1.8-second neon/chrome ASCII sweep, then returns to the compact UI. Reopen, side `/new`, tree navigation, and returning to an already-seen main session must not replay it. Reload/restart resets this in-memory bookkeeping.
+- The intro is decoration, never a boot/queue gate. Keep editor, permissions, and activity available. Input dismisses it without being consumed; paste framing still precedes shortcuts. Confirmations and warnings/errors preempt it.
+- Use a bounded, unreferenced, lazily started timer; stop on dismissal, expiry, or disposal. No blinking, flashing, terminal-clearing commands, transcript entries, or persisted session changes.
+- Suppress with `PI_JARVIS_NO_ANIMATION=1`, non-empty `NO_COLOR`, or `TERM=dumb`. Use compact/no intro on small terminals and readable palettes for light themes and 256-color output.
+- `jarvis-branding.ts` owns the original wordmark. `npm run render:branding` regenerates README SVGs with local renderer fixtures, not live provider/session data. Label fixture previews honestly.
 
 ## Native MCP (1.6.0)
 - Use Pi's root-exported native factories, not private registry/runtime/transport internals. Jarvis owns separate configured-server connections; main-only extension registrations are not inherited.

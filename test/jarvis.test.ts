@@ -2221,6 +2221,7 @@ type TestExtensionCommandContext = {
 	cwd: string;
 	sessionManager: {
 		getBranch: () => SessionEntry[];
+		getSessionId: () => string;
 	};
 	isIdle: () => boolean;
 	signal: undefined;
@@ -2401,6 +2402,7 @@ function createTestExtensionCommandContext(
 		cwd,
 		sessionManager: {
 			getBranch: () => branchEntries,
+			getSessionId: () => cwd,
 		},
 		isIdle: () => true,
 		signal: undefined,
@@ -2997,6 +2999,7 @@ async function testJarvisOverlaySkipsReconnectTextForMissingSessionRef(): Promis
 			await harness.api.runCommand("jarvis", "", harness.ctx);
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture the overlay while the runtime is still booting");
+			capturedOverlay.handleInput("\x1b[1;5F"); // Dismiss first-open decoration to inspect startup transcript.
 			const lines = capturedOverlay.render(80) as string[];
 			assert.ok(lines.some((line) => line.includes("Starting /jarvis side conversation…")), "missing side-session files should fall back to a fresh startup label");
 			assert.ok(!lines.some((line) => line.includes("Connecting to your prior /jarvis conversation…")), "missing side-session files should not claim the old conversation will be restored");

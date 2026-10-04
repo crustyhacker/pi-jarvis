@@ -67,7 +67,7 @@ function harness(mode = "tui") {
 		mode, hasUI: mode === "tui" || mode === "rpc", cwd: join(root, `project-${harnessCount++}`), model: models[0],
 		isProjectTrusted: () => false, isIdle: () => true, hasPendingMessages: () => false,
 		getSystemPrompt: () => "You are a coding assistant.", getContextUsage: () => undefined,
-		sessionManager: { getBranch: () => entries },
+		sessionManager: { getBranch: () => entries, getSessionId: () => "test-main-session" },
 		modelRegistry: { refresh: () => refresh(), getAvailable: () => models, find: (_: string, id: string) => models.find((m) => m.id === id) },
 		ui: {
 			theme, notify: (text: string) => notices.push(text),
@@ -250,6 +250,42 @@ try {
 		assert.equal(bridge.hasPendingConfirmation(), false, "abort dismisses matching dialog immediately");
 		assert.equal(await bridge.requestConfirmation("cancelled", "body", currentSignal.signal), false);
 		assert.equal(bridge.hasPendingConfirmation(), false);
+	}
+	{
+		const h = harness();
+		const saved = { motion: process.env.PI_JARVIS_NO_ANIMATION, color: process.env.NO_COLOR, term: process.env.TERM };
+		delete process.env.PI_JARVIS_NO_ANIMATION; delete process.env.NO_COLOR; process.env.TERM = "xterm-256color";
+		let sessionId = "intro-first-main";
+		h.ctx.sessionManager.getSessionId = () => sessionId;
+		let opening: Promise<void> | undefined;
+		const hasIntro = () => h.overlay.render(80).join("\n").includes("A SECOND LANE OF THOUGHT");
+		try {
+			await h.event("session_start");
+			opening = h.command("jarvis", "greet while intro runs");
+			await until(() => h.runtimes[0]?.sent.includes("greet while intro runs") === true);
+			assert.equal(hasIntro(), true, "first actual TUI open shows the intro without blocking the initial prompt");
+			h.overlay.handleInput("x");
+			await h.overlay.view.sendMessage("/new");
+			assert.equal(hasIntro(), false, "side /new never replays presentation");
+			h.overlay.dispose(); await opening;
+			opening = h.command("jarvis");
+			assert.equal(hasIntro(), false, "reopen in the same main session skips the intro");
+			await h.event("session_tree");
+			assert.equal(hasIntro(), false, "tree navigation is not a first open");
+			h.overlay.dispose(); await opening;
+			sessionId = "intro-second-main"; h.clearBranch(); await h.event("session_start");
+			opening = h.command("jarvis");
+			assert.equal(hasIntro(), true, "a different main session gets its own first open");
+			h.overlay.dispose(); await opening;
+			sessionId = "intro-first-main"; h.clearBranch(); await h.event("session_start");
+			opening = h.command("jarvis");
+			assert.equal(hasIntro(), false, "returning to a seen main session does not replay");
+		} finally {
+			await h.event("session_shutdown"); await opening;
+			for (const [key, value] of [["PI_JARVIS_NO_ANIMATION", saved.motion], ["NO_COLOR", saved.color], ["TERM", saved.term]]) {
+				if (value === undefined) delete process.env[key!]; else process.env[key!] = value;
+			}
+		}
 	}
 	console.log("index regression tests passed");
 } finally {

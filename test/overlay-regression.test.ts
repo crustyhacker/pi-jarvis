@@ -281,13 +281,15 @@ class MemoryTerminal implements Terminal {
 }
 
 for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
-	test(`${Renderer.name}: actual Pi 1 renderer routes overlay input, focus, resize, and confirmation`, async () => {
+	test(`${Renderer.name}: actual Pi 1 renderer routes overlay intro, input, focus, resize, and confirmation`, async () => {
+		const saved = { motion: process.env.PI_JARVIS_NO_ANIMATION, color: process.env.NO_COLOR, term: process.env.TERM };
+		delete process.env.PI_JARVIS_NO_ANIMATION; delete process.env.NO_COLOR; process.env.TERM = "xterm-256color";
 		const terminal = new MemoryTerminal();
 		const host = new Renderer(terminal);
 		const f = fixture();
 		const bridge = new JarvisOverlayBridge();
 		let handle: ReturnType<TUI["showOverlay"]> | undefined;
-		const component = attachOverlayBridge(new JarvisOverlayComponent(host, theme, bridge, f.view, () => handle?.hide()), bridge, host);
+		const component = attachOverlayBridge(new JarvisOverlayComponent(host, theme, bridge, f.view, () => handle?.hide(), undefined, { showIntro: true }), bridge, host);
 		const baseInputs: string[] = [];
 		const base = { render: () => ["base"], invalidate() {}, handleInput: (data: string) => baseInputs.push(data) };
 		host.addChild(base);
@@ -297,6 +299,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			handle = host.showOverlay(component, { width: "68%", minWidth: 68, maxHeight: "82%" });
 			host.renderNow(true);
 			assert.ok(component.render(68).some((line) => line.includes(CURSOR_MARKER)));
+			assert.match(plain(component.render(68)), /A SECOND LANE OF THOUGHT/);
 			terminal.input?.("hello");
 			host.renderNow();
 			assert.ok(plain(component.render(68)).includes("hello"));
@@ -316,6 +319,9 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			component.dispose();
 			host.stop();
 			f.overlay.dispose();
+			for (const [key, value] of [["PI_JARVIS_NO_ANIMATION", saved.motion], ["NO_COLOR", saved.color], ["TERM", saved.term]]) {
+				if (value === undefined) delete process.env[key!]; else process.env[key!] = value;
+			}
 		}
 	});
 }

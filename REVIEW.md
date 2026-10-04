@@ -45,6 +45,14 @@
 - Validation: 181 Node test results passed (including real SDK/local MCP fixtures and temporary-repository/mock-GitHub release tests), plus build, release-payload verification, and local tag-policy checks. No live user MCP servers or paid provider calls were used. GitHub-hosted workflow execution is not claimed by local validation.
 - Prepared as the normal 1.6.0 release on `main`. Published 1.5.0 and existing history/tags/assets remain unchanged; npm publication is still manual.
 
+## 1.6.1 branding and first-open intro
+
+- Shared ASCII wordmark with a single 1.8-second neon/chrome sweep. Main-session IDs scope the in-memory first-open tracking; reopen, side `/new`, and tree navigation do not replay it. Reload/restart resets the tracking.
+- Decoration does not gate boot, queued prompts, input, permissions, or confirmation review. Input is forwarded after dismissal; errors/warnings preempt the intro. A lazy, unreferenced timer stops on deadline or disposal.
+- Motion opt-out, NO_COLOR/dumb-terminal suppression, light/256-color palettes, tiny-terminal bounds, input/paste preservation, session identity, and both real Pi terminal renderers have deterministic coverage.
+- README now shares the wordmark, exposes native MCP near the top, and has a CI badge and reproducible SVG preview. The preview is explicitly demo data, generated from the actual renderer without opening a live session. Rasterized SVG artwork was visually inspected; no human-driven live terminal/provider smoke test is claimed.
+- Validation: 191 test results passed, plus build and release-payload checks. Existing release tags and tarballs are preserved; npm publication remains manual.
+
 ## Explicit limitations / proposed next improvements
 
 1. **Native MCP lifecycle hardening.** The 1.6.0 integration covers native direct/deferred/nested/resource gates, late registration, trust, and best-effort teardown. Strict cancellation during native connection/authentication initialization needs upstream public lifecycle hooks; neither reaching into private transports nor reviving the unsupported legacy adapter is acceptable.
