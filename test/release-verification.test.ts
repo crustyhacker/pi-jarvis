@@ -90,7 +90,7 @@ function main(): void {
 		"index", "jarvis-config", "main-context", "main-session-state", "model-picker", "overlay", "session-ref", "side-session",
 		"draft-editor", "overlay-layout", "transcript-viewport", "native-mcp", "jarvis-branding",
 		"memory-types", "memory-config", "memory-content", "memory-store", "memory-service", "memory-extension",
-		"archive-types", "archive-config", "archive-store", "archive-service", "archive-extension",
+		"archive-types", "archive-config", "archive-store", "archive-service", "archive-extension", "archive-import",
 	].flatMap((name) => [`dist/${name}.js`, `dist/${name}.d.ts`])]) {
 		assert.ok(existsSync(join(process.cwd(), path)), `missing built/release artifact: ${path}`);
 		assert.ok(packedPaths.has(path), `missing expected packaged path: ${path}`);

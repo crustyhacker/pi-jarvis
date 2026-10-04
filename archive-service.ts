@@ -1,9 +1,11 @@
-import { constants, realpathSync } from "node:fs";
-import { open } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { archiveConfigPath, clearArchivePolicy, resolveArchivePolicy, saveArchivePolicy } from "./archive-config.js";
 import { ArchiveStore } from "./archive-store.js";
+import { ARCHIVE_IMPORT_LIMITS, ArchiveImportFailure, discoverArchiveImports, importArchiveTranscript, type ImportCounts, type ImportInventory } from "./archive-import.js";
 import type { ArchiveInput, ArchivePage, ArchivePolicy, ArchiveScope, ArchiveSummary } from "./archive-types.js";
 
 export type ArchiveContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted" | "sessionManager" | "ui" | "hasUI" | "mode"> & { signal?: AbortSignal };
@@ -23,9 +25,13 @@ const HELP = `Full-session archive (separate from shared memory; defaults OFF):
 /jarvis-archive session [--all] <session-id> [record-offset]
 /jarvis-archive stats [--all]
 /jarvis-archive import --confirm-sensitive <absolute JSONL path>
+/jarvis-archive import-all [absolute directory]
+/jarvis-archive import-all --confirm-sensitive --preview TOKEN [same directory]
+/jarvis-archive import-cancel
+/jarvis-archive import-report REPORT_ID [file offset]
 /jarvis-archive forget-session [--all] --confirm <session-id>
 /jarvis-archive prune [--all] --confirm <ISO timestamp>
-Controls default GLOBAL; an explicit global off is a master switch. Data defaults to this project. Full off blocks even record inspection; capture off leaves inspection available. Model tools are separately opt-in and read-only. Import is human-only, explicit-file, v3 JSONL; partial imports are reported. clear removes settings, never data; acknowledgment is required because fallback can re-enable recording/model access. Accepted entries are preserved without truncation (64 MiB raw-entry/index budgets; 64K UTF-16 normalization-context limit); rejected entries are reported, not silently shortened. Use read pagination to reconstruct raw JSON; offsets are Unicode codepoints. No automatic recall or external file dereferencing.`;
+Controls default GLOBAL; an explicit global off is a master switch. Data defaults to this project. Full off blocks even record inspection; capture off leaves inspection available. Model tools are separately opt-in and read-only. Import is human-only, v3 JSONL; partial imports are reported. import-all previews recursive regular single-link .jsonl files (default: active agent directory/sessions) using metadata only. A sensitive confirmation and one-use preview token are required within 10 minutes; only reviewed files are imported sequentially, never added files. Discovery rejects unreadable/incomplete/over-limit scans (10,000 candidates, 50,000 visited entries, depth 64, 8 MiB inventory). Nested links, hardlinks and nonregular files are skipped. Reviewed directory identities/opened file metadata are checked and bulk reads stop at reviewed sizes; concurrent mutation checks are best effort, not a filesystem sandbox. import-cancel works even OFF. import-report pages the latest ephemeral same-project/session report while enabled (capture/model access may be off). clear removes settings, never data; acknowledgment is required because fallback can re-enable recording/model access. Accepted entries are preserved without truncation (64 MiB raw-entry/index budgets; 64K UTF-16 normalization-context limit); rejected entries are reported, not silently shortened. Use read pagination to reconstruct raw JSON; offsets are Unicode codepoints. No automatic recall or external file dereferencing.`;
 
 const encode = (value: unknown) => JSON.stringify(value).replace(/[<>\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const integer = (value: number | undefined, fallback: number, max: number) => {
@@ -59,11 +65,34 @@ function headerEntry(header: { timestamp?: unknown }): ArchiveInput["entry"] {
 	return { id: "__pi_jarvis_archive_header__", parentId: null, type: "archive_session_header", timestamp: header.timestamp, header };
 }
 
+interface ImportOwner { cwd: string; sessionId: string; epoch: number; generation: number; signal?: AbortSignal }
+interface ImportPreview { id: string; expires: number; owner: ImportOwner; inventory: ImportInventory }
+type ImportFileStatus = "succeeded" | "failed" | "changed" | "skipped" | "unprocessed";
+interface ImportFileResult extends ImportCounts { index: number; path: string; status: ImportFileStatus; line?: number; reason?: string }
+interface ImportReport {
+	id: string; root: string; owner: ImportOwner; discoverySkipped: number; files: ImportFileResult[]; stopped?: string;
+}
+
+/** Bounded display strings; exact reviewed paths stay private in the manifest. */
+function importPath(path: string, maximum = 256): { path: string; pathAbbreviated?: true } {
+	const points = [...path];
+	if (points.length <= maximum) return { path };
+	const prefix = Math.floor(maximum / 3);
+	return { path: points.slice(0, prefix).join("") + "… [abbreviated] …" + points.slice(-(maximum - prefix)).join(""), pathAbbreviated: true };
+}
+function importRoot(root: string): { root: string; rootAbbreviated?: true } {
+	const display = importPath(root, 512);
+	return { root: display.path, ...(display.pathAbbreviated ? { rootAbbreviated: true as const } : {}) };
+}
+
 /** One lazy service explicitly shared by main Pi and Jarvis. No memory coupling. */
 export class SharedArchiveService {
 	readonly store: ArchiveStore;
 	private generation = 0;
 	private importGeneration = 0;
+	private pendingPreview?: ImportPreview;
+	private latestImportReport?: ImportReport;
+	private bulkRunning = false;
 	private readonly changes = new Set<() => void>();
 	private readonly keys = new Map<string, string>();
 	private readonly notices = new Set<string>();
@@ -75,6 +104,7 @@ export class SharedArchiveService {
 	get epoch(): number { return this.generation; }
 	onChange(listener: () => void): () => void { this.changes.add(listener); return () => this.changes.delete(listener); }
 	invalidate(): void {
+		this.pendingPreview = undefined;
 		this.generation++;
 		this.notifyAgain = true;
 		if (this.notifying) return;
@@ -88,8 +118,8 @@ export class SharedArchiveService {
 			} while (this.notifyAgain);
 		} finally { this.notifying = false; }
 	}
-	cancelImports(): void { this.importGeneration++; }
-	close(): void { this.cancelImports(); this.savedHeaders.clear(); try { this.store.close(); } finally { this.generation++; } }
+	cancelImports(): void { this.pendingPreview = undefined; this.importGeneration++; }
+	close(): void { this.cancelImports(); this.latestImportReport = undefined; this.savedHeaders.clear(); try { this.store.close(); } finally { this.generation++; } }
 	policy(ctx: ArchiveContext): ArchivePolicy {
 		const trusted = ctx.isProjectTrusted();
 		const resolution = resolveArchivePolicy(ctx.cwd, this.agentDir, trusted);
@@ -201,6 +231,34 @@ export class SharedArchiveService {
 			return `${scope} archive settings updated.\n${this.status(ctx)}`;
 		}
 		if (leadingScope) throw new Error("Data scope follows the action; use --all explicitly for cross-project access.\n" + HELP);
+		if (action === "import-cancel") {
+			if (tokens.length) throw new Error(HELP);
+			this.cancelImports();
+			return "Archive imports and previews cancelled in this loaded service. Completed entries remain; settings and sources unchanged.";
+		}
+		if (action === "import-report") {
+			if (tokens.length < 1 || tokens.length > 2 || (tokens[1] !== undefined && !/^\d+$/.test(tokens[1]))) throw new Error(HELP);
+			return this.importReport(tokens[0]!, integer(tokens[1] === undefined ? 0 : Number(tokens[1]), 0, Number.MAX_SAFE_INTEGER), ctx);
+		}
+		if (action === "import-all") {
+			let sensitive = false, previewId: string | undefined;
+			const seen = new Set<string>();
+			while (tokens[0]?.startsWith("--")) {
+				const flag = tokens.shift()!;
+				if (seen.has(flag)) throw new Error(HELP);
+				seen.add(flag);
+				if (flag === "--confirm-sensitive") sensitive = true;
+				else if (flag === "--preview") {
+					previewId = tokens.shift();
+					if (!previewId || !/^[a-f0-9]{32}$/.test(previewId)) throw new Error("Bulk import needs a valid prior preview token and --confirm-sensitive.");
+				} else throw new Error(HELP);
+			}
+			if (sensitive || previewId !== undefined) {
+				if (!sensitive || !previewId) throw new Error(ARCHIVE_WARNING + "\nBulk import needs both --confirm-sensitive and --preview TOKEN from a prior preview.");
+				return this.importAll(previewId, tokens.length ? rest() : undefined, ctx);
+			}
+			return this.previewImports(tokens.length ? rest() : join(resolve(this.agentDir), "sessions"), ctx);
+		}
 		let all = false, confirm = false, sensitive = false, metadata = false, offset = 0;
 		const seen = new Set<string>();
 		const flags: Record<string, string[]> = { search: ["--all", "--offset"], read: ["--all", "--metadata"], session: ["--all"], stats: ["--all"], import: ["--confirm-sensitive"], "forget-session": ["--all", "--confirm"], prune: ["--all", "--confirm"] };
@@ -234,63 +292,132 @@ export class SharedArchiveService {
 		this.invalidate();
 		return `Deleted ${count} archive records. Entry-identity tombstones prevent re-import of those entries. Other copies, original Pi transcripts, backups and already-sent context remain; this is not forensic erasure.`;
 	}
+	private importOwner(ctx: ArchiveContext): ImportOwner {
+		return { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), epoch: this.epoch, generation: this.importGeneration, signal: ctx.signal };
+	}
+	private checkImport(ctx: ArchiveContext, owner: ImportOwner): void {
+		try { this.require(ctx, false, true); }
+		catch {
+			if (this.pendingPreview?.owner === owner) this.pendingPreview = undefined;
+			throw new ArchiveImportFailure("Archive import cancelled or live trust/capture permission expired.", true);
+		}
+		if (owner.signal?.aborted || ctx.cwd !== owner.cwd || ctx.sessionManager.getSessionId() !== owner.sessionId || this.epoch !== owner.epoch || this.importGeneration !== owner.generation) {
+			if (this.pendingPreview?.owner === owner) this.pendingPreview = undefined;
+			throw new ArchiveImportFailure("Archive import cancelled or project/session/permission generation expired.", true);
+		}
+	}
+	private async previewImports(path: string, ctx: ArchiveContext): Promise<string> {
+		this.require(ctx, false, true);
+		if (this.bulkRunning) throw new Error("An archive batch is still running. Use import-cancel and wait for its partial report before another preview.");
+		// Also prevents a concurrently scanning older preview from publishing late.
+		this.cancelImports();
+		const owner = this.importOwner(ctx);
+		const inventory = await discoverArchiveImports(path, () => this.checkImport(ctx, owner));
+		this.checkImport(ctx, owner);
+		const preview: ImportPreview = { id: randomBytes(16).toString("hex"), expires: Date.now() + ARCHIVE_IMPORT_LIMITS.previewMs, owner, inventory };
+		this.pendingPreview = preview;
+		const samples = inventory.candidates.slice(0, 10).map(file => ({ index: file.index, ...importPath(file.path) }));
+		const response = {
+			kind: "archive-import-preview", previewId: preview.id, ...importRoot(inventory.root), candidates: inventory.candidates.length,
+			skipped: inventory.skipped, expiresAt: new Date(preview.expires).toISOString(), samples, omitted: inventory.candidates.length - samples.length,
+			confirmCommand: `/jarvis-archive import-all --confirm-sensitive --preview ${preview.id}`,
+			notice: "Metadata-only preview; no transcript bodies or archive records read. Only these reviewed files will be imported. Sources are never modified. Concurrent filesystem checks are best effort, not a sandbox."
+		};
+		while (Buffer.byteLength(encode(response)) > 24_000 && samples.length) { samples.pop(); response.omitted++; }
+		return encode(response);
+	}
+	private async importAll(previewId: string, path: string | undefined, ctx: ArchiveContext): Promise<string> {
+		this.require(ctx, false, true);
+		const preview = this.pendingPreview;
+		if (!preview || preview.id !== previewId) throw new Error("Bulk import needs a matching prior preview token; run import-all to preview first.");
+		if (Date.now() >= preview.expires) { this.pendingPreview = undefined; throw new Error("Bulk import preview expired after 10 minutes; preview again."); }
+		this.checkImport(ctx, preview.owner);
+		if (this.bulkRunning) throw new Error("An archive batch is already running; wait for its report.");
+		// Consume synchronously, before any await or notification: no double use.
+		this.pendingPreview = undefined;
+		this.bulkRunning = true;
+		try {
+			if (path !== undefined) {
+				if (!isAbsolute(path)) throw new Error("Confirmation directory must be absolute and match the reviewed canonical root.");
+				let root: string;
+				try { root = await realpath(path); }
+				catch { this.checkImport(ctx, preview.owner); throw new Error("Confirmation directory is unreadable or changed; preview again."); }
+				this.checkImport(ctx, preview.owner);
+				if (root !== preview.inventory.root) throw new Error("Confirmation directory does not match the reviewed canonical root; preview again.");
+			}
+			this.notice(ctx, ARCHIVE_WARNING, "warning");
+			this.checkImport(ctx, preview.owner);
+			const report: ImportReport = {
+				id: randomBytes(16).toString("hex"), root: preview.inventory.root, owner: preview.owner, discoverySkipped: preview.inventory.skipped,
+				files: preview.inventory.candidates.map(file => ({ index: file.index, path: file.path, status: "unprocessed", saved: 0, duplicates: 0, deleted: 0 }))
+			};
+			this.latestImportReport = report;
+			this.notice(ctx, `Archive bulk import starting: ${report.files.length} reviewed files; report ID ${report.id}. /jarvis-archive import-report ${report.id} inspects progress; /jarvis-archive import-cancel stops remaining work. Completed entries remain; sources are not modified.`, "info");
+			for (const candidate of preview.inventory.candidates) {
+				try { this.checkImport(ctx, preview.owner); }
+				catch { report.stopped = "Archive import cancelled or live project/session/capture permission expired."; break; }
+				const result = await importArchiveTranscript(candidate.path, {
+					check: () => this.checkImport(ctx, preview.owner), candidate,
+					append: input => this.store.append(input), project: cwd => this.project(cwd), headerEntry
+				});
+				const file = report.files[candidate.index]!;
+				file.saved = result.saved; file.duplicates = result.duplicates; file.deleted = result.deleted;
+				file.status = result.complete ? "succeeded" : result.changed ? "changed" : "failed";
+				if (!result.complete) { file.line = result.line; file.reason = result.reason; }
+				if (result.stop) { report.stopped = result.reason; break; }
+				// Yield even for empty/invalid files; never run parallel source imports.
+				await new Promise<void>(resolve => setImmediate(resolve));
+				try { this.checkImport(ctx, preview.owner); }
+				catch { report.stopped = "Archive import cancelled or live project/session/capture permission expired."; break; }
+			}
+			if (!report.stopped) {
+				try { this.checkImport(ctx, preview.owner); }
+				catch { report.stopped = "Archive import cancelled or live project/session/capture permission expired."; }
+			}
+			return encode({ kind: "archive-import-summary", ...this.importSummary(report) });
+		} finally { this.bulkRunning = false; }
+	}
+	private importSummary(report: ImportReport) {
+		const counts = { saved: 0, duplicates: 0, deleted: 0, succeeded: 0, failed: 0, changed: 0, skipped: 0, unprocessed: 0 };
+		for (const file of report.files) {
+			counts.saved += file.saved; counts.duplicates += file.duplicates; counts.deleted += file.deleted;
+			counts[file.status]++;
+		}
+		return {
+			reportId: report.id, ...importRoot(report.root), ...counts, total: report.files.length, discoverySkipped: report.discoverySkipped,
+			stopped: Boolean(report.stopped), ...(report.stopped ? { stopReason: report.stopped } : {}),
+			notice: "Completed entries remain, including partial files. Per-file counts update when each file settles and cover acknowledged entries; a storage failure may leave an uncertain final commit. Duplicates and deleted identities were skipped. Source files were not modified. Report is ephemeral; use import-report REPORT_ID [offset] for bounded per-file results."
+		};
+	}
+	private importReport(id: string, offset: number, ctx: ArchiveContext): string {
+		this.require(ctx, false);
+		const report = this.latestImportReport;
+		if (!report || report.id !== id || ctx.cwd !== report.owner.cwd || ctx.sessionManager.getSessionId() !== report.owner.sessionId) throw new Error("No matching archive import report for this project/session in the loaded service.");
+		const records = report.files.slice(offset, offset + 50).map(file => ({
+			index: file.index, ...importPath(file.path), status: file.status, saved: file.saved, duplicates: file.duplicates, deleted: file.deleted,
+			...(file.line !== undefined ? { line: file.line } : {}), ...(file.reason ? { reason: file.reason } : {})
+		}));
+		const response = {
+			kind: "archive-import-report", ...this.importSummary(report), offset, records,
+			nextOffset: offset + records.length < report.files.length ? offset + records.length : null,
+			omitted: Math.max(0, report.files.length - offset - records.length)
+		};
+		while (Buffer.byteLength(encode(response)) > 24_000 && records.length) {
+			records.pop(); response.nextOffset = offset + records.length; response.omitted = report.files.length - offset - records.length;
+		}
+		if (Buffer.byteLength(encode(response)) > 24_000 || (!records.length && response.nextOffset === offset)) throw new Error("Archive import report exceeds the output budget.");
+		return encode(response);
+	}
 	private async importFile(path: string, ctx: ArchiveContext): Promise<string> {
 		this.require(ctx, false, true);
 		if (!isAbsolute(path) || !path.endsWith(".jsonl")) throw new Error("Import requires an explicit absolute .jsonl path, not a directory or automatic scan.");
-		const epoch = this.epoch, importGeneration = this.importGeneration;
-		const ownerSessionId = ctx.sessionManager.getSessionId();
-		const check = () => {
-			this.require(ctx, false, true);
-			if (this.epoch !== epoch || this.importGeneration !== importGeneration || ctx.sessionManager.getSessionId() !== ownerSessionId) throw new Error("Archive import permission/session expired.");
-		};
-		let saved = 0, duplicate = 0, deleted = 0, line = 0;
-		let header: { id: string; cwd: string } | undefined;
-		// O_NOFOLLOW prevents a final-component symlink; fstat forbids pipes/devices/hardlinks.
-		let file: Awaited<ReturnType<typeof open>> | undefined;
-		try {
-			file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
-			const stat = await file.stat();
-			if (!stat.isFile() || stat.nlink !== 1) throw new Error("Import source must be a regular single-link file.");
-			let pending: Buffer[] = [], size = 0;
-			const consume = (bytes: Buffer) => {
-				line++;
-				if (!bytes.length) return;
-				check();
-				let parsed: any;
-				try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw new Error("Invalid UTF-8/JSON transcript line (input content omitted)."); }
-				if (!header) {
-					if (parsed?.type !== "session" || parsed.version !== 3 || typeof parsed.id !== "string" || !parsed.id.length || parsed.id.length > 512 || typeof parsed.cwd !== "string" || !isAbsolute(parsed.cwd)) throw new Error("A v3 Pi session header with session ID and absolute cwd is required.");
-					header = { id: parsed.id, cwd: this.project(parsed.cwd) };
-					const outcome = this.store.append({ project: header.cwd, sessionId: header.id, lane: "import", entry: headerEntry(parsed) });
-					if (outcome === "saved") saved++; else if (outcome === "duplicate") duplicate++; else deleted++;
-					return;
-				}
-				const result = this.store.append({ project: header.cwd, sessionId: header.id, lane: "import", entry: parsed });
-				if (result === "saved") saved++; else if (result === "duplicate") duplicate++; else deleted++;
-			};
-			for await (const value of file.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 })) {
-				check();
-				const chunk = value as Buffer;
-				let start = 0;
-				for (let index = 0; index < chunk.length; index++) {
-					if (chunk[index] !== 10) continue;
-					const fragment = chunk.subarray(start, index); size += fragment.length;
-					if (size > 64 * 1024 * 1024) throw new Error("Transcript line exceeds the explicit 64 MiB safety ceiling; nothing was truncated.");
-					pending.push(fragment); consume(Buffer.concat(pending, size)); pending = []; size = 0; start = index + 1;
-				}
-				if (start < chunk.length) { const fragment = chunk.subarray(start); size += fragment.length; pending.push(fragment); }
-				if (size > 64 * 1024 * 1024) throw new Error("Transcript line exceeds the explicit 64 MiB safety ceiling; nothing was truncated.");
-			}
-			if (size) consume(Buffer.concat(pending, size));
-			if (!header) throw new Error("No session header found.");
-			return `Imported ${saved} entries; ${duplicate} duplicates and ${deleted} deleted identities skipped. Source project: ${encode(header.cwd)}; session: ${encode(header.id)}. Source file unchanged.`;
-		} catch (error) {
-			// Never expose parser/native errors with raw transcript snippets or secrets.
-			throw new Error(`Archive import stopped near line ${line + 1}: ${saved} saved, ${duplicate} duplicates, ${deleted} deleted identities skipped. Completed entries remain; source unchanged. Check source format, entry size, storage, cancellation and current permissions.`, { cause: error });
-		} finally {
-			try { await file?.close(); }
-			catch { throw new Error(`Archive source cleanup failed: ${saved} saved, ${duplicate} duplicates, ${deleted} deleted identities skipped. Source was not modified.`); }
-		}
+		const owner = this.importOwner(ctx);
+		const result = await importArchiveTranscript(path, {
+			check: () => this.checkImport(ctx, owner), append: input => this.store.append(input), project: cwd => this.project(cwd), headerEntry
+		});
+		if (result.cleanupFailed) throw new Error(`Archive source cleanup failed: ${result.saved} saved, ${result.duplicates} duplicates, ${result.deleted} deleted identities skipped. Source was not modified.`);
+		if (!result.complete) throw new Error(`Archive import stopped near line ${result.line + 1}: ${result.saved} saved, ${result.duplicates} duplicates, ${result.deleted} deleted identities skipped. Completed entries remain; source unchanged. Check source format, entry size, storage, cancellation and current permissions.`);
+		return `Imported ${result.saved} entries; ${result.duplicates} duplicates and ${result.deleted} deleted identities skipped. Source project: ${encode(result.project)}; session: ${encode(result.sessionId)}. Source file unchanged.`;
 	}
 	private require(ctx: ArchiveContext, model = false, capture = false): ArchivePolicy {
 		const policy = this.policy(ctx);

@@ -10,7 +10,7 @@
 
 `pi-jarvis` adds `/jarvis`: a polished overlay where you can ask for status, inspect the repo when you explicitly allow it, and send a quiet note or a confirmed redirect back to the main lane.
 
-**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects.
+**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects. **New in 1.9.0: bulk-import existing Pi sessions with a preview and explicit confirmation.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -18,11 +18,12 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.8.0</p>
+<p><strong>Current version:</strong> 1.9.0</p>
 
 <p>
   <strong>Shared persistent memory</strong> ·
   <strong>Optional indexed session archive</strong> ·
+  <strong>Confirmed bulk history import</strong> ·
   <strong>Persistent side session</strong> ·
   <strong>Live main-session awareness</strong> ·
   <strong>Opt-in local tools + native MCP</strong> ·
@@ -98,7 +99,7 @@ Both work across main Pi and Jarvis, independently of **Repo tools** and whether
 | Capability | What you get |
 |---|---|
 | **Shared memory** | Main Pi and Jarvis remember useful discussions across sessions; enabled by default, with global/project controls and a master off switch |
-| **Optional full-session archive** | Off by default; raw finalized entries, local indexed cross-session search, separate model permission and explicit historical import |
+| **Optional full-session archive** | Off by default; raw finalized entries, local indexed cross-session search, separate model permission, and preview-confirmed bulk history import |
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
 | **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
 | **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and configured native MCP stay off until you enable Repo tools |
@@ -296,7 +297,43 @@ Search/session pages return bounded excerpts of normalized indexing text with ID
 
 Global accessibility is within the **same active Pi agent directory**, not cloud sync or other users' machines. Project controls govern operations initiated here; existing records from a paused project remain accessible through explicit all-project queries from another allowed project. Disabling is not deletion. Returned model-tool results persist normally in Pi and can be captured again as part of a later journal entry.
 
-### Explicit import and retention
+### Import all existing Pi sessions
+
+With archive recording enabled, run:
+
+```text
+/jarvis-archive import-all
+```
+
+This **previews** `.jsonl` candidates recursively under the active Pi agent directory's `sessions` folder (normally `~/.pi/agent/sessions`). It shows the candidate file count before any transcript body is read or archived. Then paste the confirmation command supplied by the preview:
+
+```text
+/jarvis-archive import-all --confirm-sensitive --preview <preview-id>
+```
+
+For a different session directory, preview it explicitly:
+
+```text
+/jarvis-archive import-all /absolute/path/to/session-directory
+```
+
+The default covers Pi's standard main-session directory across projects. For older Jarvis side sessions, repeat the preview for `<active-agent-dir>/jarvis-sessions`; custom `--session-dir` locations also need an explicit directory preview.
+
+The confirmation token selects the **exact reviewed file list**, not a fresh scan. Files created afterward are not silently added. Existing identical entries are skipped, and each source file keeps its original project/session identity. Bad/legacy files are reported individually rather than hiding failures or abandoning the rest of the batch. Original transcripts are never rewritten.
+
+```text
+/jarvis-archive import-report <report-id>       # paged per-file results
+/jarvis-archive import-report <report-id> <nextOffset> # follow the returned offset
+/jarvis-archive import-cancel                   # stop pending/active imports
+```
+
+Previews expire after 10 minutes and are bound to the current project/session and permission generation. A new preview replaces the old one; confirmation consumes it once. The latest report is kept only in memory, not persisted or supplied to models. Policy/session changes, cancellation, or storage-wide failure stop remaining work; completed entries remain, with partial counts reported. The start notice supplies the report ID; progress counts update as each file settles, not on every entry. Counts cover acknowledged writes; a storage failure can leave an uncertain final commit. Re-preview explicitly to retry—imports are never automatically replayed.
+
+Discovery skips symlinks below the selected root, hardlinked/nonregular files, and unrelated extensions. Unreadable directories or discovery limits abort the preview rather than calling a partial scan “all”: at most 10,000 candidates, 50,000 visited entries, depth 64, and an 8 MiB manifest budget. Opened files and reviewed directory identities are checked for substitution; bulk reads are limited to the reviewed size, with mutation checks during streaming. These are defensive checks, **not an immutable filesystem snapshot or sandbox**. Pause active sessions for the most reliable historical import; changed files are reported and may need a fresh preview.
+
+Bulk import is a human command, not a model tool. It requires enabled recording in the initiating trusted project but does not require model access or Repo tools. Like single-file import, it can ingest sensitive unredacted history from multiple projects; no automatic startup scan or import occurs.
+
+### Single-file import and retention
 
 ```text
 /jarvis-archive import --confirm-sensitive /absolute/path/to/session.jsonl
@@ -305,7 +342,7 @@ Global accessibility is within the **same active Pi agent directory**, not cloud
 /jarvis-archive prune --all --confirm 2026-01-01T00:00:00.000Z
 ```
 
-Import is **human-only**, requires enabled recording and an explicit regular v3 JSONL file, and preserves the source header's project/session identity—even if different from the current project. No directory scan or silent historical import occurs; legacy session versions require a separately reviewed conversion first. Completed entries survive a partial/cancelled import, with counts reported; duplicate entries are skipped, differing payloads for an existing identity are rejected, and originals are never modified. Deletion defaults to this project; `--all` is explicit. Stable identity tombstones prevent re-import of deleted entries, not every semantic copy or other previously unarchived entry.
+Single-file import is **human-only**, requires enabled recording and an explicit regular v3 JSONL file, and preserves the source header's project/session identity—even if different from the current project. Directory discovery happens only through the explicit bulk preview above; no silent historical import occurs. Both import modes require v3 session files; legacy session versions require a separately reviewed conversion first. Completed entries survive a partial/cancelled import, with counts reported; duplicate entries are skipped, differing payloads for an existing identity are rejected, and originals are never modified. Deletion defaults to this project; `--all` is explicit. Stable identity tombstones prevent re-import of deleted entries, not every semantic copy or other previously unarchived entry.
 
 Storage is lazy SQLite under `<active-agent-dir>/extensions/pi-jarvis-archive/archive.sqlite`, defaulting to `~/.pi/agent/extensions/pi-jarvis-archive/archive.sqlite`. Owned directories/files use private permissions where supported, with defensive link/type checks and concurrent-writer transactions. There is no background watcher: observed settings changes are propagated between mounted lanes, while other processes recheck at operation boundaries. Deletion does not erase original Pi files, prior search-result copies, already-sent model context or backups, and does not guarantee reclaimed disk space or forensic erasure. For a complete reset, stop all Pi processes using the store and remove only its archive directory yourself; that also removes tombstones. Shared memory stays separate and unchanged. To stop both Jarvis persistence layers, use both `/jarvis-archive off` and `/jarvis-memory off`; neither disables Pi's original session transcripts.
 

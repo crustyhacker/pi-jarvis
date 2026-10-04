@@ -579,6 +579,68 @@ test("arbitrary config symlinks stay rejected beneath supported caller-root link
 	}
 });
 
+for (const when of ["before-open", "after-open"] as const) {
+	for (const malformed of [false, true]) {
+		test(`writer preflight ${when} replacement is reread under lock without losing controls${malformed ? " or repairing corruption" : ""}`, t => {
+			const f = fixture(t), path = f.path("global");
+			f.put("global", { archive: { enabled: true }, old: true });
+			const replacement = malformed ? '{"PRIVATE_CONFIG_CANARY": broken' : JSON.stringify({ archive: { enabled: false, modelAccess: false }, preserved: "other writer" });
+			const original = fs.openSync; let replaced = false, locks = 0;
+			const replace = () => {
+				fs.writeFileSync(`${path}.replacement`, replacement);
+				fs.renameSync(`${path}.replacement`, path);
+			};
+			withFsFault("openSync", ((...args: Parameters<typeof fs.openSync>) => {
+				if (String(args[0]).endsWith(".archive.lock")) locks++;
+				if (String(args[0]) !== path || replaced) return (original as Function)(...args);
+				replaced = true;
+				if (when === "before-open") replace();
+				const fd = (original as Function)(...args);
+				if (when === "after-open") replace();
+				return fd;
+			}) as typeof fs.openSync, () => {
+				if (malformed) assert.throws(() => f.save("global", { capture: false }), /^Error: Cannot update global archive settings\.$/);
+				else f.save("global", { capture: false });
+			});
+			assert.equal(replaced, true); assert.equal(locks, 1, "only the safe preflight read is retried under one lock");
+			if (malformed) assert.equal(fs.readFileSync(path, "utf8"), replacement);
+			else assert.deepEqual(f.read("global"), { archive: { enabled: false, modelAccess: false, capture: false }, preserved: "other writer" });
+			assert.deepEqual(fs.readdirSync(dirname(path)), ["pi-jarvis-archive.json"]);
+		});
+	}
+}
+
+test("policy readers still fail closed on an atomic replacement and never retry it", t => {
+	const f = fixture(t), path = f.path("global"); f.put("global", { archive: on });
+	const original = fs.openSync; let reads = 0;
+	withFsFault("openSync", ((...args: Parameters<typeof fs.openSync>) => {
+		const fd = (original as Function)(...args);
+		if (String(args[0]) === path && ++reads === 1) {
+			fs.writeFileSync(`${path}.replacement`, JSON.stringify({ archive: on }));
+			fs.renameSync(`${path}.replacement`, path);
+		}
+		return fd;
+	}) as typeof fs.openSync, () => {
+		const result = f.policy(); assert.deepEqual(result.policy, off); assert.equal(result.errors.length, 1);
+	});
+	assert.equal(reads, 1);
+});
+
+test("a replacement during the locked read fails closed without write replay or further read retry", t => {
+	const f = fixture(t), path = f.path("global"); f.put("global", { archive: on });
+	const replacement = JSON.stringify({ archive: { enabled: false }, untouched: true });
+	const original = fs.openSync; let reads = 0;
+	withFsFault("openSync", ((...args: Parameters<typeof fs.openSync>) => {
+		const fd = (original as Function)(...args);
+		if (String(args[0]) === path && ++reads === 2) {
+			fs.writeFileSync(`${path}.replacement`, replacement); fs.renameSync(`${path}.replacement`, path);
+		}
+		return fd;
+	}) as typeof fs.openSync, () => assert.throws(() => f.save("global", { capture: false }), /Cannot update global archive settings/));
+	assert.equal(reads, 2); assert.equal(fs.readFileSync(path, "utf8"), replacement);
+	assert.deepEqual(fs.readdirSync(dirname(path)), ["pi-jarvis-archive.json"]);
+});
+
 test("atomic replacement is same-directory, complete before rename, restrictive and leaves no artifacts", (t) => {
 	const f = fixture(t);
 	for (const scope of ["global", "project"] as const) {
@@ -680,6 +742,28 @@ test("lock cleanup never unlinks a replacement lock owned by another writer", (t
 	}) as typeof fs.renameSync, () => f.save("global", { enabled: true }));
 	assert.deepEqual(f.read("global"), { archive: { enabled: true } });
 	assert.equal(fs.readFileSync(lock, "utf8"), "new owner");
+});
+
+test("a lock unlinked during lstat is retried by exclusive acquisition without stealing a lock", t => {
+	const f = fixture(t), lock = `${f.path("global")}.archive.lock`;
+	f.put("global", { archive: { enabled: false }, preserved: true }); fs.writeFileSync(lock, "temporary owner");
+	const originalStat = fs.lstatSync, originalOpen = fs.openSync;
+	let disappeared = false, attempts = 0;
+	withFsFault("openSync", ((...args: Parameters<typeof fs.openSync>) => {
+		if (String(args[0]) === lock) attempts++;
+		return (originalOpen as Function)(...args);
+	}) as typeof fs.openSync, () => {
+		withFsFault("lstatSync", ((...args: Parameters<typeof fs.lstatSync>) => {
+			const stat = (originalStat as Function)(...args);
+			if (String(args[0]) === lock && !disappeared) {
+				disappeared = true; fs.unlinkSync(lock); stat.nlink = 0;
+			}
+			return stat;
+		}) as typeof fs.lstatSync, () => f.save("global", { capture: false }));
+	});
+	assert.equal(disappeared, true); assert.equal(attempts, 2);
+	assert.deepEqual(f.read("global"), { archive: { enabled: false, capture: false }, preserved: true });
+	assert.equal(fs.existsSync(lock), false);
 });
 
 test("lock acquisition I/O failure cannot overwrite settings", (t) => {

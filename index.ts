@@ -580,6 +580,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", async (_event, ctx) => {
 		const sessionRef = readJarvisSessionRef(ctx.sessionManager.getBranch());
 		if (sessionRef?.file !== state.sessionRef?.file) {
+			state.archive.cancelImports();
 			state.runtime?.flushArchive?.();
 			state.closeOverlay?.();
 			state.bootGeneration += 1;
@@ -1099,6 +1100,7 @@ async function executeJarvisSideCommand(
 		return runtime;
 	}
 
+	state.archive.cancelImports();
 	state.runtime?.flushArchive?.();
 	const generation = ++state.bootGeneration;
 	state.runtime?.dispose();

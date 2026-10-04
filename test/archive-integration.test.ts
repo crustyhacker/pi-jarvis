@@ -555,11 +555,19 @@ for (const reason of ["permission", "signal", "session", "boundary"] as const) {
 			const abort = new AbortController(), base = f.context(); base.sessionManager.getSessionId = () => sessionId;
 			const ctx = { ...base, signal: abort.signal }; await enable(f, ctx);
 			const path = transcript(f, "large-line", [entry("large", user("chunkfixture " + "x".repeat(256 * 1024)))]);
-			const original = f.service.policy.bind(f.service); let checks = 0;
+			const append = f.service.store.append.bind(f.service.store);
+			let headerCompleted = false, revoked = false;
+			t.mock.method(f.service.store, "append", (input: ArchiveInput) => {
+				const result = append(input);
+				if (input.entry.type === "archive_session_header") headerCompleted = true;
+				return result;
+			});
+			const original = f.service.policy.bind(f.service);
 			t.mock.method(f.service, "policy", (context: Parameters<typeof original>[0]) => {
-				// command require, import require, first chunk, header, then second
-				// chunk. Only the header has completed when check 5 is reached.
-				if (++checks === 5) {
+				// Revoke at the next guard after the header. Do not depend on the
+				// number of extra safety checks around open/stat/read/close awaits.
+				if (headerCompleted && !revoked) {
+					revoked = true;
 					if (reason === "permission") saveArchivePolicy(f.projectA, f.agentDir, "global", { enabled: false });
 					else if (reason === "signal") abort.abort();
 					else if (reason === "session") sessionId = "replacement-owner";
@@ -568,7 +576,7 @@ for (const reason of ["permission", "signal", "session", "boundary"] as const) {
 				return original(context);
 			});
 			await assert.rejects(f.service.command(`import --confirm-sensitive ${path}`, ctx), safePartial(1));
-			assert.equal(checks, 5); assert.equal(existsSync(f.service.store.path), true, "only header provenance completed before revocation");
+			assert.equal(revoked, true); assert.equal(existsSync(f.service.store.path), true, "only header provenance completed before revocation");
 			t.mock.restoreAll(); saveArchivePolicy(f.projectA, f.agentDir, "global", { enabled: true });
 			assert.equal(sessionRecords(f, "imported-session").length, 0);
 		});

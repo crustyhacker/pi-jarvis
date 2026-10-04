@@ -122,7 +122,8 @@ try {
 		const h = harness();
 		await h.event("session_start");
 		for (const initial of ["/memory off", "/jarvis-memory --project off", "/memory remember private | must not become a model prompt", "/jarvis-memory status",
-			"/archive off", "/jarvis-archive status", "/archive on", "/archive search private"]) {
+			"/archive off", "/jarvis-archive status", "/archive on", "/archive search private",
+			"/archive import-all", "/archive import-all --confirm-sensitive --preview stale", "/archive import-report stale", "/archive import-cancel"]) {
 			const command = h.command("jarvis", initial);
 			await tick();
 			assert.equal(h.runtimes.length, 0, "initial memory/archive commands must not boot a side runtime");
@@ -172,10 +173,15 @@ try {
 		const view = h.overlay.view;
 		await view.sendMessage("/tree bad-target");
 		assert.ok(h.notices.length === 0); // processing errors belong to overlay bridge
+		const archive = h.runtimes[0]!.options.archive;
+		const cancelImports = archive.cancelImports.bind(archive);
+		let importCancellations = 0;
+		archive.cancelImports = () => { importCancellations++; cancelImports(); };
 		const reset = view.sendMessage("/new");
 		const following = view.sendMessage("after reset");
 		await Promise.all([reset, following]);
 		assert.equal(h.runtimes.length, 2, "one /new must create exactly one runtime");
+		assert.ok(importCancellations > 0, "side /new cancels pending import previews/work before replacing its UI owner");
 		assert.deepEqual(h.runtimes[1]!.sent, ["after reset"]);
 		assert.equal(h.runtimes[0]!.disposed, true);
 		assert.equal(h.runtimes[1]!.options.projectTrusted, false);

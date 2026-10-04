@@ -15,6 +15,10 @@ const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 20;
 const sleep = new Int32Array(new SharedArrayBuffer(4));
 const noFollow = constants.O_NOFOLLOW ?? 0;
+// A cooperative writer can atomically replace a file during the unlocked
+// no-op preflight. Only writers retry that read once under the lock; policy
+// readers and races during the locked read still fail closed.
+class ArchiveSettingsReadRace extends Error {}
 
 /** Caller-spelled settings path, without I/O. Access canonicalizes only the chosen root. */
 export function archiveConfigPath(cwd: string, agentDir: string, scope: Scope): string {
@@ -151,6 +155,9 @@ function regularFile(path: string): ReturnType<typeof lstatSync> | undefined {
 		if (missing(error)) return undefined;
 		throw error;
 	}
+	// A pathname lookup can retain the old inode while a concurrent rename or
+	// lock release unlinks it, so even lstat may legitimately report nlink=0.
+	if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 0) throw new ArchiveSettingsReadRace("Archive settings path was unlinked during lookup.");
 	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("Unsafe archive settings file.");
 	return stat;
 }
@@ -165,9 +172,10 @@ function readConfig(path: string): Config | undefined {
 	let text: string;
 	try {
 		const opened = fstatSync(fd);
-		if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== stat.dev || opened.ino !== stat.ino) {
-			throw new Error("Archive settings changed while opening.");
+		if (opened.isFile() && (opened.nlink === 0 || (opened.nlink === 1 && (opened.dev !== stat.dev || opened.ino !== stat.ino)))) {
+			throw new ArchiveSettingsReadRace("Archive settings changed while opening.");
 		}
+		if (!opened.isFile() || opened.nlink !== 1) throw new Error("Unsafe archive settings file.");
 		if (opened.size > CONFIG_LIMIT_BYTES) throw new Error("Archive settings exceed the size limit.");
 		// A bounded buffer also handles growth after fstat: readFileSync could allocate
 		// without limit in that race. The extra byte detects growth without reading it all.
@@ -195,8 +203,14 @@ function changeConfig(cwd: string, agentDir: string, scope: Scope, change: (conf
 	try {
 		const path = settingsPath(cwd, agentDir, scope);
 		// Avoid creating directories/lock files for absent clears or already-applied changes.
-		const existing = readConfig(path);
-		if (!change({ ...existing })) return;
+		try {
+			const existing = readConfig(path);
+			if (!change({ ...existing })) return;
+		} catch (error) {
+			if (!(error instanceof ArchiveSettingsReadRace)) throw error;
+			// No write has occurred. Re-read/validate the current file under the
+			// existing cooperative lock rather than replaying an uncertain write.
+		}
 		directories(dirname(path), true);
 		withLock(path, () => {
 			const config = readConfig(path) ?? {};
@@ -218,7 +232,12 @@ function withLock(path: string, run: () => void): void {
 			break;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
-			regularFile(lock); // Reject symlink/nonregular locks instead of waiting on them.
+			try { regularFile(lock); } // Reject symlink/nonregular/hardlinked locks.
+			catch (lookupError) {
+				// The owner released it during lookup. Only a later exclusive open
+				// can acquire the path; keep the existing deadline and never unlink it.
+				if (!(lookupError instanceof ArchiveSettingsReadRace)) throw lookupError;
+			}
 			const remaining = deadline - performance.now();
 			if (remaining <= 0) throw new Error("Archive settings lock timed out.");
 			Atomics.wait(sleep, 0, 0, Math.min(LOCK_POLL_MS, remaining));

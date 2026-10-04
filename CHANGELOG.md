@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.9.0] - 2026-10-04
+
+### Added
+- Human-only bulk history import: `/jarvis-archive import-all` recursively previews existing Pi session files under the active agent directory, or an explicitly selected directory, before a separate sensitive-data confirmation.
+- One-use, expiring previews pin the reviewed file inventory; added files are not automatically included. Sequential imports preserve source project/session provenance, skip identical entries and tombstoned identities, and report malformed/legacy/conflicting files individually without modifying originals.
+- Bounded, paged `/jarvis-archive import-report` results and `/jarvis-archive import-cancel`, with partial-commit counts and execution-time trust, policy, cancellation and session checks. No new model tools or automatic historical ingestion.
+
+### Fixed
+- Cooperative archive settings writers now recover an atomic-replacement race in the unlocked no-op preflight by rereading once under the existing lock. Policy readers and locked-read races still fail closed; malformed settings are never repaired and uncertain writes are never replayed. A lock released during pathname lookup is treated as contention within the existing bounded exclusive-acquisition loop, never stolen or blindly removed.
+
+### Safety and documentation
+- Bounded metadata-only discovery skips nested symlinks, hardlinked/nonregular files; incomplete or over-limit scans fail rather than producing a misleading partial preview. Reviewed source/directory identities are rechecked and bulk streams are capped at reviewed sizes. Concurrent changes are reported; this is not a filesystem snapshot or sandbox.
+- Advertise bulk import alongside both independent memory features: default-on shared memory and the disabled-by-default full-session archive. Archive recording/model access remain explicit opt-ins; npm publication remains manual.
+
 ## [1.8.0] - 2026-10-04
 
 ### Added
