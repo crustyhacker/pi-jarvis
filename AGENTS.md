@@ -42,6 +42,7 @@
 - Use a bounded, unreferenced, lazily started timer; stop on dismissal, expiry, or disposal. No blinking, flashing, terminal-clearing commands, transcript entries, or persisted session changes.
 - Suppress with `PI_JARVIS_NO_ANIMATION=1`, non-empty `NO_COLOR`, or `TERM=dumb`. Use compact/no intro on small terminals and readable palettes for light themes and 256-color output.
 - `jarvis-branding.ts` owns the original wordmark. `npm run render:branding` regenerates README SVGs with local renderer fixtures, not live provider/session data. Label fixture previews honestly.
+- `npm run render:showcase` generates self-contained conceptual workspace/history/access SVGs; `npm run check:showcase` optionally uses an existing Playwright installation for loopback-only desktop/narrow/light/dark screenshots and text-bound checks. Keep browser dependencies out of the runtime package, distinguish conceptual diagrams from live UI, and preserve truthful defaults/privacy/close-versus-stop labels.
 
 ## Native MCP (1.6.0)
 - Use Pi's root-exported native factories, not private registry/runtime/transport internals. Jarvis owns separate configured-server connections; main-only extension registrations are not inherited.

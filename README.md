@@ -4,17 +4,17 @@
 
 <img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-logo.svg" alt="JARVIS — Pi / A second lane of thought. Cyan, violet, and pink ASCII chrome." width="720">
 
-## Give Pi a memory. Give yourself a second lane.
+## Remember more. Explore in parallel. Stay in control.
 
-**Remember decisions. Reuse preferences. Find the conversation that started it all.**
+**Persistent shared memory. A second lane of thought. A searchable past.**
 
-Main Pi and Jarvis share **persistent, searchable memory across sessions**—so useful preferences, corrections and project decisions can inform the next conversation. It works in main Pi **even if you never open `/jarvis`**, independently of Repo tools and bridge permissions.
+Your main Pi session stays on the job. **Jarvis gives you room to investigate, remember and act**—without turning every side question into a change of plan. Open a polished conversation overlay, choose its model and thinking level, and let assigned work continue when you close the window.
 
-Want the original history, not just useful facts? The separate, opt-in **session archive** adds indexed search, session browsing and preview-confirmed import of existing Pi chats. Optional **password encryption** protects its active database, index and SQLite journals.
+**The payoff compounds across sessions.** Main Pi and Jarvis share saved preferences, corrections and project decisions—even if you never open the overlay. Add the optional history archive to search recorded conversations and tool activity, import existing Pi chats after review, and optionally encrypt the active archive.
 
-And `/jarvis` still gives you a polished side-conversation overlay: a second opinion, live main-session context, opt-in repo inspection, and quiet notes or confirmed redirects.
+**Power is explicit:** opt-in local tools + native MCP, quiet notes to main, and redirects that require your confirmation. [See the whole toolkit](#at-a-glance) · [Try memory in a minute](#memory-in-60-seconds).
 
-**Local storage. User-controlled access. No background model calls or embeddings.** Shared memory is **on in trusted projects** and stored in **plaintext**; recalled facts can be sent to your active model. The separate archive and its encryption are **off by default**. [Understand the controls and privacy boundary](#two-complementary-memory-features).
+**Know the defaults:** shared memory is **on in trusted projects**, stored in **local plaintext**, and recalled facts can reach your active model. The separate archive, archive encryption and three tool/bridge grants start **off**. Memory retrieval needs no embeddings or background model jobs. [Privacy and controls](#two-complementary-memory-features).
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -22,13 +22,13 @@ And `/jarvis` still gives you a polished side-conversation overlay: a second opi
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.11.3</p>
+<p><strong>Current version:</strong> 1.11.4</p>
 
 ```bash
 pi install npm:pi-jarvis
 ```
 
-[Memory in 60 seconds](#memory-in-60-seconds) · [Search your history](#full-session-archive) · [Import existing sessions](#import-all-existing-pi-sessions) · [Archive encryption](#optional-archive-encryption) · [Open the overlay](#quick-start)
+[Install](#quick-start) · [Shared memory](#shared-memory) · [Search & import](#full-session-archive) · [Encryption](#optional-archive-encryption) · [TUI controls](#overlay-controls) · [Native MCP](#native-mcp)
 
 <p>
   <strong>Shared persistent memory</strong> ·
@@ -36,9 +36,11 @@ pi install npm:pi-jarvis
   <strong>Optional password encryption</strong> ·
   <strong>Confirmed bulk history import</strong> ·
   <strong>Persistent side session</strong> ·
-  <strong>Live main-session awareness</strong> ·
+  <strong>Live main-session context</strong> ·
+  <strong>Background task continuity</strong> ·
+  <strong>In-window model + thinking selection</strong> ·
   <strong>Opt-in local tools + native MCP</strong> ·
-  <strong>Safe redirect flow</strong>
+  <strong>Confirmed redirects</strong>
 </p>
 
 </div>
@@ -60,7 +62,9 @@ pi install npm:pi-jarvis
 
 ![Jarvis compact overlay, rendered with deterministic demo data](https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-overlay.svg)
 
-*Renderer preview with a custom dark palette and demo conversation—not a live provider session. Your Pi theme controls the normal overlay.*
+*Actual renderer, deterministic demo conversation, custom dark palette—not a live provider session. Theme-aware panels, bounded reading width, visible access states and a distinct multiline prompt keep the discussion front and center.*
+
+> **Not just a chat window.** Keep the main plan moving, ask a second model for a fresh perspective, carry useful facts into the next session, and find the original evidence when a summary is not enough.
 
 ---
 
@@ -131,53 +135,52 @@ Both work across main Pi and Jarvis, independently of **Repo tools** and whether
 
 ## At a glance
 
-| Capability | What you get |
+### One extension. A complete side-workflow toolkit.
+
+| Capability | Why it matters |
 |---|---|
-| **Shared persistent memory** | One store for main Pi + Jarvis: reusable preferences, decisions and bounded finalized conversations; on in trusted projects, with global/project controls and a master off switch |
-| **Optional full-session archive** | Off by default; raw finalized entries, local indexed cross-session search, separate model permission, and preview-confirmed bulk history import |
-| **Optional archive encryption** | Off by default; password-protected database/index/journals, explicit migration and cleanup, and selectable unlock lifetimes |
-| **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
-| **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
-| **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and configured native MCP stay off until you enable Repo tools |
-| **Safe main-session handoff** | `Note main` is quiet; `Redirect` is confirmation-gated |
-| **Independent model control** | Follow the main model or pin `/jarvis` to a separate model |
-| **Cleaner UX** | A one-time neon ASCII intro, then compact diagnostics, scrollback, multiline drafts, and independent activity/queue feedback |
+| **[Shared persistent memory](#shared-memory)** | Stop re-explaining useful preferences and project decisions. Main Pi and Jarvis use the same local store, across sessions—even without the overlay. |
+| **[Scoped recall and search](#memory-in-60-seconds)** | Relevant global/current-project facts can inform the next prompt. Explicitly search further when needed; inspect, edit or forget records yourself. |
+| **[Searchable original history](#full-session-archive)** | Go beyond a summary: find recorded conversations, exposed tool activity and provenance, then page through the original accepted entries. Separate recording and model-access opt-ins. |
+| **[Bulk history import](#import-all-existing-pi-sessions)** | Put existing Pi chats to work: preview the exact file set, confirm once, skip identical entries and inspect per-file results. No silent backfill or source rewriting. |
+| **[Optional archive encryption](#optional-archive-encryption)** | Protect the active archive database, index and SQLite journals. Choose session, process, fixed-duration, idle or OS-backed remembered unlock. |
+| **[A persistent second lane](#session-behavior)** | Investigate, brainstorm or get a second opinion in an isolated side conversation with restorable history. Side `/compact`, `/tree` and `/new` leave the main conversation alone. |
+| **[Main-session context](#how-it-fits-into-pi)** | See a deterministic main-session summary and bounded recent changes instead of manually pasting every update. |
+| **[Work that survives window close](#overlay-controls)** | Assigned work and enabled grants continue for the same live owner. Main status stays visible; `/jarvis stop` and `/jarvis access off` keep control close at hand. |
+| **[Your model, your thinking level](#model-and-thinking-resolution)** | Press **F2 / F3** inside Jarvis. Follow main or choose a physical model independently, with scoped settings and a preserved draft. |
+| **[Local tools + native MCP](#native-mcp)** | Enable Repo tools for `read`, `bash`, `edit`, `write` and configured native MCP capabilities. Connections and permission generations belong to the side session. |
+| **[Quiet notes or deliberate redirects](#redirect-flow)** | Send a follow-up without changing the main priority, or request a redirect with visible per-send approval. Separate switches, not an all-or-nothing bridge. |
+| **[A conversation-first TUI](#keyboard-and-drafts)** | Padded reading panels, restrained color, clear speaker headings, anchored scrollback, multiline drafts, theme-aware focus and compact diagnostics. |
+| **[Controls that stay separate](#permission-flow)** | Memory, archive capture, archive model access, encryption, Repo tools, Note main and Redirect each have their own operating boundaries. |
+
+### The everyday loop
+
+1. **Remember the decision.** Save a concise project fact or an intentional global preference.
+2. **Explore beside the main task.** Ask Jarvis for triage, a second opinion or an explicitly permitted repo inspection.
+3. **Find the evidence.** Search memory; opt into archive recording/import when you need original recorded history.
+4. **Bring back what matters.** Keep it as context, send a quiet note, or confirm a redirect. You choose the level of intervention.
+
+No perfect-recall promise, autonomous swarm claim or hidden permission escalation: curation depends on tool use, recall is bounded, and stored history is untrusted context.
 
 ---
 
 ## How it fits into Pi
 
-```mermaid
-flowchart LR
-    U[You] -->|primary work| M[Main Pi session]
-    U -->|open /jarvis| J[Jarvis overlay]
-    M -->|summary + recent delta| J
-    M <-->|independent memory controls| S[Shared local memory]
-    J <-->|independent memory controls| S
-    M -->|recording opt-in| A[Separate local history archive]
-    J -->|recording opt-in| A
-    A -. separately authorized model reads .-> M
-    A -. separately authorized model reads .-> J
-    J -->|Repo tools enabled| R[Local tools\nread • bash • edit • write]
-    J -->|Repo tools enabled| C[Configured native MCP\nside-owned connections]
-    J -. Note main .-> M
-    J -. Redirect after confirmation .-> M
-```
+<img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-workspace.svg" alt="Main Pi and Jarvis are separate conversation lanes. Main-session context flows to Jarvis; both share local plaintext memory, on in trusted projects. Recalled facts may reach the model/provider. Archive and tool permissions remain separate." width="640">
+
+*Architecture illustration—not a live session or a promise that every saved fact is recalled.*
 
 ### Operating model
 
-```mermaid
-flowchart TD
-    A["Main session keeps moving"] --> B["/jarvis opens in overlay"]
-    B --> C["Jarvis sees current main-session context"]
-    C --> D{"What do you need?"}
-    D -->|Status / summary / analysis| E["Jarvis handles the side task"]
-    D -->|Repo inspection| F["Enable Repo tools"]
-    D -->|Influence the main lane| G["Enable Note main or Redirect"]
-    G --> H{"Redirect?"}
-    H -->|Yes| I["Per-send confirmation"]
-    H -->|No| J["Quiet follow-up note"]
-```
+**One main plan, one side conversation, shared useful context.** Jarvis gets a summary and bounded delta from main Pi—not a duplicate of every hidden provider state. Its session, model choice, tools and pending input remain independently owned.
+
+| What you want | What to do |
+|---|---|
+| Status, analysis or a second opinion | Open `/jarvis` and ask; repo inspection is not required. |
+| Inspect or change project files / call native MCP | Explicitly enable **Repo tools** and trust the project and configured capabilities. |
+| Leave a useful observation for main | Enable **Note main** and ask Jarvis to send it. |
+| Change the main agent's priority | Enable **Redirect**, review the proposed message and approve that send. |
+| Close the window, not the task | Escape; use main Pi's Jarvis status and explicit stop/access-off commands as needed. |
 
 ---
 
@@ -342,6 +345,12 @@ Search/session pages return bounded excerpts of normalized indexing text with ID
 Global accessibility is within the **same active Pi agent directory**, not cloud sync or other users' machines. Project controls govern operations initiated here; existing records from a paused project remain accessible through explicit all-project queries from another allowed project. Disabling is not deletion. Returned model-tool results persist normally in Pi and can be captured again as part of a later journal entry.
 
 ### Import all existing Pi sessions
+
+**Turn a pile of old chats into history you can query.** Preview first, confirm the reviewed set, then inspect what imported—and what did not.
+
+<img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-history.svg" alt="Optional archive workflow: preview the selected history files, confirm the exact reviewed set, import with duplicate skipping and per-file reporting, then search recorded entries. Archive and model access are off by default. Content defaults to unredacted plaintext and may hold secrets; model reads can reach the provider even with encryption. Encryption protects only the active archive." width="640">
+
+*Workflow illustration, not automatic setup. Recording must be explicitly enabled; read [safe encryption setup](#safe-initial-setup) before capturing/importing if avoiding new plaintext archive copies.*
 
 With archive recording enabled, run:
 
@@ -553,17 +562,9 @@ The combined live-record/tombstone budget is 100,000 identities: new identity sa
 
 ## Model and thinking resolution
 
-```mermaid
-flowchart TD
-    A[Project config\n.pi/jarvis.json] -->|if present| B{valid?}
-    B -->|yes| P[Use project overrides]
-    B -->|no or missing| C[Global config\n&lt;agentDir&gt;/extensions/pi-jarvis.json]
-    C -->|if present| D{valid?}
-    D -->|yes| G[Use global overrides]
-    D -->|no or missing| E[Built-in defaults]
-    E --> F[Model default: follow-main]
-    E --> H[Thinking default: auto]
-```
+**A different perspective, without changing main Pi.** Press **F2** for the model or **F3** for thinking inside Jarvis; the pickers keep your draft in place. Busy changes are refused rather than silently interrupting a turn. Use the commands for explicit project/global choices.
+
+**Project override → Global default → Built-in behavior** (`follow-main` model, `auto` thinking). Malformed or unreadable shared configuration is never automatically repaired or overwritten; repair it deliberately while preserving privacy controls.
 
 ### Resolution order
 
@@ -639,40 +640,22 @@ Scrollback follows new output until you scroll up. To bound rendering work, the 
 
 ### Permission flow
 
-```mermaid
-flowchart TD
-    A[Overlay opens] --> B[Repo tools off]
-    A --> C[Note main off]
-    A --> D[Redirect off]
+<img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-access.svg" alt="A fresh owner starts with Repo tools, Note main and Redirect off. Each is a separate opt-in; Redirect requires visible per-send confirmation. Ordinary close preserves same-owner work and grants. Explicit stop and access-off remain available." width="640">
 
-    B -->|enable| E[Jarvis may use local tools]
-    E --> H[Configured native MCP]
-
-    C -->|enable| I[Jarvis may send a quiet note to main]
-    D -->|enable| J[Jarvis may request redirect sends]
-    J --> K[Every redirect still requires confirmation]
-
-    L[Incompatible /jarvis model] --> M[Note main disabled]
-    L --> N[Redirect disabled]
-```
+*Permission/lifecycle illustration. Memory and archive controls are independent. Closing is not revocation; an incompatible model can still disable bridge controls.*
 
 ---
 
 ## Redirect flow
 
-```mermaid
-sequenceDiagram
-    participant You
-    participant Jarvis
-    participant Main as Main session
+**Discuss freely. Redirect deliberately.**
 
-    You->>Jarvis: Enable Redirect
-    You->>Jarvis: "Tell the main session to stop and inspect overlay teardown"
-    Jarvis->>You: Confirmation request
-    You-->>Jarvis: Approve
-    Jarvis-->>Main: Redirect instruction
-    Main-->>You: Continues on new priority
-```
+1. Enable **Redirect** separately from Repo tools and Note main.
+2. Ask Jarvis to propose the message for main Pi.
+3. Review the visible confirmation, including every page of a long message.
+4. Approve that send—or cancel and keep the main plan unchanged.
+
+A closed overlay cannot approve a redirect. Closing cancels pending reviews; background requests needing new confirmation are refused, not silently accepted or replayed on reopen.
 
 ---
 
@@ -739,7 +722,7 @@ Pi already provides MCP; Jarvis 1.6.0 opts its separate SDK session into Pi's na
 - **Repo tools is the opt-in for both local tools and native MCP.** While initially off, Jarvis does not start MCP connections or expand MCP configuration credentials/commands.
 - Enabling it starts **separate, side-owned connections** to configured servers from the active agent directory's `mcp.json` and, only when trusted, the project's `.pi/mcp.json`. Main-session connections are neither reused nor disconnected. Servers registered only by main-session extensions are not automatically inherited.
 - Native direct, deferred/tool-search, codemode, and resource tools keep Pi's configured exposure. Jarvis rechecks live permission and session lifetime for calls, including nested calls and previously prepared tool references. Server annotations are hints, not permission grants.
-- Disabling Repo tools, closing the overlay, or disposing the side runtime invalidates that permission generation, hides its tools, aborts owned call signals, and requests native disconnection. Re-enabling creates a fresh generation rather than reviving stale calls.
+- Disabling Repo tools, explicit access-off, observed trust denial or retiring the side owner invalidates that permission generation, hides its tools, aborts owned call signals, and requests native disconnection. **Ordinary overlay close preserves enabled access and assigned work** for the same live owner. Re-enabling after revocation creates a fresh generation rather than reviving stale calls.
 - **Cancellation is best effort, not rollback or a sandbox.** Pi may allow already-started connection handshakes, authentication refresh/cleanup, or remote operations to finish or time out after revocation. A pending native handshake may outlive the shutdown request until Pi finishes or times it out.
 - Manage servers and OAuth sign-in in **main Pi** (`/mcp` or `pi mcp ...`), not through a side-session administration command. Jarvis does not register a side `/mcp` manager. Codemode's classifier/image-model helpers are disabled in the side session.
 
@@ -794,6 +777,20 @@ npm run render:branding
 ```
 
 This uses deterministic fixtures, without opening a terminal, calling a provider, or connecting to MCP servers.
+
+Regenerate the self-contained feature/workflow SVGs:
+
+```bash
+npm run render:showcase
+```
+
+Check them with an existing Playwright installation (no browser dependency is bundled with Jarvis):
+
+```bash
+npm run check:showcase -- --playwright-module /absolute/path/to/playwright --browser /path/to/chrome --out-dir /tmp/jarvis-showcase-qa
+```
+
+The module/browser flags are optional when Playwright and its cached browser are already available. The check uses a fresh browser context and a loopback-only documentation server, captures desktop/390px/320px light/dark wrappers, and checks SVG text bounds, overlaps, image loading and horizontal overflow. Results and screenshots go to the output directory; without an explicit directory, a temporary one is created. These are **local README-style checks**, not a claim to reproduce GitHub/npm's complete production renderer or a live TUI. The ordinary test suite also checks deterministic generation, escaped/self-contained SVG markup and documented feature boundaries without needing a browser.
 
 ### Release automation
 

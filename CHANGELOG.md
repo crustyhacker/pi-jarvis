@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.11.4] - 2026-10-05
+
+### Documentation and showcase
+- Expand the GitHub/npm landing page into a benefit-led showcase of shared memory, searchable history/import, optional archive encryption, independent side sessions, background work, model/thinking controls, local/native MCP tools and confirmed main-session handoffs.
+- Add three deterministic, self-contained SVG workflow diagrams with descriptive text alternatives, plus a reproducible Playwright visual check for desktop/narrow layouts and SVG text bounds. Runtime packages do not gain a browser dependency.
+- Correct stale documentation that associated ordinary overlay close with grant revocation; fresh-owner defaults and explicit stop/access-off remain distinct.
+- Documentation, artwork and package-discoverability only: runtime behavior, controls, stored data and installed user settings are unchanged. npm publication remains manual.
+
 ## [1.11.3] - 2026-10-05
 
 ### Presentation refinement
