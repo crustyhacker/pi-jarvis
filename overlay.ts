@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type KeybindingsManager, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { JarvisDraftEditor } from "./draft-editor.js";
-import { renderJarvisHeader, renderJarvisActivity, renderJarvisControls } from "./overlay-layout.js";
+import { renderJarvisHeader, renderJarvisActivity, renderJarvisControls, jarvisSurface } from "./overlay-layout.js";
 import { JarvisChoicePicker, type JarvisPickerChoice } from "./model-picker.js";
 import { TranscriptViewport, type TranscriptLineAnchor } from "./transcript-viewport.js";
 import { JarvisIntroAnimation, renderJarvisIntro } from "./jarvis-branding.js";
@@ -38,6 +38,13 @@ export interface JarvisOverlayView {
 	toggleSteerToMain(): void;
 	getDisplayEntries(): JarvisDisplayEntry[];
 	sendMessage(text: string): Promise<void>;
+}
+
+interface TranscriptEntryLayout {
+	lines: string[];
+	/** UTF-16 offsets in sanitized source; -1 is the separate role heading. */
+	offsets: number[];
+	continuations: boolean[];
 }
 
 type NotificationType = "info" | "warning" | "error";
@@ -262,8 +269,12 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	private thinkingAnimationTick = 0;
 	private thinkingAnimationTimer?: NodeJS.Timeout;
 	private transcriptCacheWidth = -1;
-	private transcriptCache: Array<{ kind: JarvisDisplayEntry["kind"]; text: string; lines: string[] }> = [];
+	private transcriptCache: Array<{ kind: JarvisDisplayEntry["kind"]; text: string; layout: TranscriptEntryLayout }> = [];
 	private transcriptLines: string[] = [];
+	/** Layout row identities let even blank spacing/repeated role headings anchor. */
+	private transcriptViewportRows: string[] = [];
+	private transcriptSourceIds = new Map<string, number>();
+	private transcriptNextSourceId = 0;
 	private transcriptContinuationLabels: Array<string | undefined> = [];
 	private transcriptAnchors: Array<TranscriptLineAnchor | undefined> = [];
 
@@ -505,11 +516,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		// multiline draft. The editor's public cursor crop retains all draft text.
 		const inputBudget = Math.max(1, Math.min(5, maxBodyLines >= 14 ? maxBodyLines - 14 : Math.floor(maxBodyLines / 4)));
 		const inputLines = this.renderInputLines(innerWidth, inputBudget);
-		const footerLines = maxBodyLines >= 10 ? [
-			`${this.keyLabel("tui.input.submit")} send • ${this.keyLabel("tui.input.newLine")} newline • esc close`,
-			`${this.keyLabel("tui.editor.pageUp")}/${this.keyLabel("tui.editor.pageDown")} • alt+↑/↓ history • ctrl+end live`,
-			`${this.keyLabel("tui.input.tab")} controls • ctrl+c stop • ${snapshot.notifications.length ? "ctrl+l notice" : "ctrl+o details"}`,
-		] : maxBodyLines >= 3 ? ["F2 Model • F3 Thinking • esc close", "PgUp/PgDn scroll • ctrl+c stop"] : [];
+		const footerLines = this.renderHints(innerWidth, maxBodyLines, snapshot.notifications.length > 0);
 		const panel = maxBodyLines >= 9 && innerWidth >= 12;
 		const promptSection = [
 			...(maxBodyLines >= 7 ? [this.promptBorder("Prompt · Message", innerWidth, true)] : []),
@@ -518,12 +525,19 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			...footerLines.map((line) => truncateToWidth(this.theme.fg("dim", line), innerWidth, "", true)),
 		];
 		let remaining = Math.max(0, maxBodyLines - promptSection.length);
+		const active = Boolean(this.view.getIsProcessing?.() || this.view.isStreaming());
+		this.syncThinkingAnimation(active);
+		const activity = renderJarvisActivity(this.theme, snapshot, this.view, innerWidth);
+		const icon = active ? this.theme.fg("accent", ["◈", "◆", "◇", "✦"][this.thinkingAnimationTick % 4] + " ") : "";
 		const header = renderJarvisHeader(this.theme, this.view, innerWidth, {
 			expanded: this.expandedDetails, focusTarget: this.focusTarget, focused: this.focused,
+			activity: this.expandedDetails || stripTerminalSequences(activity) !== "Ready" ? icon + activity : undefined,
+			infoNotice: !this.expandedDetails && snapshot.notifications.some(item => item.type === "info"),
 		});
 		// Keep a transcript row on normal terminals; keep the focused access
 		// control available even on short ones. Details never consume the editor.
-		const headerBudget = Math.min(header.length, Math.max(0, remaining - (remaining >= 5 ? 3 : 0)));
+		const importantNotice = snapshot.notifications.some(item => item.type !== "info");
+		const headerBudget = Math.min(header.length, Math.max(0, remaining - (remaining >= 7 ? 6 : remaining >= 5 ? 3 : 0) - (importantNotice ? 1 : 0)));
 		const top: string[] = headerBudget >= header.length ? header : headerBudget >= 2
 			? [...header.slice(0, headerBudget - 1), header[header.length - 1]!]
 			: headerBudget === 1 ? [this.focusTarget === "input" ? header[0]! : header[header.length - 1]!] : [];
@@ -535,18 +549,12 @@ export class JarvisOverlayComponent implements Component, Focusable {
 				remaining--;
 			}
 		}
-		const active = Boolean(this.view.getIsProcessing?.() || this.view.isStreaming());
-		this.syncThinkingAnimation(active && remaining > 0);
-		if (remaining > 0) {
-			const icon = active ? ["◈", "◆", "◇", "✦"][this.thinkingAnimationTick % 4] + " " : "";
-			top.push(truncateToWidth(this.theme.fg("accent", icon) + renderJarvisActivity(this.theme, snapshot, this.view, innerWidth), innerWidth, "", true));
-			remaining -= 1;
-		}
-		if (remaining > 2 && snapshot.notifications.length) {
-			const notices = this.notificationLines(snapshot.notifications, innerWidth);
-			const count = Math.min(this.expandedDetails ? 4 : 1, notices.length, remaining - 2);
+		const visibleNotifications = this.expandedDetails ? snapshot.notifications : snapshot.notifications.filter(item => item.type !== "info");
+		if (remaining > 0 && visibleNotifications.length) {
+			const notices = this.notificationLines(visibleNotifications, innerWidth);
+			const count = Math.min(this.expandedDetails ? 4 : 1, notices.length, importantNotice ? Math.max(1, remaining - 2) : Math.max(0, remaining - 2));
 			const visibleNotices = notices.slice(0, count);
-			if (count < notices.length) visibleNotices[count - 1] = truncateToWidth(visibleNotices[count - 1]!, innerWidth - 1, "", true) + this.theme.fg("dim", "…");
+			if (count > 0 && count < notices.length) visibleNotices[count - 1] = truncateToWidth(visibleNotices[count - 1]!, innerWidth - 1, "", true) + this.theme.fg("dim", "…");
 			top.push(...visibleNotices);
 			remaining -= count;
 		}
@@ -558,11 +566,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			if (this.transcriptCacheWidth !== innerWidth || this.viewport.getStatus().totalLines === 0) this.renderTranscript(innerWidth, Math.max(0, remaining - 1), snapshot);
 			top.push(...renderJarvisIntro(this.theme, innerWidth, remaining, introFrame));
 		} else if (remaining > 0) {
-			const transcript = this.renderTranscript(innerWidth, Math.max(0, remaining - 1), snapshot);
-			const position = this.viewport.getStatus();
-			const historyFocus = this.focused && this.focusTarget === "history" ? "[History ↑/↓] · " : "";
-			const label = historyFocus + (position.following ? "Conversation · live" : `History · ${position.hiddenBelow} lines below · ctrl+end live`);
-			top.push(this.sectionDivider(label, innerWidth), ...transcript);
+			top.push(...this.renderConversation(innerWidth, remaining, snapshot));
 		}
 		return [this.borderTop(innerWidth), ...[...top, ...promptSection].slice(0, maxBodyLines).map((line) => this.row(line, innerWidth)), this.borderBottom(innerWidth)];
 	}
@@ -665,6 +669,59 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		void stop();
 	}
 
+	private renderHints(width: number, budget: number, hasNotice: boolean): string[] {
+		if (budget < 3) return [];
+		const submit = this.keyLabel("tui.input.submit");
+		const newline = this.keyLabel("tui.input.newLine");
+		const core = `${submit} send • ${newline} newline • esc close • ctrl+c stop`;
+		const compact = `${submit} send • ${newline === "shift+enter" ? "⇧enter" : newline} ↵ • esc close • ctrl+c stop`;
+		const first = visibleWidth(core) <= width ? core : visibleWidth(compact) <= width ? compact : "esc close • ctrl+c stop";
+		const tab = this.keyLabel("tui.input.tab");
+		const context = this.expandedDetails ? `alt+↑/↓ history • ctrl+end live • ${tab} controls`
+			: ["tools", "followUp", "steer"].includes(this.focusTarget) ? `${submit}/space toggle • ${tab} next`
+			: ["model", "thinking"].includes(this.focusTarget) ? `${submit}/space choose • ${tab} next`
+			: this.focusTarget === "history" ? `↑/↓ scroll • alt+↑/↓ history • ${tab} next`
+			: `${tab} controls`;
+		return [first, `${context} • ctrl+o details${hasNotice ? " • ctrl+l dismiss" : ""}`];
+	}
+
+	private renderConversation(width: number, budget: number, snapshot: JarvisOverlaySnapshot): string[] {
+		const framed = width >= 16 && budget >= 5;
+		const panelWidth = framed ? width - 2 : width;
+		const padding = framed ? width >= 40 ? 2 : 1 : 0;
+		const readingWidth = Math.max(1, Math.min(96, panelWidth - padding * 2));
+		const inset = padding + Math.floor(Math.max(0, panelWidth - padding * 2 - readingWidth) / 2);
+		// Vertical air is optional: never buy it with the last three reading rows.
+		const air = framed && budget >= 9 ? 1 : 0;
+		const transcript = this.renderTranscript(readingWidth, Math.max(0, budget - (framed ? 2 : 1) - air * 2), snapshot);
+		const position = this.viewport.getStatus();
+		const scroll = `${this.keyLabel("tui.editor.pageUp")}/${this.keyLabel("tui.editor.pageDown")} scroll`;
+		const state = position.following ? `live · ${scroll}` : `History · ${position.hiddenBelow} below · ctrl+end live`;
+		const continued = this.transcriptContinuationLabels[position.startLine];
+		// A clipped message's speaker precedes optional scroll chrome, so even
+		// narrow titles retain identity without replacing or clipping body text.
+		const role = continued ? `${continued} · ` : "";
+		const fullTitle = `${role}Conversation · ${state}`;
+		const shortScroll = `${this.keyLabel("tui.editor.pageUp").replace(/^pageUp$/, "PgUp")}/${this.keyLabel("tui.editor.pageDown").replace(/^pageDown$/, "PgDn")}`;
+		const compactTitle = `${role}${position.following ? `Conversation · live · ${shortScroll}` : state}`;
+		const titleWidth = framed ? width - 4 : width - 2;
+		const title = visibleWidth(fullTitle) <= titleWidth ? fullTitle : visibleWidth(compactTitle) <= titleWidth ? compactTitle
+			: `${role}Conversation${role ? "" : position.following ? " · live" : " · History"}`;
+		const border = (top: boolean, label = "") => {
+			const text = label ? ` ${truncateToWidth(label, Math.max(0, width - 4), "", true)} ` : "";
+			return this.theme.fg("borderMuted", `${top ? "╭" : "╰"}${text}${"─".repeat(Math.max(0, width - visibleWidth(text) - 2))}${top ? "╮" : "╯"}`);
+		};
+		const row = (line: string) => {
+			const content = " ".repeat(inset) + line;
+			const padded = content + " ".repeat(Math.max(0, panelWidth - visibleWidth(content)));
+			const body = jarvisSurface(this.theme, padded, "conversation");
+			return framed ? this.theme.fg("borderMuted", "│") + body + this.theme.fg("borderMuted", "│") : body;
+		};
+		return [framed ? border(true, title) : this.sectionDivider(title, width),
+			...(air && transcript.length ? [row("")] : []), ...transcript.map(row),
+			...(air && transcript.length ? [row("")] : []), ...(framed ? [border(false)] : [])];
+	}
+
 	private promptBorder(label: string, width: number, top: boolean): string {
 		const text = label ? ` ${label} ` : "";
 		return truncateToWidth(this.theme.fg("borderAccent", (top ? "┌" : "└") + text + "─".repeat(Math.max(0, width - visibleWidth(text) - 1))), width, "", true);
@@ -749,54 +806,68 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			if (this.transcriptCacheWidth !== innerWidth) this.transcriptCache = [];
 			this.transcriptCacheWidth = innerWidth;
 			this.transcriptLines = [];
+			this.transcriptViewportRows = [];
 			this.transcriptContinuationLabels = [];
 			this.transcriptAnchors = [];
 			const cache: typeof this.transcriptCache = [];
-			const labels = { user: "User:", assistant: "Jarvis:", tool: "Tool:", status: "Note:", system: "" };
+			const sourceIds = new Map<string, number>();
+			const labels = { user: "User:", assistant: "Jarvis:", tool: "Tool:", status: "Note:", system: "System:" };
 			for (let i = 0; i < entries.length; i++) {
 				const entry = entries[i]!;
 				const previous = this.transcriptCache[i];
-				const block = previous?.kind === entry.kind && previous.text === entry.text ? previous.lines : this.renderEntry(entry, innerWidth);
-				cache.push({ ...entry, lines: block });
-				if (i > 0 && entries[i - 1]!.kind !== entry.kind) { this.transcriptLines.push(""); this.transcriptContinuationLabels.push(undefined); this.transcriptAnchors.push(undefined); }
+				const layout = previous?.kind === entry.kind && previous.text === entry.text ? previous.layout : this.renderEntry(entry, innerWidth);
+				cache.push({ ...entry, layout });
 				const safeText = sanitizeOverlayDisplayText(entry.text);
 				const key = `${entry.kind}:${safeText.slice(0, 500)}`;
-				let offset = 0;
-				for (let j = 0; j < block.length; j++) {
-					this.transcriptLines.push(block[j]!);
-					this.transcriptContinuationLabels.push(j > 0 ? labels[entry.kind] || undefined : undefined);
-					const label = labels[entry.kind];
-					const text = stripTerminalSequences(block[j]!).slice(label ? label.length + (j === 0 ? 1 : 2) : 0);
-					const found = text ? safeText.indexOf(text, offset) : offset;
-					if (found >= 0) offset = found;
-					this.transcriptAnchors.push({ key, offset });
-					offset += text.length;
+				const sourceId = sourceIds.get(key) ?? this.transcriptSourceIds.get(key) ?? ++this.transcriptNextSourceId;
+				sourceIds.set(key, sourceId);
+				if (i > 0) {
+					this.transcriptLines.push(""); this.transcriptViewportRows.push(`${sourceId}/-2`);
+					this.transcriptContinuationLabels.push(undefined); this.transcriptAnchors.push({ key, offset: -2 });
+				}
+				for (let j = 0; j < layout.lines.length; j++) {
+					this.transcriptLines.push(layout.lines[j]!);
+					this.transcriptViewportRows.push(`${sourceId}/${layout.offsets[j]}`);
+					this.transcriptContinuationLabels.push(layout.continuations[j] ? labels[entry.kind] : undefined);
+					this.transcriptAnchors.push({ key, offset: layout.offsets[j]! });
 				}
 			}
 			this.transcriptCache = cache;
+			this.transcriptSourceIds = sourceIds;
 		}
-		const visible = this.viewport.render(this.transcriptLines, budget, innerWidth, this.transcriptAnchors);
-		const start = this.viewport.getStatus().startLine;
-		const label = this.transcriptContinuationLabels[start];
-		if (label && visible.length) visible[0] = truncateToWidth(`${this.theme.fg("muted", label)} ${visible[0]!.trimStart()}`, innerWidth, "", true);
-		return visible;
+		// Give the existing viewport layout identities instead of decoration.
+		// Otherwise identical headings and empty spacer rows conceal rollover,
+		// preventing its source-character anchors from being consulted. IDs never
+		// enter the transcript or terminal; the selected range paints real rows.
+		this.viewport.render(this.transcriptViewportRows, budget, innerWidth, this.transcriptAnchors);
+		const position = this.viewport.getStatus();
+		return this.transcriptLines.slice(position.startLine, position.endLine);
 	}
 
-	private renderEntry(entry: JarvisDisplayEntry, innerWidth: number): string[] {
+	private renderEntry(entry: JarvisDisplayEntry, innerWidth: number): TranscriptEntryLayout {
 		const safeText = sanitizeOverlayDisplayText(entry.text);
-		switch (entry.kind) {
-			case "user":
-				return this.wrapWithPrefix(this.theme.fg("accent", "User:"), safeText, innerWidth);
-			case "assistant":
-				return this.wrapWithPrefix(this.theme.fg("success", "Jarvis:"), safeText, innerWidth);
-			case "tool":
-				return this.wrapWithPrefix(this.theme.fg("warning", "Tool:"), safeText, innerWidth);
-			case "status":
-				return this.wrapWithPrefix(this.theme.fg("muted", "Note:"), safeText, innerWidth);
-			case "system":
-			default:
-				return this.wrapBlock(this.theme.fg("muted", safeText), innerWidth);
+		const labels = { user: "User:", assistant: "Jarvis:", tool: "Tool:", status: "Note:", system: "System:" };
+		const colors = { user: "accent", assistant: "success", tool: "warning", status: "muted", system: "muted" } as const;
+		const layout: TranscriptEntryLayout = {
+			lines: [truncateToWidth(this.theme.bold(this.theme.fg(colors[entry.kind], labels[entry.kind])), innerWidth, "", true)],
+			offsets: [-1], continuations: [false],
+		};
+		let paragraphOffset = 0;
+		for (const paragraph of safeText.split("\n")) {
+			let consumed = 0;
+			for (const line of wrapTextWithAnsi(paragraph, Math.max(1, innerWidth))) {
+				// Track source before styling/padding: headings and frame insets are
+				// not source characters. Public wrapping may skip boundary whitespace.
+				const found = line ? paragraph.indexOf(line, consumed) : consumed;
+				const offset = found >= 0 ? found : consumed;
+				layout.lines.push(truncateToWidth(this.theme.fg(entry.kind === "system" || entry.kind === "status" ? "muted" : "text", line), innerWidth, "", true));
+				layout.offsets.push(paragraphOffset + offset);
+				layout.continuations.push(true);
+				consumed = offset + line.length;
+			}
+			paragraphOffset += paragraph.length + 1;
 		}
+		return layout;
 	}
 
 	private renderInputLines(innerWidth: number, maxLines: number): string[] {
@@ -806,16 +877,20 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		return this.input.render(inputWidth, maxLines).map((line, index) => {
 			const content = truncateToWidth(this.theme.fg("accent", index === 0 ? prompt : continuation) + this.theme.fg("text", line), innerWidth, "", true);
 			const padded = content + " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-			return typeof this.theme.bg === "function" ? this.theme.bg("userMessageBg", padded) : padded;
+			return jarvisSurface(this.theme, padded, "prompt");
 		});
 	}
 
 	private notificationLines(items: readonly NotificationItem[], innerWidth: number): string[] {
-		const item = items.at(-1);
+		const item = [...items].reverse().find(item => item.type !== "info") ?? items.at(-1);
 		if (!item) return [];
-		const color = item.type === "error" ? "error" : item.type === "warning" ? "warning" : "muted";
-		const label = item.type === "error" ? "Error" : item.type === "warning" ? "Warning" : "Notice";
-		return this.wrapBlock(this.theme.fg(color, `${label}: ${sanitizeOverlayDisplayText(item.message)}`), innerWidth);
+		const latest = items.at(-1)!;
+		const visible = latest !== item && latest.type === "info" ? [item, latest] : [item];
+		return visible.flatMap(notice => {
+			const color = notice.type === "error" ? "error" : notice.type === "warning" ? "warning" : "muted";
+			const label = notice.type === "error" ? "Error" : notice.type === "warning" ? "Warning" : "Notice";
+			return this.wrapBlock(this.theme.fg(color, `${label}: ${sanitizeOverlayDisplayText(notice.message)}`), innerWidth);
+		});
 	}
 
 	private sectionDivider(label: string, innerWidth: number): string {
@@ -879,15 +954,6 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		this.thinkingAnimationTick = 0;
 	}
 
-	private wrapWithPrefix(prefix: string, text: string, innerWidth: number): string[] {
-		const indentWidth = Math.min(innerWidth - 1, Math.max(7, visibleWidth(prefix) + 2));
-		const wrapped = wrapTextWithAnsi(text || " ", Math.max(1, innerWidth - indentWidth));
-		return wrapped.map((line, index) => {
-			const label = index === 0 ? prefix : " ".repeat(Math.max(0, visibleWidth(prefix) + 1));
-			return truncateToWidth(`${label} ${line}`, innerWidth, "", true);
-		});
-	}
-
 	private wrapBlock(text: string, innerWidth: number): string[] {
 		const wrapped = wrapTextWithAnsi(text || " ", Math.max(1, innerWidth));
 		return wrapped.map((line) => truncateToWidth(line, innerWidth, "", true));
@@ -910,7 +976,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	}
 
 	private overlayBackground(text: string): string {
-		return typeof this.theme.bg === "function" ? this.theme.bg("customMessageBg", text) : text;
+		return jarvisSurface(this.theme, text, "chrome");
 	}
 }
 

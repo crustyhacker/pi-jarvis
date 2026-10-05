@@ -1,11 +1,14 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { mixColors, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { JarvisOverlaySnapshot, JarvisOverlayView } from "./overlay.js";
 
 export interface JarvisHeaderOptions {
 	expanded: boolean;
 	focusTarget: "input" | "tools" | "followUp" | "steer" | "model" | "thinking" | "history";
 	focused: boolean;
+	/** Pre-rendered side activity; idle Ready is deliberately omitted by the caller. */
+	activity?: string;
+	infoNotice?: boolean;
 }
 
 interface PermissionControl {
@@ -43,6 +46,9 @@ export function renderJarvisHeader(
 		state,
 	];
 	let heading = headings.find((candidate) => visibleWidth(candidate) <= width) ?? fit(state, width, "");
+	if (options.activity) {
+		heading = fit(`${heading}${separator}${options.activity}`, width);
+	}
 	// Drop only the provider prefix. Keep model IDs that themselves contain '/'.
 	const compactModel = sideModel.slice(sideModel.indexOf("/") + 1) || sideModel;
 	const modelWidth = width - visibleWidth(heading) - visibleWidth(separator);
@@ -50,13 +56,12 @@ export function renderJarvisHeader(
 		heading += separator + theme.fg("muted", fitPlain(compactModel, modelWidth));
 	}
 
-	const lines = [
-		fit(heading, width),
-		fit(theme.fg("muted", `Focus: ${inlineText(view.getMainFocusLabel()) || "idle"}`), width),
-	];
+	if (options.infoNotice && visibleWidth(heading) + 9 <= width) heading += theme.fg("dim", " · notice");
+	const lines = [fit(heading, width)];
 	if (options.expanded) {
 		const mode = inlineText(view.getModelModeLabel());
 		lines.push(
+			fit(theme.fg("muted", `Focus: ${inlineText(view.getMainFocusLabel()) || "idle"}`), width),
 			fit(theme.fg("muted", `Main model: ${inlineText(view.getMainModelLabel()) || "unknown"}`), width),
 			fit(theme.fg("muted", `Jarvis model: ${sideModel}${mode ? ` (${mode})` : ""}`), width),
 			fit(theme.fg("muted", `Since last: ${inlineText(view.getMainDeltaLabel()) || "unchanged"}`), width),
@@ -75,8 +80,8 @@ export function renderJarvisHeader(
 export function renderJarvisControls(theme: Theme, view: JarvisOverlayView, width: number, options: JarvisHeaderOptions): string {
 	width = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
 	if (!width) return "";
-	const model = inlineText(view.getModelModeLabel());
-	const thinking = inlineText(view.getThinkingLabel?.() ?? "");
+	const model = options.expanded ? inlineText(view.getModelModeLabel()) : "";
+	const thinking = options.expanded ? inlineText(view.getThinkingLabel?.() ?? "") : compactThinking(view.getThinkingLabel?.() ?? "");
 	const controls = [
 		{ target: "model", label: "F2 Model", detail: model },
 		{ target: "thinking", label: "F3 Thinking", detail: thinking },
@@ -132,6 +137,30 @@ export function renderJarvisActivity(
 		row += separator + theme.fg("muted", fitPlain(message, detailWidth));
 	}
 	return fit(row, width);
+}
+
+/** Presentation-only summary of the public full thinking label, never configuration. */
+function compactThinking(label: string): string {
+	const safe = inlineText(label);
+	return /\beffective\s+([^;)]+)/i.exec(safe)?.[1]?.trim()
+		?? safe.split(/→|->/).at(-1)?.replace(/^thinking\s+/i, "").trim() ?? "";
+}
+
+/**
+ * Quiet surfaces derived from the active theme, not a fixed purple panel.
+ * Resolve on every call: theme invalidation may replace concrete token colors.
+ * Older minimal themes used by hosts/fixtures retain semantic bg fallbacks.
+ */
+export function jarvisSurface(theme: Theme, text: string, surface: "chrome" | "conversation" | "prompt"): string {
+	if (typeof theme.style === "function" && theme.colors) {
+		const base = theme.colors.toolPendingBg;
+		const ink = theme.colors.text;
+		const neutral = mixColors(base, ink, theme.appearance === "light" ? 0.02 : 0.035);
+		const bg = surface === "chrome" ? base : surface === "conversation" ? neutral
+			: mixColors(base, theme.colors.userMessageBg, 0.45);
+		return theme.style(text, { bg, ...(surface === "conversation" ? { fg: "text" as const } : {}) });
+	}
+	return typeof theme.bg === "function" ? theme.bg(surface === "prompt" ? "userMessageBg" : "toolPendingBg", text) : text;
 }
 
 function renderPermissions(theme: Theme, controls: PermissionControl[], width: number, options: JarvisHeaderOptions): string {

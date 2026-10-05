@@ -36,10 +36,10 @@ const history = (count: number): JarvisDisplayEntry[] => Array.from({ length: co
 
 function transcript(lines: string[]): string[] {
 	const text = lines.map(stripTerminalSequences);
-	const start = text.findIndex((line) => line.includes("Conversation ·") || line.includes("History ·"));
+	const start = text.findIndex((line) => line.includes("│ ╭") || line.includes("Conversation ·") || line.includes("History ·"));
 	const end = text.findIndex((line) => line.includes("Message"));
 	assert.ok(start >= 0 && end > start);
-	return text.slice(start + 1, end);
+	return text.slice(start + 1, end).filter(line => !line.includes("╰"));
 }
 
 test("multiline drafts survive close/reopen and presentation close does not revoke view-owned grants", () => {
@@ -440,7 +440,7 @@ test("Tab discovers Model/Thinking/History controls and focused arrows scroll wi
 	} finally { f.overlay.dispose(); }
 });
 
-test("80x24 compact UI exposes terminal-style Message prompt, all shortcuts and at least three transcript rows", () => {
+test("80x24 compact UI exposes core shortcuts, contextual controls and at least three transcript rows", () => {
 	const f = fixture(undefined, history(100)); selectable(f);
 	try {
 		f.terminal.rows = 24;
@@ -450,8 +450,10 @@ test("80x24 compact UI exposes terminal-style Message prompt, all shortcuts and 
 			component.focused = true;
 			try {
 				const lines = component.render(54); const output = plain(lines);
-				for (const hint of ["F2 Model", "F3 Thinking", "ctrl+c stop", "esc close", "pageUp/pageDown", "alt+↑/↓ history", "ctrl+end live", "tab controls", "jarvis >", "Prompt · Message"]) assert.ok(output.includes(hint), hint);
-				assert.ok(transcript(lines).length >= 3);
+				for (const hint of ["F2 Model", "F3 Thinking", "ctrl+c stop", "esc close", "live", "tab controls", "ctrl+o details", "jarvis >", "Prompt · Message"]) assert.ok(output.includes(hint), hint);
+				assert.match(output, /pageUp\/pageDown|PgUp\/PgDn/);
+				assert.ok((component as unknown as { viewport: { getStatus(): { startLine: number; endLine: number } } }).viewport.getStatus().endLine
+					- (component as unknown as { viewport: { getStatus(): { startLine: number; endLine: number } } }).viewport.getStatus().startLine >= 3);
 				assert.ok(lines.some(line => line.includes(CURSOR_MARKER)));
 				assert.ok(lines.every(line => visibleWidth(line) <= 54));
 				if (text) assert.match(output, /\.\.\./);
@@ -498,7 +500,8 @@ test("prompt panel uses public semantic light/dark colors, a Message label and n
 			try {
 				overlay.handleInput("one\n  two"); const lines = overlay.render(54); const output = plain(lines);
 				assert.match(output, /Prompt · Message/); assert.match(output, /jarvis > one/); assert.match(output, /\.\.\.   two/);
-				assert.ok(bgRoles.includes("userMessageBg") && bgRoles.includes("customMessageBg"));
+				assert.ok(bgRoles.includes("userMessageBg") && bgRoles.includes("toolPendingBg"));
+				assert.ok(!bgRoles.includes("customMessageBg"), "chrome does not inherit a flat colorful message panel");
 				assert.ok(lines.some(line => line.includes(CURSOR_MARKER)));
 				assert.ok(lines.every(line => visibleWidth(line) <= 54)); assert.ok(!output.includes("$"));
 			} finally { overlay.dispose(); f.bridge.setDraft(""); }
@@ -522,4 +525,88 @@ test("tiny redraw, invalidation, unfocus and resize-before-redraw cannot apply a
 			assert.equal(f.bridge.getDraft(), "draft");
 		} finally { f.overlay.dispose(); }
 	}
+});
+
+function layoutProbe(component: JarvisOverlayComponent) {
+	return component as unknown as {
+		viewport: { getStatus(): { startLine: number; endLine: number; following: boolean } };
+		transcriptCacheWidth: number;
+		transcriptLines: string[];
+		transcriptAnchors: { key: string; offset: number }[];
+		transcriptSourceIds: Map<string, number>;
+		transcriptCache: { text: string; layout: { lines: string[]; offsets: number[] } }[];
+	};
+}
+
+test("conversation is framed, padded, source-bounded to 96 columns and spaces consecutive roles", () => {
+	const entries: JarvisDisplayEntry[] = [{ kind: "assistant", text: "first entry" }, { kind: "assistant", text: "second entry" }];
+	const f = fixture(undefined, entries);
+	try {
+		f.terminal.columns = 220;
+		const output = plain(f.overlay.render(220));
+		assert.match(output, /╭ Conversation/);
+		assert.match(output, /first entry[^\n]*\n[^\n]*│\s+│[^\n]*\n[^\n]*Jarvis:/);
+		assert.equal(layoutProbe(f.overlay).transcriptCacheWidth, 96);
+		assert.deepEqual(entries.map(entry => entry.text), ["first entry", "second entry"]);
+		assert.ok(f.overlay.render(220).length < 28, "short conversations do not fill a huge empty panel");
+	} finally { f.overlay.dispose(); }
+});
+
+test("body anchors count source UTF-16 characters, never role headings, panel insets or skipped wrap whitespace", () => {
+	const text = "  α🙂 中文 repeated repeated repeated " .repeat(8) + "\n\n    indented paragraph🙂 " .repeat(8);
+	const f = fixture(undefined, [{ kind: "user", text }]);
+	try {
+		for (const width of [34, 54, 118, 220]) {
+			f.overlay.render(width);
+			const entry = layoutProbe(f.overlay).transcriptCache[0]!;
+			assert.equal(entry.layout.offsets[0], -1);
+			for (let i = 1; i < entry.layout.lines.length; i++) {
+				const row = stripTerminalSequences(entry.layout.lines[i]!).trimEnd();
+				assert.ok(text.slice(entry.layout.offsets[i]).startsWith(row), `${width}: offset ${entry.layout.offsets[i]} for ${JSON.stringify(row)}`);
+			}
+		}
+		f.overlay.render(54); f.overlay.handleInput("\x1b[5~"); f.overlay.render(54);
+		const probe = layoutProbe(f.overlay), before = probe.transcriptAnchors[probe.viewport.getStatus().startLine]!;
+		f.overlay.render(118);
+		const after = probe.transcriptAnchors[probe.viewport.getStatus().startLine]!;
+		assert.equal(after.key, before.key); assert.ok(after.offset <= before.offset);
+		assert.equal(probe.viewport.getStatus().following, false);
+		assert.equal(f.state.entries[0]!.text, text);
+	} finally { f.overlay.dispose(); }
+});
+
+test("bounded rollover anchors body, repeated role headings and empty inter-entry spacing equally", () => {
+	for (const target of [-2, -1, 0]) {
+		const f = fixture(undefined, history(510));
+		try {
+			f.overlay.render(80); f.overlay.handleInput("\x1b[5~"); f.overlay.render(80);
+			const probe = layoutProbe(f.overlay);
+			for (let step = 0; step < 4 && probe.transcriptAnchors[probe.viewport.getStatus().startLine]!.offset !== target; step++) {
+				f.overlay.handleInput("\x1b[1;3A"); f.overlay.render(80);
+			}
+			const before = probe.transcriptAnchors[probe.viewport.getStatus().startLine]!;
+			assert.equal(before.offset, target);
+			const reading = transcript(f.overlay.render(80));
+			f.state.entries.push({ kind: "assistant", text: "record-510" });
+			assert.deepEqual(transcript(f.overlay.render(80)), reading);
+			const after = probe.transcriptAnchors[probe.viewport.getStatus().startLine]!;
+			assert.deepEqual(after, before);
+			assert.ok(probe.transcriptSourceIds.size <= 501);
+		} finally { f.overlay.dispose(); }
+	}
+});
+
+test("narrow clipped bodies keep speaker and Conversation visible; notices never hide an older warning", () => {
+	const f = fixture(undefined, [{ kind: "assistant", text: "Long clipped reply with several words and paragraphs. ".repeat(20) }]);
+	try {
+		f.terminal.rows = 20;
+		const lines = f.overlay.render(34), output = plain(lines);
+		const title = lines.map(stripTerminalSequences).find(line => line.includes("Conversation"))!;
+		assert.match(title, /Jarvis:/); assert.ok(output.includes("Prompt · Message"));
+		f.bridge.notify("urgent permission warning", "warning"); f.bridge.notify("informational configuration details");
+		assert.match(plain(f.overlay.render(80)), /Warning: urgent permission warning/);
+		assert.doesNotMatch(plain(f.overlay.render(80)), /Notice: informational configuration details/);
+		f.overlay.handleInput("\x0f"); assert.match(plain(f.overlay.render(80)), /Warning: urgent permission warning/);
+		f.overlay.handleInput("\x0c"); assert.doesNotMatch(plain(f.overlay.render(80)), /urgent permission warning/);
+	} finally { f.overlay.dispose(); }
 });

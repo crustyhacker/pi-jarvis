@@ -571,7 +571,9 @@ async function testOverlayClippedTranscriptPreservesSpeakerLabel(): Promise<void
 	const transcriptLine = lines
 		.slice(conversationDivider + 1, promptDivider >= 0 ? promptDivider : undefined)
 		.find((line) => line.includes("Jarvis:") || line.includes("Long clipped transcript"));
-	assert.ok(transcriptLine?.includes("Jarvis:"), "the first visible clipped transcript line should retain the speaker label");
+	assert.ok(transcriptLine, "the clipped reading panel must still show transcript text");
+	assert.ok(lines[conversationDivider]!.includes("Jarvis:") || transcriptLine.includes("Jarvis:"),
+		"the visible conversation title or first clipped text line must identify its speaker");
 	overlay.dispose();
 }
 
@@ -602,8 +604,10 @@ async function testOverlaySanitizesNonTranscriptUiText(): Promise<void> {
 	bridge.setStatus("status", "status \x1b[2J line");
 	const { view } = createTestOverlayView({ displayEntries: [] });
 	const overlay = new JarvisOverlayComponent(tui, theme, bridge, view, () => {});
+	assert.ok(overlay.render(80).some((line) => line.includes("notice")), "compact chrome should indicate a retained informational notice");
+	overlay.handleInput("\x0f");
 	const normalLines = overlay.render(80);
-	assert.ok(normalLines.some((line) => line.includes("notice label")), "overlay should sanitize notices before rendering them");
+	assert.ok(normalLines.some((line) => line.includes("notice label")), "expanded notice text must still be sanitized");
 	assert.ok(normalLines.some((line) => line.includes("status  line")), "overlay should sanitize bridge status text before rendering it");
 	const confirmation = bridge.requestConfirmation("title \x1b[2J", "body \x1b]8;;https://example.com\x07label\x1b]8;;\x07");
 	const lines = overlay.render(80);
@@ -644,10 +648,11 @@ async function testOverlayForwardingToggleControls(): Promise<void> {
 
 	let lines = overlay.render(80);
 	assert.ok(lines.some((line) => line.includes("Jarvis · Main busy")), "overlay header should show the Jarvis title and current main status");
-	assert.ok(lines.some((line) => line.includes("Focus: editing side-session.ts")), "overlay header should show the current main-session focus");
+	assert.ok(!lines.some((line) => line.includes("Focus: editing side-session.ts")), "compact chrome should reserve verbose main focus for diagnostics");
 	assert.ok(!lines.some((line) => line.includes("Since last:")), "default header should keep diagnostics collapsed");
 	overlay.handleInput("\x0f");
 	lines = overlay.render(80);
+	assert.ok(lines.some((line) => line.includes("Focus: editing side-session.ts")), "expanded diagnostics must retain the current main focus");
 	assert.ok(lines.some((line) => line.includes("Since last: focus → editing side-session.ts")), "expanded header should show the since-last delta");
 	assert.ok(lines.some((line) => line.includes("Access: local tools + MCP available")), "overlay header should show repo tool availability details");
 	assert.ok(lines.some((line) => line.includes("Main model: openai/gpt-5.2")), "overlay header should show the current main model label");
@@ -699,7 +704,7 @@ async function testOverlayForwardingToggleControls(): Promise<void> {
 	overlay.handleInput("\t");
 	lines = overlay.render(80);
 	assert.equal(cursorMarkerPresent(lines), false, "model controls must not edit the draft");
-	assert.ok(lines.some((line) => line.includes("[F2 Model:")), "tab should expose the in-window model control");
+	assert.ok(lines.some((line) => line.includes("[F2 Model")), "tab should expose the in-window model control");
 	overlay.handleInput("\t");
 	lines = overlay.render(80);
 	assert.ok(lines.some((line) => line.includes("[F3 Thinking")), "tab should expose the in-window thinking control");

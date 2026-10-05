@@ -65,6 +65,8 @@ function harness(mode = "tui") {
 	let entries: any[] = [];
 	let overlay: any;
 	let customCalls = 0;
+	let customOptions: any;
+	const terminal = { rows: 40, columns: 100 };
 	let refresh: () => Promise<void> = async () => {};
 	const models = [model("main"), model("project"), model("global")];
 	const ctx: any = {
@@ -75,10 +77,11 @@ function harness(mode = "tui") {
 		modelRegistry: { refresh: () => refresh(), getAvailable: () => models, find: (_: string, id: string) => models.find((m) => m.id === id) },
 		ui: {
 			theme, notify: (text: string) => notices.push(text),
-			custom: (factory: any) => {
+			custom: (factory: any, options: any) => {
 				customCalls++;
+				customOptions = options;
 				return new Promise((resolve) => {
-					overlay = factory({ terminal: { rows: 40 }, requestRender() {} }, theme, getKeybindings(), (value: unknown) => {
+					overlay = factory({ terminal, requestRender() {} }, theme, getKeybindings(), (value: unknown) => {
 						overlay?.dispose?.(); resolve(value);
 					});
 				});
@@ -107,12 +110,25 @@ function harness(mode = "tui") {
 		event: (name: string) => handlers.get(name)?.({}, ctx),
 		command: (name: string, args = "") => commands.get(name).handler(args, ctx),
 		get overlay() { return overlay; }, get customCalls() { return customCalls; },
+		terminal, get customOptions() { return customOptions; },
 		setRefresh(callback: () => Promise<void>) { refresh = callback; },
 		clearBranch() { entries = []; },
 	};
 }
 
 try {
+	{
+		const h = harness(); await h.event("session_start");
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		assert.equal(typeof h.customOptions.overlayOptions, "function", "initial geometry must be calculated through Pi's public overlay options callback");
+		for (const [columns, width] of [[100, 80], [400, 118], [140, 112], [54, 68], [1, 68]]) {
+			h.terminal.columns = columns!;
+			assert.equal(h.customOptions.overlayOptions().width, width);
+		}
+		assert.equal(h.customOptions.overlayOptions().maxHeight, "82%");
+		assert.equal(h.customOptions.overlayOptions().anchor, "center");
+		await h.event("session_shutdown"); await opened;
+	}
 	for (const mode of ["rpc", "json", "print"]) {
 		const h = harness(mode);
 		await h.event("session_start");

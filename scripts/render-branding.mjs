@@ -10,7 +10,10 @@ const fgNames = "accent border borderAccent borderMuted success error warning mu
 const fg = Object.fromEntries(fgNames.map((name) => [name, "#dcd9ef"]));
 Object.assign(fg, { accent: "#5de2ff", borderAccent: "#ff70cd", borderMuted: "#77659a", muted: "#aaa0c3", dim: "#8f83a7", success: "#70e2bc", warning: "#ffb97e" });
 const bg = Object.fromEntries("selectedBg searchMatchBg userMessageBg customMessageBg toolPendingBg toolSuccessBg toolErrorBg".split(" ").map((name) => [name, "#171127"]));
-bg.userMessageBg = "#241a38";
+// Purple-heavy fixture exercises separation even when a theme's custom panel
+// background is saturated. This is demo artwork, not the user's live theme.
+bg.customMessageBg = "#3a3453";
+bg.userMessageBg = "#1e1b2d";
 const theme = new Theme(fg, bg, "truecolor", { name: "Jarvis demo", appearance: "dark" });
 const escape = (text) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
@@ -67,7 +70,7 @@ const bridge = new JarvisOverlayBridge();
 const view = {
 	isReady: () => true, isStreaming: () => false,
 	getModelLabel: () => "demo/side", getModelModeLabel: () => "follow main",
-	getThinkingLabel: () => "auto (effective medium)",
+	getThinkingLabel: () => "thinking auto (effective medium; project setting)",
 	getModelChoices: async () => [{ value: "follow-main", label: "Follow main" }, { value: "demo/side", label: "demo/side" }],
 	async configureModel() { throw new Error("Documentation fixture must never configure models"); },
 	async configureThinking() { throw new Error("Documentation fixture must never configure thinking"); },
@@ -84,6 +87,7 @@ const view = {
 	],
 	async sendMessage() { throw new Error("Documentation fixture must never send"); },
 };
+bridge.notify("Saved Jarvis thinking for this project. Effective thinking is medium.", "info");
 const overlay = new JarvisOverlayComponent({ terminal: { rows: 34, columns: 100 }, requestRender() {} }, theme, bridge, view, () => {});
 try {
 	writeFileSync("docs/assets/jarvis-overlay.svg", svg(overlay.render(88), "Jarvis compact overlay preview", "Actual Jarvis renderer with deterministic demo conversation and a custom dark palette. Not a live provider session.", 88));

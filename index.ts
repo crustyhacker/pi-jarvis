@@ -215,9 +215,11 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			}
 
 			const overlayView = createOverlayView(pi, state, ctx, configureModel, configureThinking);
+			let terminalColumns: (() => number) | undefined;
 			try {
 				await ctx.ui.custom<void>(
 					(tui, theme, keybindings, done) => {
+						terminalColumns = () => tui.terminal.columns;
 						state.themeProvider = () => theme;
 						let closed = false;
 						const closeOverlay = () => {
@@ -245,11 +247,18 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 					},
 					{
 						overlay: true,
-						overlayOptions: {
-							width: "68%",
-							minWidth: 68,
-							maxHeight: "82%",
-							anchor: "center",
+						overlayOptions: () => {
+							const columns = terminalColumns?.();
+							return {
+								// Keep a comfortable reading width instead of stretching
+								// paragraphs across an ultrawide terminal. Pi still clamps
+								// the minimum to the available space on small terminals.
+								width: Number.isFinite(columns) && columns! > 0
+									? Math.min(118, Math.max(68, Math.floor(columns! * 0.8))) : "68%",
+								minWidth: 68,
+								maxHeight: "82%",
+								anchor: "center",
+							};
 						},
 					},
 				);

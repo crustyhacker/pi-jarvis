@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { renderJarvisActivity, renderJarvisHeader, renderJarvisControls, type JarvisHeaderOptions } from "../overlay-layout.js";
+import { readFileSync } from "node:fs";
+import { Theme } from "@earendil-works/pi-coding-agent";
+import { colorToRgb, mixColors, stripTerminalSequences, visibleWidth, type Color } from "@earendil-works/pi-tui";
+import { jarvisSurface, renderJarvisActivity, renderJarvisHeader, renderJarvisControls, type JarvisHeaderOptions } from "../overlay-layout.js";
 import type { JarvisOverlaySnapshot, JarvisOverlayView } from "../overlay.js";
 
 const plainTheme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -59,11 +60,10 @@ function assertBounds(lines: string[], width: number) {
 	}
 }
 
-test("default header is three compact rows, with side model, main focus and named permissions", () => {
+test("default header is two compact rows, with side model and named permissions; focus is diagnostic", () => {
 	const rows = plain(renderJarvisHeader(plainTheme, fixture(), 80, collapsed));
 	assert.deepEqual(rows, [
 		"Jarvis · Main idle · gpt-side",
-		"Focus: reviewing layout",
 		"Repo tools: off  Note main: off  Redirect: off",
 	]);
 	assert.ok(!rows.join("\n").includes("openai-codex"));
@@ -73,11 +73,12 @@ test("default header is three compact rows, with side model, main focus and name
 test("collapsed rendering does not even request detail getters", () => {
 	const view = fixture({
 		getMainModelLabel: forbidden,
+		getMainFocusLabel: forbidden,
 		getModelModeLabel: forbidden,
 		getMainDeltaLabel: forbidden,
 		getRepoToolsDetailLabel: forbidden,
 	});
-	assert.equal(renderJarvisHeader(plainTheme, view, 80, collapsed).length, 3);
+	assert.equal(renderJarvisHeader(plainTheme, view, 80, collapsed).length, 2);
 });
 
 test("expanded details include both full models, mode, delta and access, keeping permissions last", () => {
@@ -170,7 +171,7 @@ test("all tiny widths, focus targets and detail modes stay bounded with wide Uni
 			for (const focusTarget of focusTargets) {
 				for (let width = 0; width <= 80; width++) {
 					const rows = renderJarvisHeader(theme, view, width, { expanded, focusTarget, focused: true });
-					assert.equal(rows.length, width === 0 ? 0 : expanded ? 7 : 3);
+					assert.equal(rows.length, width === 0 ? 0 : expanded ? 7 : 2);
 					assertBounds(rows, width);
 				}
 			}
@@ -183,7 +184,7 @@ test("truncation preserves emoji graphemes and compact model IDs containing slas
 	const view = fixture({ getModelLabel: () => "openai-codex/中文/model", getMainFocusLabel: () => `中文${family}e\u0301 ending` });
 	assert.ok(plain(renderJarvisHeader(plainTheme, view, 80, collapsed))[0]!.endsWith("中文/model"));
 	for (let width = 1; width <= 30; width++) {
-		const focus = plain(renderJarvisHeader(plainTheme, view, width, collapsed))[1]!;
+		const focus = plain(renderJarvisHeader(plainTheme, view, width, { ...collapsed, expanded: true }))[1]!;
 		for (const member of ["👨", "👩", "👧", "👦"]) {
 			if (focus.includes(member)) assert.ok(focus.includes(family), "split ZWJ grapheme");
 		}
@@ -316,6 +317,61 @@ test("picker/history controls retain discoverable shortcuts and focused target a
 			}
 		}
 	}
-	assert.match(renderJarvisControls(plainTheme, view, 80, collapsed), /auto → high/);
+	assert.match(renderJarvisControls(plainTheme, view, 80, collapsed), /Thinking: high/);
+	assert.doesNotMatch(renderJarvisControls(plainTheme, view, 80, collapsed), /pinned|auto/);
+	assert.match(renderJarvisControls(plainTheme, view, 100, { ...collapsed, expanded: true }), /auto → high/);
 	assert.match(renderJarvisControls(plainTheme, view, 20, { ...collapsed, focusTarget: "history" }), /^\[History ↑\/↓\]/);
+});
+
+function publicPalette(name: "dark" | "light", mode: "truecolor" | "256color", purple = false): Theme {
+	// Public bundled palettes only: never load agent settings or user themes.
+	const json = JSON.parse(readFileSync(new URL(`modes/interactive/theme/${name}.json`, import.meta.resolve("@earendil-works/pi-coding-agent")), "utf8"));
+	const resolve = (value: string | number): string | number => typeof value === "string" && value in json.vars ? resolve(json.vars[value]) : value;
+	const bgNames = new Set(["selectedBg", "searchMatchBg", "userMessageBg", "customMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"]);
+	const foreground: Record<string, string | number> = {}, background: Record<string, string | number> = {};
+	for (const [token, value] of Object.entries(json.colors)) (bgNames.has(token) ? background : foreground)[token] = resolve(value as string | number);
+	if (purple) { background.customMessageBg = "#3a3453"; background.userMessageBg = "#1e1b2d"; }
+	return new Theme(foreground as ConstructorParameters<typeof Theme>[0], background as ConstructorParameters<typeof Theme>[1], mode, { appearance: name });
+}
+
+function contrast(a: Color, b: Color): number {
+	const luminance = (color: Color) => {
+		const { r, g, b } = colorToRgb(color);
+		const linear = [r, g, b].map(x => { x /= 255; return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; });
+		return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
+	};
+	const values = [luminance(a), luminance(b)].sort((x, y) => y - x);
+	return (values[0]! + 0.05) / (values[1]! + 0.05);
+}
+
+test("real public light/dark/purple-heavy palettes produce quiet readable surfaces in truecolor and 256 color", () => {
+	for (const appearance of ["light", "dark"] as const) for (const mode of ["truecolor", "256color"] as const) for (const purple of [false, true]) {
+		const palette = publicPalette(appearance, mode, purple);
+		const neutral = mixColors(palette.colors.toolPendingBg, palette.colors.text, appearance === "light" ? 0.02 : 0.035);
+		assert.ok(contrast(neutral, palette.colors.text) >= 4.5, `${appearance}: body contrast`);
+		const surfaces = ["chrome", "conversation", "prompt"].map(surface => jarvisSurface(palette, "body 中文🙂   ", surface as "chrome" | "conversation" | "prompt"));
+		assert.ok(surfaces.every(line => stripTerminalSequences(line) === "body 中文🙂   "));
+		assert.notEqual(surfaces[0], surfaces[1]); assert.notEqual(surfaces[1], surfaces[2]);
+		assert.notEqual(surfaces[0], palette.bg("customMessageBg", "body 中文🙂   "));
+		assert.match(surfaces.join(""), mode === "truecolor" ? /\x1b\[48;2;/ : /\x1b\[48;5;/);
+		if (mode === "256color") assert.doesNotMatch(surfaces.join(""), /\x1b\[(?:38|48);2;/);
+	}
+});
+
+test("surface rendering reads live theme colors and minimal legacy themes use semantic fallbacks", () => {
+	let active = publicPalette("dark", "truecolor", true);
+	const proxy = { get colors() { return active.colors; }, get appearance() { return active.appearance; }, style: (text: string, options: Parameters<Theme["style"]>[1]) => active.style(text, options) } as Theme;
+	const dark = jarvisSurface(proxy, "body", "conversation"); active = publicPalette("light", "truecolor");
+	assert.notEqual(dark, jarvisSurface(proxy, "body", "conversation"));
+	assert.equal(jarvisSurface(plainTheme, "body", "conversation"), "body");
+	const calls: string[] = [];
+	const legacy = { ...plainTheme, bg: (role: string, text: string) => { calls.push(role); return text; } } as Theme;
+	for (const surface of ["chrome", "conversation", "prompt"] as const) jarvisSurface(legacy, "body", surface);
+	assert.deepEqual(calls, ["toolPendingBg", "toolPendingBg", "userMessageBg"]);
+});
+
+test("default controls summarize effective thinking, while diagnostics retain the public requested/scope label", () => {
+	const view = fixture({ getThinkingLabel: () => "thinking auto (effective high; project setting)" });
+	assert.equal(renderJarvisControls(plainTheme, view, 80, collapsed), "F2 Model • F3 Thinking: high • History ↑/↓");
+	assert.match(renderJarvisControls(plainTheme, view, 140, { ...collapsed, expanded: true }), /thinking auto \(effective high; project setting\)/);
 });

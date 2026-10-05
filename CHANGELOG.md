@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.11.1] - 2026-10-05
+
+### Presentation
+- Give the conversation a distinct, padded reading panel with clearer message separation, calmer theme-aware surfaces and bounded paragraph width.
+- Reduce default header clutter, keep named access states and controls discoverable, and move verbose focus/settings/diagnostics behind Ctrl+O. Use quieter contextual hints and summarized informational notices without hiding warnings/errors.
+- Choose an initial overlay width capped at 118 columns using Pi's public geometry API; the body reading column caps at 96. The host clamps on shrink; reopen after enlargement to recalculate width. Refresh the deterministic README renderer preview.
+- Preserve 1.11.0 task continuation, in-memory grants, stopping, scrolling, model/thinking selection and private-input boundaries. This is a presentation patch; no user theme/renderer/settings changes, new memory behavior or archive migration.
+
 ## [1.11.0] - 2026-10-05
 
 ### Overlay fixes

@@ -22,7 +22,7 @@ And `/jarvis` still gives you a polished side-conversation overlay: a second opi
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.11.0</p>
+<p><strong>Current version:</strong> 1.11.1</p>
 
 ```bash
 pi install npm:pi-jarvis
@@ -623,7 +623,9 @@ Version **1.11.0** separates close from stop, adds in-window settings pickers an
 | Ctrl+C | Request stopping Jarvis work and clear waiting inputs; reviews/pickers retain their own cancellation behavior |
 | Escape | Close without stopping work; inside a picker/review, cancel it instead |
 
-The compact header keeps main status, the side model, main focus, and permissions visible. Activity and waiting-message counts remain visible while reading older output; counts exclude the active request. The latest notice appears separately; expand details for more of a long notice.
+The compact header keeps activity, the side model and named permission states easy to scan. Verbose main focus, setting scopes and full diagnostics live behind Ctrl+O. Informational notices are summarized in the compact view; warnings/errors remain prominent and Ctrl+L dismisses notices. Waiting counts exclude the active request.
+
+The conversation has its own padded, theme-aware reading panel, separated from quieter controls, the prompt and contextual hints. The overlay chooses a width of at most 118 columns when opened, avoiding stretched paragraphs on ultrawide terminals; the reading column is at most 96 columns. Pi clamps the window when the terminal shrinks. Reopen after enlarging the terminal to recalculate the initial width. Light/dark and 256-color presentation use Pi's public theme APIs—no theme or renderer settings are changed.
 
 The multiline editor uses Pi's public editor and configured editing keybindings. Up/Down move within a draft; Up at the beginning of the first line (or in an empty editor) recalls prompts. Down past recalled prompts restores the draft. Pasted indentation and newlines are preserved, with Pi's normal tab-to-spaces normalization. Oversized drafts (over 64 KiB) and terminal-control payloads are rejected explicitly, never silently truncated or sent.
 
