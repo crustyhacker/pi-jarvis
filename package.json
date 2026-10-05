@@ -1,10 +1,10 @@
 {
   "name": "pi-jarvis",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "engines": {
     "node": ">=22.19.0"
   },
-  "description": "A Pi side-conversation overlay with shared memory, an optional searchable session archive, password encryption, and confirmed history import.",
+  "description": "Persistent shared memory for main Pi and Jarvis: reuse preferences and project decisions, search conversations, and opt into a session archive with bulk import and password encryption.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -40,8 +40,14 @@
     "overlay",
     "assistant",
     "memory",
+    "persistent-memory",
+    "shared-memory",
+    "coding-agent",
+    "conversation-history",
     "session-history",
-    "archive"
+    "archive",
+    "sqlite",
+    "encryption"
   ],
   "pi": {
     "extensions": [

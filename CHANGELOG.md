@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.10.2] - 2026-10-05
+
+### Documentation and package discoverability
+- Lead the GitHub/npm landing page with persistent memory shared by main Pi and Jarvis, including use without the overlay, reusable preferences/project decisions and searchable conversation captures.
+- Add a one-minute, command-driven memory workflow, concrete cross-session use cases, scoped search and immediate privacy controls. Keep the optional full-session archive, explicit history import and archive-only encryption clearly separate.
+- Refresh package description and search keywords. This is a documentation/metadata release: runtime behavior, defaults, user settings and stored data are unchanged; npm publication remains manual.
+
 ## [1.10.1] - 2026-10-05
 
 ### Fixed

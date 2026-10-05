@@ -4,13 +4,17 @@
 
 <img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-logo.svg" alt="JARVIS — Pi / A second lane of thought. Cyan, violet, and pink ASCII chrome." width="720">
 
-## A cinematic side-conversation overlay for Pi
+## Give Pi a memory. Give yourself a second lane.
 
-**A second lane of thought—with shared memory, searchable history, and optional archive encryption.**
+**Remember decisions. Reuse preferences. Find the conversation that started it all.**
 
-`pi-jarvis` adds `/jarvis`: a polished overlay where you can ask for status, inspect the repo when you explicitly allow it, and send a quiet note or a confirmed redirect back to the main lane.
+Main Pi and Jarvis share **persistent, searchable memory across sessions**—so useful preferences, corrections and project decisions can inform the next conversation. It works in main Pi **even if you never open `/jarvis`**, independently of Repo tools and bridge permissions.
 
-**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects. **New in 1.10.0: optional password encryption for the archive database and index.** Plaintext remains the default; bulk history import still requires a preview and explicit confirmation.
+Want the original history, not just useful facts? The separate, opt-in **session archive** adds indexed search, session browsing and preview-confirmed import of existing Pi chats. Optional **password encryption** protects its active database, index and SQLite journals.
+
+And `/jarvis` still gives you a polished side-conversation overlay: a second opinion, live main-session context, opt-in repo inspection, and quiet notes or confirmed redirects.
+
+**Local storage. User-controlled access. No background model calls or embeddings.** Shared memory is **on in trusted projects** and stored in **plaintext**; recalled facts can be sent to your active model. The separate archive and its encryption are **off by default**. [Understand the controls and privacy boundary](#two-complementary-memory-features).
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -18,7 +22,13 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.10.1</p>
+<p><strong>Current version:</strong> 1.10.2</p>
+
+```bash
+pi install npm:pi-jarvis
+```
+
+[Memory in 60 seconds](#memory-in-60-seconds) · [Search your history](#full-session-archive) · [Import existing sessions](#import-all-existing-pi-sessions) · [Archive encryption](#optional-archive-encryption) · [Open the overlay](#quick-start)
 
 <p>
   <strong>Shared persistent memory</strong> ·
@@ -54,27 +64,50 @@
 
 ---
 
-## The pitch
+## Stop re-explaining your project
 
-The main Pi session should stay on the critical path.
+A fresh session should not mean throwing away every useful decision. `pi-jarvis` gives main Pi and Jarvis a shared place to keep the facts you want to reuse—and an optional archive when you need the original evidence.
 
-`/jarvis` gives you a **second cockpit** for the work that should not interrupt that primary flow:
+| Your workflow | What Jarvis adds |
+|---|---|
+| **"Remember how I like to work."** | Global preference notes, available to main Pi and Jarvis across projects |
+| **"We already decided this."** | Project-scoped decisions and corrections that survive session changes |
+| **"Jarvis found something useful."** | A saved fact can be recalled later in main Pi without enabling `Note main` or `Redirect` |
+| **"What did we say about deployment?"** | Keyword search across saved notes and bounded conversation captures |
+| **"Show me the original tool output."** | Separately enabled archive search, session provenance and paged raw entries |
+| **"I have months of existing Pi chats."** | Explicit bulk-import preview, confirmation, duplicate skipping and per-file reports |
 
-- checking what the main agent is doing right now
-- seeing what changed since the last `/jarvis` turn
-- asking for triage, summaries, or a second opinion
-- inspecting the repo with local tools when you turn them on
-- sending a non-interrupting note back to the main session
-- redirecting the main session only after explicit confirmation
+Memory is **context, not authority**: records can be stale, recall is bounded and relevance-based, and model curation depends on the model using its tools. Current instructions still win. Archive search covers recorded or explicitly imported history—not everything Pi has ever seen.
 
-> Think of it as a side conversation with real context, not a detached scratchpad.
+### Memory in 60 seconds
 
-### Typical prompts
+After installing and reloading, check the first-use notice and effective settings. These are **literal commands**, not promises that a model will save or recall a fact:
+
+```text
+/jarvis-memory
+/jarvis-memory remember Build workflow | This project uses npm, not pnpm.
+/jarvis-memory remember --global Answer style | Prefer concise answers with file paths.
+/jarvis-memory search Build workflow
+```
+
+The first note stays in this project; the second is a deliberate cross-project preference. Both lanes use the same store. Inside the overlay, `/memory search Build workflow` runs locally without a model call or waiting for queued side work.
+
+Now ask either lane: *"What build workflow did we save for this project? Search memory if needed."* Or ask: *"Find the earlier discussion about deployment and show the source before suggesting a change."* Automatic recall uses global/current-project records; broader search is explicit:
+
+```text
+/jarvis-memory search --all deployment
+```
+
+**Your controls, immediately available:** `/jarvis-memory off` is the global master-off; `/jarvis-memory --project off` pauses this project. `/jarvis-memory --project capture off` and `--project recall off` control saving and recall separately here. Full off retains data but blocks even record inspection; none of these switches erases original Pi transcripts or already-sent model context. [Inspect, edit and forget saved records](#inspect-edit-and-forget).
+
+### A second cockpit—not a second task queue for main Pi
+
+Use `/jarvis` for a second opinion, progress checks or repo inspection while the main lane stays on its plan. Repo tools, `Note main` and `Redirect` are separate opt-ins; redirects still require confirmation. Shared memory does **not** steer, interrupt or queue work into the other lane.
 
 - *"What is the main agent doing right now?"*
+- *"Which project decisions did we save, and which might be stale?"*
 - *"Summarize the last validation failure and tell me what matters."*
 - *"Check this file while the main session keeps moving."*
-- *"Compare what changed since my last `/jarvis` turn."*
 - *"Redirect the main session, but make me confirm it first."*
 
 ---
@@ -100,7 +133,7 @@ Both work across main Pi and Jarvis, independently of **Repo tools** and whether
 
 | Capability | What you get |
 |---|---|
-| **Shared memory** | Main Pi and Jarvis remember useful discussions across sessions; enabled by default, with global/project controls and a master off switch |
+| **Shared persistent memory** | One store for main Pi + Jarvis: reusable preferences, decisions and bounded finalized conversations; on in trusted projects, with global/project controls and a master off switch |
 | **Optional full-session archive** | Off by default; raw finalized entries, local indexed cross-session search, separate model permission, and preview-confirmed bulk history import |
 | **Optional archive encryption** | Off by default; password-protected database/index/journals, explicit migration and cleanup, and selectable unlock lifetimes |
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
@@ -180,9 +213,9 @@ Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Version **1.6.0** suppor
 ### 2) Restart or reload Pi
 
 `pi install` registers the package automatically. For local development, build and load `./dist/index.js` with `pi -e ./dist/index.js`.
-**New in 1.7.0: shared memory is enabled by default in trusted projects**, including main Pi even if you never open the overlay. A first-use notice explains capture and recall. Already using another memory extension? Run `/jarvis-memory off` before your first prompt; this disables both main and Jarvis memory without deleting anything.
+**Shared memory is enabled by default in trusted projects**, including main Pi even if you never open the overlay. A first-use notice explains capture and recall; [try the one-minute memory workflow](#memory-in-60-seconds). Already using another memory extension? Run `/jarvis-memory off` before your first prompt; this disables both main and Jarvis memory without deleting anything.
 
-**The separate full-session archive is OFF by default.** Nothing is imported or recorded by that subsystem until you opt in. **Version 1.10.0 adds optional password encryption, also OFF by default**; installation does not encrypt an existing archive or change your recording/model/memory settings. If you want to avoid new plaintext archive captures during setup, pause effective **capture before enabling or migrating**. See [Full-session archive](#full-session-archive) and [safe encryption setup](#safe-initial-setup).
+**The separate full-session archive is OFF by default.** Nothing is imported or recorded by that subsystem until you opt in. **Optional password encryption is also OFF by default**; installation does not encrypt an existing archive or change your recording/model/memory settings. If you want to avoid new plaintext archive captures during setup, pause effective **capture before enabling or migrating**. See [Full-session archive](#full-session-archive) and [safe encryption setup](#safe-initial-setup).
 
 ### 3) Open Jarvis
 
@@ -445,7 +478,9 @@ See [Archive encryption design and operating contract](docs/archive-encryption-d
 
 ## Shared memory
 
-Main Pi and Jarvis use **one local memory service**, independent of the overlay lifecycle. Useful Jarvis discussions can inform a later main session and vice versa—even when `Note main` is off. Memory does not steer or queue messages into the other session; it supplies historical context when recalled. Close/reopen, `/new`, and project changes do not erase it.
+**The feature you can use even without the overlay:** main Pi and Jarvis use **one local memory service**, independent of the overlay lifecycle. Useful Jarvis discussions can inform a later main session and vice versa—even when `Note main` is off. Memory does not steer or queue messages into the other session; it supplies historical context when recalled. Close/reopen, `/new`, and project changes do not erase it.
+
+Use project notes for architecture choices, build conventions, corrections and useful references. Use global notes only for preferences you deliberately want across projects. Prefer concise, specific facts with stable titles; search and inspect their dates/provenance before relying on them. **Do not use memory as a password or token store.** See [Memory in 60 seconds](#memory-in-60-seconds) for commands you can run without involving a model.
 
 ### What is remembered
 
