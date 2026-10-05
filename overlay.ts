@@ -709,7 +709,9 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			: `${role}Conversation${role ? "" : position.following ? " · live" : " · History"}`;
 		const border = (top: boolean, label = "") => {
 			const text = label ? ` ${truncateToWidth(label, Math.max(0, width - 4), "", true)} ` : "";
-			return this.theme.fg("borderMuted", `${top ? "╭" : "╰"}${text}${"─".repeat(Math.max(0, width - visibleWidth(text) - 2))}${top ? "╮" : "╯"}`);
+			return this.theme.fg("borderMuted", top ? "╭" : "╰")
+				+ this.theme.fg(this.focused && this.focusTarget === "history" ? "accent" : "muted", text)
+				+ this.theme.fg("borderMuted", `${"─".repeat(Math.max(0, width - visibleWidth(text) - 2))}${top ? "╮" : "╯"}`);
 		};
 		const row = (line: string) => {
 			const content = " ".repeat(inset) + line;
@@ -724,7 +726,9 @@ export class JarvisOverlayComponent implements Component, Focusable {
 
 	private promptBorder(label: string, width: number, top: boolean): string {
 		const text = label ? ` ${label} ` : "";
-		return truncateToWidth(this.theme.fg("borderAccent", (top ? "┌" : "└") + text + "─".repeat(Math.max(0, width - visibleWidth(text) - 1))), width, "", true);
+		const active = this.focused && this.focusTarget === "input";
+		return truncateToWidth(this.theme.fg(active ? "borderAccent" : "borderMuted", (top ? "╭" : "╰") + text
+			+ "─".repeat(Math.max(0, width - visibleWidth(text) - 1))), width, "", true);
 	}
 
 	private renderConfirmation(confirmation: JarvisPendingConfirmation, innerWidth: number, budget: number): string[] {
@@ -848,8 +852,12 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		const safeText = sanitizeOverlayDisplayText(entry.text);
 		const labels = { user: "User:", assistant: "Jarvis:", tool: "Tool:", status: "Note:", system: "System:" };
 		const colors = { user: "accent", assistant: "success", tool: "warning", status: "muted", system: "muted" } as const;
+		const label = this.theme.bold(this.theme.fg(colors[entry.kind], labels[entry.kind]));
+		// A short hairline belongs to the heading only, never body text or its
+		// source offsets. It adds structure without another row or a wider inset.
+		const rule = innerWidth >= 32 ? this.theme.fg("borderMuted", "  ────────") : "";
 		const layout: TranscriptEntryLayout = {
-			lines: [truncateToWidth(this.theme.bold(this.theme.fg(colors[entry.kind], labels[entry.kind])), innerWidth, "", true)],
+			lines: [truncateToWidth(label + rule, innerWidth, "", true)],
 			offsets: [-1], continuations: [false],
 		};
 		let paragraphOffset = 0;
@@ -875,7 +883,9 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		const continuation = innerWidth >= 12 ? "     ... " : innerWidth >= 3 ? "| " : "";
 		const inputWidth = Math.max(1, innerWidth - visibleWidth(prompt));
 		return this.input.render(inputWidth, maxLines).map((line, index) => {
-			const content = truncateToWidth(this.theme.fg("accent", index === 0 ? prompt : continuation) + this.theme.fg("text", line), innerWidth, "", true);
+			const prefix = this.theme.fg("accent", index === 0 ? prompt : continuation);
+			const content = truncateToWidth((this.input.focused ? this.theme.bold(prefix) : prefix)
+				+ this.theme.fg("text", line), innerWidth, "", true);
 			const padded = content + " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
 			return jarvisSurface(this.theme, padded, "prompt");
 		});

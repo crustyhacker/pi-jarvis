@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { mixColors, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { backgroundAnsi, colorToRgb, mixColors, stripTerminalSequences, truncateToWidth, visibleWidth, type Color } from "@earendil-works/pi-tui";
 import type { JarvisOverlaySnapshot, JarvisOverlayView } from "./overlay.js";
 
 export interface JarvisHeaderOptions {
@@ -91,7 +91,8 @@ export function renderJarvisControls(theme: Theme, view: JarvisOverlayView, widt
 	const ordered = selected > 0 ? [...controls.slice(selected), ...controls.slice(0, selected)] : controls;
 	const render = (control: typeof controls[number], detail: boolean) => {
 		const label = control.label + (detail && control.detail ? `: ${control.detail}` : "");
-		return options.focused && options.focusTarget === control.target ? theme.bold(theme.fg("accent", `[${label}]`)) : theme.fg("muted", label);
+		return options.focused && options.focusTarget === control.target
+			? focusedControl(theme, `[${label}]`, "accent") : theme.fg("muted", label);
 	};
 	for (const detailTargets of [new Set(["model", "thinking"]), new Set([selected < 0 ? "thinking" : options.focusTarget]), new Set<string>()]) {
 		const row = ordered.map((control) => render(control, detailTargets.has(control.target))).join(theme.fg("dim", " • "));
@@ -153,21 +154,51 @@ function compactThinking(label: string): string {
  */
 export function jarvisSurface(theme: Theme, text: string, surface: "chrome" | "conversation" | "prompt"): string {
 	if (typeof theme.style === "function" && theme.colors) {
-		const base = theme.colors.toolPendingBg;
 		const ink = theme.colors.text;
-		const neutral = mixColors(base, ink, theme.appearance === "light" ? 0.02 : 0.035);
-		const bg = surface === "chrome" ? base : surface === "conversation" ? neutral
-			: mixColors(base, theme.colors.userMessageBg, 0.45);
-		return theme.style(text, { bg, ...(surface === "conversation" ? { fg: "text" as const } : {}) });
+		// Borrow the user's message palette instead of inheriting a flat tool-
+		// result gray. Reject blends that would make the body harder to read.
+		const original = theme.colors.toolPendingBg;
+		const tinted = mixColors(original, theme.colors.userMessageBg, 0.7, "srgb");
+		const base = readableSurface(tinted, ink) ? tinted : original;
+		const raised = mixColors(base, ink, theme.appearance === "light" ? 0.02 : 0.035, "srgb");
+		const prompt = mixColors(base, theme.colors.userMessageBg, 0.6, "srgb");
+		const bg = surface === "chrome" ? base : surface === "conversation"
+			? readableSurface(raised, ink) ? raised : base
+			: readableSurface(prompt, ink) ? prompt : base;
+		// Theme.style does not restore an enclosing background after a nested
+		// chip's SGR 49 (or a truncation reset). Reapply this surface, leaving
+		// the final outer reset intact so color cannot leak into the next row.
+		const background = typeof theme.getColorMode === "function" ? backgroundAnsi(bg, theme.getColorMode()) : undefined;
+		const content = background ? text.replaceAll("\x1b[49m", background)
+			.replace(/\x1b\[(?:0)?m/g, reset => reset + background) : text;
+		return theme.style(content, { bg, ...(surface === "conversation" ? { fg: "text" as const } : {}) });
 	}
 	return typeof theme.bg === "function" ? theme.bg(surface === "prompt" ? "userMessageBg" : "toolPendingBg", text) : text;
 }
 
-function renderPermissions(theme: Theme, controls: PermissionControl[], width: number, options: JarvisHeaderOptions): string {
-	const render = (control: PermissionControl, text: string) => {
-		const styled = theme.fg(control.enabled ? "success" : "muted", text);
-		return options.focused && options.focusTarget === control.target ? theme.bold(styled) : styled;
+function readableSurface(background: Color, foreground: Color): boolean {
+	const luminance = (color: Color) => {
+		const { r, g, b } = colorToRgb(color);
+		const linear = [r, g, b].map(channel => {
+			const value = channel / 255;
+			return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+		});
+		return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
 	};
+	const a = luminance(background), b = luminance(foreground);
+	return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05) >= 4.5;
+}
+
+function focusedControl(theme: Theme, text: string, fg: "accent" | "success"): string {
+	return typeof theme.style === "function"
+		? theme.style(text, { fg, bg: "selectedBg", bold: true })
+		: theme.bold(theme.fg(fg, text));
+}
+
+function renderPermissions(theme: Theme, controls: PermissionControl[], width: number, options: JarvisHeaderOptions): string {
+	const render = (control: PermissionControl, text: string) => options.focused && options.focusTarget === control.target
+		? focusedControl(theme, text, control.enabled ? "success" : "accent")
+		: theme.fg(control.enabled ? "success" : "muted", text);
 	const text = (control: PermissionControl, compact = false) => {
 		const value = `${control.label}${compact ? " " : ": "}${control.enabled ? "on" : "off"}`;
 		return options.focused && options.focusTarget === control.target ? `[${value}]` : value;

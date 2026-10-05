@@ -14,6 +14,7 @@ const bg = Object.fromEntries("selectedBg searchMatchBg userMessageBg customMess
 // background is saturated. This is demo artwork, not the user's live theme.
 bg.customMessageBg = "#3a3453";
 bg.userMessageBg = "#1e1b2d";
+bg.toolPendingBg = "#33383a"; // Deliberately gray: Jarvis borrows a softer message tint.
 const theme = new Theme(fg, bg, "truecolor", { name: "Jarvis demo", appearance: "dark" });
 const escape = (text) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
@@ -90,6 +91,7 @@ const view = {
 bridge.notify("Saved Jarvis thinking for this project. Effective thinking is medium.", "info");
 const overlay = new JarvisOverlayComponent({ terminal: { rows: 34, columns: 100 }, requestRender() {} }, theme, bridge, view, () => {});
 try {
+	overlay.focused = true;
 	writeFileSync("docs/assets/jarvis-overlay.svg", svg(overlay.render(88), "Jarvis compact overlay preview", "Actual Jarvis renderer with deterministic demo conversation and a custom dark palette. Not a live provider session.", 88));
 } finally { overlay.dispose(); }
 console.log("Generated docs/assets/jarvis-logo.svg and jarvis-overlay.svg (deterministic renderer fixtures).");

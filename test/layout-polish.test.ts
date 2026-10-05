@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { Theme } from "@earendil-works/pi-coding-agent";
 import { colorToRgb, mixColors, stripTerminalSequences, visibleWidth, type Color } from "@earendil-works/pi-tui";
 import { jarvisSurface, renderJarvisActivity, renderJarvisHeader, renderJarvisControls, type JarvisHeaderOptions } from "../overlay-layout.js";
-import type { JarvisOverlaySnapshot, JarvisOverlayView } from "../overlay.js";
+import { JarvisOverlayBridge, JarvisOverlayComponent, type JarvisOverlaySnapshot, type JarvisOverlayView } from "../overlay.js";
 
 const plainTheme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const collapsed: JarvisHeaderOptions = { expanded: false, focusTarget: "input", focused: true };
@@ -330,7 +330,10 @@ function publicPalette(name: "dark" | "light", mode: "truecolor" | "256color", p
 	const bgNames = new Set(["selectedBg", "searchMatchBg", "userMessageBg", "customMessageBg", "toolPendingBg", "toolSuccessBg", "toolErrorBg"]);
 	const foreground: Record<string, string | number> = {}, background: Record<string, string | number> = {};
 	for (const [token, value] of Object.entries(json.colors)) (bgNames.has(token) ? background : foreground)[token] = resolve(value as string | number);
-	if (purple) { background.customMessageBg = "#3a3453"; background.userMessageBg = "#1e1b2d"; }
+	if (purple) {
+		background.customMessageBg = "#3a3453"; background.userMessageBg = "#1e1b2d";
+		if (name === "dark") background.toolPendingBg = "#33383a";
+	}
 	return new Theme(foreground as ConstructorParameters<typeof Theme>[0], background as ConstructorParameters<typeof Theme>[1], mode, { appearance: name });
 }
 
@@ -347,9 +350,15 @@ function contrast(a: Color, b: Color): number {
 test("real public light/dark/purple-heavy palettes produce quiet readable surfaces in truecolor and 256 color", () => {
 	for (const appearance of ["light", "dark"] as const) for (const mode of ["truecolor", "256color"] as const) for (const purple of [false, true]) {
 		const palette = publicPalette(appearance, mode, purple);
-		const neutral = mixColors(palette.colors.toolPendingBg, palette.colors.text, appearance === "light" ? 0.02 : 0.035);
-		assert.ok(contrast(neutral, palette.colors.text) >= 4.5, `${appearance}: body contrast`);
+		const backgrounds: Color[] = [], style = palette.style.bind(palette);
+		palette.style = (text, options) => {
+			assert.equal(typeof options.bg, "object", "surface blends use public concrete colors");
+			backgrounds.push(options.bg as Color);
+			return style(text, options);
+		};
 		const surfaces = ["chrome", "conversation", "prompt"].map(surface => jarvisSurface(palette, "body 中文🙂   ", surface as "chrome" | "conversation" | "prompt"));
+		assert.equal(backgrounds.length, 3);
+		for (const background of backgrounds) assert.ok(contrast(background, palette.colors.text) >= 4.5, `${appearance}: actual surface contrast`);
 		assert.ok(surfaces.every(line => stripTerminalSequences(line) === "body 中文🙂   "));
 		assert.notEqual(surfaces[0], surfaces[1]); assert.notEqual(surfaces[1], surfaces[2]);
 		assert.notEqual(surfaces[0], palette.bg("customMessageBg", "body 中文🙂   "));
@@ -368,6 +377,79 @@ test("surface rendering reads live theme colors and minimal legacy themes use se
 	const legacy = { ...plainTheme, bg: (role: string, text: string) => { calls.push(role); return text; } } as Theme;
 	for (const surface of ["chrome", "conversation", "prompt"] as const) jarvisSurface(legacy, "body", surface);
 	assert.deepEqual(calls, ["toolPendingBg", "toolPendingBg", "userMessageBg"]);
+});
+
+test("gray tool surfaces borrow message color without changing text or washing out a light palette", () => {
+	for (const appearance of ["dark", "light"] as const) {
+		const palette = publicPalette(appearance, "truecolor", true);
+		let painted: Color | undefined;
+		const style = palette.style.bind(palette);
+		palette.style = (text, options) => { painted = options.bg as Color; return style(text, options); };
+		jarvisSurface(palette, "sample", "chrome");
+		const blended = mixColors(palette.colors.toolPendingBg, palette.colors.userMessageBg, 0.7, "srgb");
+		assert.deepEqual(painted, contrast(blended, palette.colors.text) >= 4.5 ? blended : palette.colors.toolPendingBg);
+		if (appearance === "dark") assert.notDeepEqual(painted, palette.colors.toolPendingBg, "do not retain the flat tool gray");
+		else assert.deepEqual(painted, palette.colors.toolPendingBg, "dark user-message background must not spoil light text contrast");
+	}
+});
+
+test("keyboard focus adds a visible themed chip without changing control labels or grant states", () => {
+	const palette = publicPalette("dark", "truecolor", true), view = fixture();
+	for (const focusTarget of ["tools", "followUp", "steer"] as const) {
+		const focused = renderJarvisHeader(palette, view, 100, { ...collapsed, focusTarget }).join("\n");
+		assert.ok(focused.includes(palette.getBgAnsi("selectedBg")));
+		for (const label of ["Repo tools: off", "Note main: off", "Redirect: off"]) assert.ok(stripTerminalSequences(focused).includes(label));
+	}
+	for (const focusTarget of ["model", "thinking", "history"] as const) {
+		assert.ok(renderJarvisControls(palette, view, 100, { ...collapsed, focusTarget }).includes(palette.getBgAnsi("selectedBg")));
+		assert.ok(!renderJarvisControls(palette, view, 100, { ...collapsed, focusTarget, focused: false }).includes(palette.getBgAnsi("selectedBg")));
+	}
+});
+
+test("complete focused control rows restore chrome after nested chips and leave the outer reset intact", () => {
+	function backgrounds(line: string) {
+		let bg = "default", offset = 0, text = "";
+		const cells: string[] = [];
+		const paint = (value: string) => { text += value; for (const _ of value) cells.push(bg); };
+		for (const match of line.matchAll(/\x1b\[([0-9;]*)m/g)) {
+			paint(line.slice(offset, match.index));
+			const codes = (match[1] || "0").split(";").map(Number);
+			for (let i = 0; i < codes.length; i++) {
+				const code = codes[i];
+				if (code === 0 || code === 49) bg = "default";
+				if (code === 38 || code === 48) {
+					const length = codes[i + 1] === 2 ? 4 : 2;
+					if (code === 48) bg = codes.slice(i, i + length + 1).join(";");
+					i += length;
+				}
+			}
+			offset = match.index! + match[0].length;
+		}
+		paint(line.slice(offset)); return { text, cells, final: bg };
+	}
+	for (const appearance of ["dark", "light"] as const) for (const mode of ["truecolor", "256color"] as const) {
+		const palette = publicPalette(appearance, mode, appearance === "dark");
+		const view = fixture({ isReady: () => true, isStreaming: () => false, getDisplayEntries: () => [] });
+		const overlay = new JarvisOverlayComponent({ terminal: { rows: 40, columns: 100 }, requestRender() {} } as any,
+			palette, new JarvisOverlayBridge(), view, () => {});
+		overlay.focused = true;
+		try {
+			const baseline = backgrounds(overlay.render(100).find(line => stripTerminalSequences(line).includes("Repo tools: off"))!);
+			const chrome = baseline.cells[baseline.text.indexOf("Repo tools")];
+			assert.notEqual(chrome, "default");
+			for (let step = 0; step < 6; step++) {
+				overlay.handleInput("\t");
+				const row = overlay.render(100).find(line => /\[(?:Repo tools|Note main|Redirect|F2 Model|F3 Thinking|History)/.test(stripTerminalSequences(line)))!;
+				assert.ok(row, "focused control must remain visible");
+				const painted = backgrounds(row), start = painted.text.indexOf("["), end = painted.text.indexOf("]");
+				assert.notEqual(painted.cells[start], chrome, "focused chip must have its own surface");
+				assert.ok(painted.cells.slice(end + 1, -2).every(bg => bg === chrome), "every later label and padding cell must retain chrome");
+				assert.equal(painted.final, "default", "surface must not leak past the rendered row");
+			}
+			const reset = backgrounds(jarvisSurface(palette, "before\x1b[0mafter", "chrome"));
+			assert.ok(reset.cells.every(bg => bg === chrome)); assert.equal(reset.final, "default");
+		} finally { overlay.dispose(); }
+	}
 });
 
 test("default controls summarize effective thinking, while diagnostics retain the public requested/scope label", () => {

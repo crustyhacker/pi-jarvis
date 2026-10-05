@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.11.3] - 2026-10-05
+
+### Presentation refinement
+- Soften flat tool-gray panels with a subtle blend from the active message palette, rejecting blends with insufficient body-text contrast. Preserve public theme/256-color rendering and minimal-theme fallbacks.
+- Highlight keyboard-focused controls without changing labels or access states; clarify the conversation title and add short, quiet speaker-heading rules without extra rows or source-offset changes.
+- Use rounded, focus-sensitive prompt borders and a stronger active prompt prefix. Refresh the deterministic renderer preview; no task, permission, model, scrolling, memory/archive or user-setting behavior changes.
+
 ## [1.11.2] - 2026-10-05
 
 ### Fixed

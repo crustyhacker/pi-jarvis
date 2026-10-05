@@ -42,6 +42,21 @@ function transcript(lines: string[]): string[] {
 	return text.slice(start + 1, end).filter(line => !line.includes("╰"));
 }
 
+test("short role hairlines stay on heading rows and leave message text and source anchors intact", () => {
+	const text = "Keep this **literal** body unchanged. 中文🙂";
+	const f = fixture(new JarvisOverlayBridge(), [{ kind: "assistant", text }]);
+	try {
+		const wide = plain(f.overlay.render(100));
+		assert.match(wide, /Jarvis:  ────────/);
+		assert.ok(wide.includes(text));
+		assert.equal(f.state.entries[0]!.text, text);
+		const narrow = plain(f.overlay.render(30));
+		assert.ok(!narrow.includes("Jarvis:  ────────"), "small reading columns omit decorative rules");
+		assert.equal(f.bridge.getDraft(), "");
+		assert.deepEqual(f.sent, []);
+	} finally { f.overlay.dispose(); }
+});
+
 test("multiline drafts survive close/reopen and presentation close does not revoke view-owned grants", () => {
 	const f = fixture();
 	f.overlay.handleInput("  first");
