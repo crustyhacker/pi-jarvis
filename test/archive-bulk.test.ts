@@ -791,3 +791,34 @@ test("an empty valid inventory has a confirmable zero-file report rather than im
 		assert.deepEqual(await allResults(f, result.reportId), []); assert.equal(fs.existsSync(f.service.store.path), false);
 	});
 });
+
+for (const revoke of ["cancel", "signal", "trust", "capture"] as const) {
+	test(`legacy bulk final-record ${revoke} at EOF keeps its receipt and stops remaining files`, async t => {
+		await fixture(async f => {
+			let trusted = true;
+			const abort = new AbortController(), ctx = { ...f.context(f.projectA, "bulk-owner", () => trusted), signal: abort.signal };
+			const path = transcript(f, "01-final.jsonl", [message("final", "receipteoffixture")]);
+			fs.writeFileSync(path, fs.readFileSync(path).subarray(0, fs.statSync(path).size - 1));
+			transcript(f, "02-next.jsonl", [message("next", "RECEIPT_MUST_NOT_RESUME")]);
+			const before = snapshot(path); await enable(f, ctx); const p = await preview(f, ctx);
+			assert.equal(p.samples[0]!.path, path);
+			const append = f.service.store.append.bind(f.service.store); let receipts = 0;
+			t.mock.method(f.service.store, "append", (input: ArchiveInput) => {
+				const result = append(input); receipts++;
+				if (input.entry.id === "final") {
+					if (revoke === "cancel") f.service.cancelImports();
+					else if (revoke === "signal") abort.abort();
+					else if (revoke === "trust") trusted = false;
+					else saveArchivePolicy(f.projectA, f.agentDir, "global", { capture: false });
+				}
+				return result;
+			});
+			const result = await confirm(f, p, ctx);
+			assert.equal(result.saved, 2); assert.ok(result.stopped); assert.equal(result.failed, 1); assert.equal(result.unprocessed, 1);
+			assert.equal(receipts, 2); restore(t); trusted = true;
+			const files = await allResults(f, result.reportId); assert.equal(files[0]!.saved, 2); assert.equal(files[0]!.status, "failed");
+			assert.equal(search(f, "receipteoffixture").length, 1); assert.equal(search(f, "RECEIPT_MUST_NOT_RESUME").length, 0);
+			assert.deepEqual(snapshot(path), before);
+		});
+	});
+}

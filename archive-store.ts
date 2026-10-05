@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import {
 	chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync,
-	opendirSync, realpathSync, type Stats,
+	opendirSync, realpathSync, fsyncSync, type Stats,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import type { DatabaseSync, SQLInputValue, StatementSync } from "node:sqlite";
+import type { SQLInputValue } from "node:sqlite";
+import type { ArchiveDatabase, ArchiveStatement } from "./archive-sqlite.js";
 import type { ArchiveInput, ArchivePage, ArchiveRead, ArchiveSearch, ArchiveSummary } from "./archive-types.js";
 
 // Importing/constructing the OFF store must not load SQLite (or its warning).
@@ -274,9 +275,10 @@ function regular(info: Stats): void {
 function same(a: Stats, b: Stats): boolean { return a.dev === b.dev && a.ino === b.ino; }
 function sqliteLocked(error: unknown): boolean {
 	const { code, errcode } = (error ?? {}) as { code?: unknown; errcode?: unknown };
+	if (typeof code === "string" && /^SQLITE_(?:BUSY|LOCKED)(?:_|$)/.test(code)) return true;
 	return code === "ERR_SQLITE_ERROR" && typeof errcode === "number" && Number.isInteger(errcode) && ((errcode & 0xff) === 5 || (errcode & 0xff) === 6);
 }
-function initializeWal(db: DatabaseSync): void {
+function initializeWal(db: ArchiveDatabase): void {
 	// The DELETE -> WAL upgrade can bypass native busy_timeout on Node 22.
 	// Retry only this idempotent startup pragma, never writes/uncertain commits.
 	const timeout = Number(db.prepare("PRAGMA busy_timeout").get()!.timeout);
@@ -284,7 +286,7 @@ function initializeWal(db: DatabaseSync): void {
 	const sleep = new Int32Array(new SharedArrayBuffer(4));
 	try {
 		db.exec("PRAGMA busy_timeout=0");
-		let statement: StatementSync | undefined;
+		let statement: ArchiveStatement | undefined;
 		for (;;) {
 			try {
 				statement ??= db.prepare("PRAGMA journal_mode=WAL");
@@ -301,44 +303,134 @@ function initializeWal(db: DatabaseSync): void {
 	} finally { db.exec(`PRAGMA busy_timeout=${timeout}`); }
 }
 
+/** Migration operations use this facade, including store initialization SQL. */
+function guardedDatabase(db: ArchiveDatabase, guard: () => void): ArchiveDatabase {
+	return {
+		exec(sql) {
+			// Revocation must not prevent transaction cleanup. Still observe the
+			// guard before rollback, but never retry or run a data action here.
+			if (sql === "ROLLBACK") { try { guard(); } catch {} }
+			else guard();
+			db.exec(sql);
+		},
+		prepare(sql) {
+			guard(); const statement = db.prepare(sql);
+			return {
+				run(...values) { guard(); return statement.run(...values); },
+				get(...values) { guard(); return statement.get(...values); },
+				all(...values) { guard(); return statement.all(...values); },
+			};
+		},
+		close() { db.close(); },
+	};
+}
+
+export interface ArchiveStoreOptions {
+	/** Code-owned vault layout; metadata and operation locking belong to the caller. */
+	managed?: boolean;
+	/** Live operation/revision guard; no automatic close/retry inside the guard. */
+	guard?: () => void;
+	/** A lowercase RFC 4122 version-4 UUID; requires managed=true. Omit for legacy source. */
+	storageId?: string;
+	/** Optional encrypted backend; the caller owns unlock/privacy/lifetime gates. */
+	databaseFactory?: (path: string, options: { create: boolean }) => ArchiveDatabase;
+}
+
 /** Local optional storage; policy/trust/cancellation are the service's gates.
  * Deletion is logical, not forensic erasure. Public SQLite opens by path: these
  * checks are not a sandbox against malicious concurrent same-user renames. */
 export class ArchiveStore {
 	readonly path: string;
 	private readonly agentDir: string;
-	private db?: DatabaseSync;
+	private readonly databaseFactory?: ArchiveStoreOptions["databaseFactory"];
+	private readonly managed: boolean;
+	private readonly guard?: () => void;
+	private readonly storageId?: string;
+	private db?: ArchiveDatabase;
 	private file?: Stats;
 	private root?: string;
 	private canonicalPath?: string;
 	private readonly directories = new Map<string, Stats>();
-	private readonly statements = new Map<string, StatementSync>();
+	private readonly rootCreationParents = new Map<string, Stats>();
+	private readonly statements = new Map<string, ArchiveStatement>();
 	// Instance-local private limits allow tiny budget fixtures; no public or
 	// service-controlled override of the production ceilings.
 	private readonly indexLimits: IndexLimits = { bytes: ARCHIVE_STORE_LIMITS.indexBytes, normalizationCharacters: ARCHIVE_STORE_LIMITS.normalizationCharacters };
 
-	constructor(agentDir: string) {
+	constructor(agentDir: string, options: ArchiveStoreOptions = {}) {
 		string(agentDir, "agent directory", 4096);
+		if (!options || typeof options !== "object" || (options.databaseFactory !== undefined && typeof options.databaseFactory !== "function")) failure("database factory");
+		if ((options.guard !== undefined && typeof options.guard !== "function") ||
+			(options.managed !== undefined && typeof options.managed !== "boolean") ||
+			(options.storageId !== undefined && (options.managed !== true || typeof options.storageId !== "string" ||
+				!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(options.storageId)))) failure("managed storage options");
+		this.databaseFactory = options.databaseFactory;
+		this.managed = options.managed === true;
+		this.guard = options.guard;
+		this.storageId = options.storageId;
 		this.agentDir = resolve(agentDir);
-		this.path = join(this.agentDir, "extensions", "pi-jarvis-archive", "archive.sqlite");
+		this.path = this.storagePath(this.agentDir);
 	}
 	private get databasePath(): string { return this.canonicalPath ?? this.path; }
+	private storagePath(root: string): string {
+		const archive = join(root, "extensions", "pi-jarvis-archive");
+		return this.storageId ? join(archive, "vaults", this.storageId, "archive.sqlite") : join(archive, "archive.sqlite");
+	}
+	private pinDirectory(directory: string, info: Stats): void {
+		const previous = this.directories.get(directory);
+		if (previous && !same(previous, info)) failure("replaced storage directory");
+		if (!info.isDirectory() || info.isSymbolicLink()) failure("storage directory");
+		owner(info);
+		this.directories.set(directory, info);
+	}
+	private checkManagedRoot(directory: string): void {
+		const handle = opendirSync(directory);
+		try {
+			for (let entry = handle.readSync(); entry; entry = handle.readSync()) {
+				if (![...AUXILIARIES, "archive.vault.json", "archive.vault.lock", "vaults"].includes(entry.name)) failure("storage entry");
+				const path = join(directory, entry.name), info = stat(path);
+				if (!info) failure("missing storage entry");
+				if (entry.name === "vaults") this.pinDirectory(path, info);
+				else regular(info);
+			}
+		} finally { handle.closeSync(); }
+		const legacy = stat(join(directory, "archive.sqlite"));
+		if (!legacy && AUXILIARIES.slice(1).some(name => stat(join(directory, name)))) failure("orphaned SQLite auxiliary file");
+		const vaults = join(directory, "vaults");
+		if (this.directories.has(vaults) && !stat(vaults)) failure("missing storage directory");
+	}
 
 	private checkDirectories(create: boolean): boolean {
 		// Resolve the user-selected root lazily; trusted root/ancestor aliases are
 		// supported, while the owned subtree must never contain links.
 		let root: string;
+		// Legacy aliases remain supported. Managed roots themselves must not be links.
+		const selectedRoot = this.managed ? stat(this.agentDir) : undefined;
+		if (selectedRoot && (!selectedRoot.isDirectory() || selectedRoot.isSymbolicLink())) failure("storage directory");
 		try { root = realpathSync(this.agentDir); } catch (error) {
 			if (!absent(error)) throw error;
 			if (this.root) failure("replaced agent root");
 			if (!create) return false;
-			mkdirSync(this.agentDir, { recursive: true, mode: 0o700 });
+			const firstCreated = mkdirSync(this.agentDir, { recursive: true, mode: 0o700 });
 			root = realpathSync(this.agentDir);
+			if (firstCreated) {
+				const boundary = dirname(realpathSync(firstCreated));
+				for (let directory = dirname(root);; directory = dirname(directory)) {
+					const info = lstatSync(directory);
+					if (!info.isDirectory() || info.isSymbolicLink()) failure("storage directory");
+					this.rootCreationParents.set(directory, info);
+					if (directory === boundary) break;
+					if (directory === dirname(directory)) failure("storage directory");
+				}
+			}
 		}
 		if (this.root && root !== this.root) failure("replaced agent root");
 		this.root = root;
-		this.canonicalPath = join(root, "extensions", "pi-jarvis-archive", "archive.sqlite");
-		for (const directory of [root, join(root, "extensions"), dirname(this.databasePath)]) {
+		this.canonicalPath = this.storagePath(root);
+		const archive = join(root, "extensions", "pi-jarvis-archive");
+		const directories = [root, join(root, "extensions"), archive];
+		if (this.storageId) directories.push(join(archive, "vaults"), dirname(this.databasePath));
+		for (const directory of directories) {
 			let info = stat(directory);
 			const previous = this.directories.get(directory);
 			if (previous && (!info || !same(previous, info))) failure(directory === root ? "replaced agent root" : "replaced storage directory");
@@ -347,10 +439,10 @@ export class ArchiveStore {
 				info = stat(directory);
 			}
 			if (!info) return false;
-			if (!info.isDirectory() || info.isSymbolicLink()) failure("storage directory");
-			owner(info);
-			this.directories.set(directory, info);
+			this.pinDirectory(directory, info);
+			if (this.managed && directory === archive) this.checkManagedRoot(archive);
 		}
+		if (this.managed && !this.storageId) return true;
 		const handle = opendirSync(dirname(this.databasePath));
 		try {
 			for (let entry = handle.readSync(); entry; entry = handle.readSync()) if (!AUXILIARIES.includes(entry.name)) failure("storage entry");
@@ -390,7 +482,7 @@ export class ArchiveStore {
 			if (stat(path)) this.privateFile(path);
 		}
 	}
-	private prepare(sql: string): StatementSync {
+	private prepare(sql: string): ArchiveStatement {
 		let statement = this.statements.get(sql);
 		if (!statement) {
 			statement = this.db!.prepare(sql);
@@ -399,13 +491,15 @@ export class ArchiveStore {
 		}
 		return statement;
 	}
-	private open(create: boolean): DatabaseSync {
+	private open(create: boolean, guard?: () => void): ArchiveDatabase {
+		this.guard?.(); guard?.();
 		if (this.db) {
 			try {
 				if (!this.checkDirectories(false)) failure("missing storage directory");
 				this.checkFiles();
-				if (this.prepare("PRAGMA user_version").get()?.user_version !== VERSION) failure("database version");
-				return this.db;
+				const db = guard ? guardedDatabase(this.db, guard) : this.db;
+				if (db.prepare("PRAGMA user_version").get()?.user_version !== VERSION) failure("database version");
+				return db;
 			} catch (error) { this.close(); throw error; }
 		}
 		if (!this.checkDirectories(create)) failure("missing storage directory");
@@ -425,9 +519,14 @@ export class ArchiveStore {
 		this.file = this.privateFile(this.databasePath)!;
 		this.tightenFiles();
 		try {
-			const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
-			this.db = new DatabaseSync(this.databasePath, { enableDoubleQuotedStringLiterals: false, allowExtension: false });
-			const db = this.db;
+			guard?.();
+			if (this.databaseFactory) this.db = this.databaseFactory(this.databasePath, { create });
+			else {
+				const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+				this.db = new DatabaseSync(this.databasePath, { enableDoubleQuotedStringLiterals: false, allowExtension: false });
+			}
+			if (this.guard) this.db = guardedDatabase(this.db, this.guard);
+			const db = guard ? guardedDatabase(this.db, guard) : this.db;
 			db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}; PRAGMA trusted_schema=OFF; PRAGMA temp_store=MEMORY`);
 			const deadline = performance.now() + BUSY_TIMEOUT_MS;
 			const sleep = new Int32Array(new SharedArrayBuffer(4));
@@ -447,7 +546,7 @@ export class ArchiveStore {
 							db.exec(`PRAGMA user_version=${VERSION}`);
 						} else if (!create && empty) pending = true;
 						else if (version !== VERSION) failure("database version");
-						if (!pending) this.validateSchema();
+						if (!pending) this.validateSchema(db);
 						db.exec(pending ? "ROLLBACK" : "COMMIT");
 					} catch (error) { try { db.exec("ROLLBACK"); } catch {} throw error; }
 					if (!pending) break;
@@ -471,14 +570,15 @@ export class ArchiveStore {
 			return db;
 		} catch (error) { this.close(); throw error; }
 	}
-	private existing(): DatabaseSync | undefined {
-		if (this.db) return this.open(false);
+	private existing(guard?: () => void): ArchiveDatabase | undefined {
+		this.guard?.(); guard?.();
+		if (this.db) return this.open(false, guard);
 		if (!this.checkDirectories(false)) return undefined;
 		this.checkFiles();
-		return stat(this.databasePath) ? this.open(false) : undefined;
+		return stat(this.databasePath) ? this.open(false, guard) : undefined;
 	}
-	private validateSchema(): void {
-		const schema = this.db!.prepare(`SELECT sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' LIMIT ${SCHEMA_LIMIT}`).all().map(row => schemaSql(String(row.sql))).sort();
+	private validateSchema(db = this.db!): void {
+		const schema = db.prepare(`SELECT sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' LIMIT ${SCHEMA_LIMIT}`).all().map(row => schemaSql(String(row.sql))).sort();
 		if (JSON.stringify(schema) !== JSON.stringify([...SCHEMA, ...SHADOW_SCHEMA].map(schemaSql).sort())) failure("database schema");
 		// Unlike bounded memory, this archive is unbounded. Never quick_check,
 		// iterate/JSON-parse every record, or FTS integrity-scan all bodies on
@@ -489,7 +589,11 @@ export class ArchiveStore {
 		const db = this.open(true);
 		db.exec("BEGIN IMMEDIATE");
 		try {
+			// A writer may have waited behind migration after its outer check.
+			// Recheck the durable revision/transition AFTER acquiring SQLite's lock.
+			this.guard?.();
 			const result = action();
+			this.guard?.();
 			db.exec("COMMIT");
 			this.checkFiles();
 			return result;
@@ -570,7 +674,7 @@ export class ArchiveStore {
 			try { entry = JSON.parse(content) as ArchiveInput["entry"]; } catch { return failure("raw record JSON"); }
 			validateInput({ project: record.project, sessionId: record.sessionId, lane: record.lane, entry });
 			if (entry.id !== record.entryId || entry.parentId !== record.parentId || entry.type !== record.type ||
-				entry.timestamp !== record.timestamp || role(entry) !== record.role || Buffer.byteLength(content) !== record.bytes || JSON.stringify(entry) !== content) failure("raw record data");
+				entry.timestamp !== record.timestamp || role(entry) !== record.role || Buffer.byteLength(content) !== record.bytes) failure("raw record data");
 		}
 		return { record, content, offset: start,
 			nextOffset: start + size < total ? start + size : null, totalCharacters: total, units: "unicode-codepoints" };
@@ -611,12 +715,78 @@ export class ArchiveStore {
 		if (!this.existing()) return 0;
 		return this.remove(`timestamp_ms<?${all ? "" : " AND project=?"}`, [milliseconds, ...(all ? [] : [currentProject])]);
 	}
+	/** @internal Migration-only path preflight; performs no SQLite open/creation. */
+	migrationLocation(guard: () => void): string {
+		this.guard?.(); guard(); this.checkDirectories(false); this.checkFiles(); guard();
+		return this.databasePath;
+	}
+	/** @internal Caller owns the coherent operation lock; not a general SQL API. */
+	migrationDatabase(create: boolean, guard: () => void): ArchiveDatabase | undefined {
+		return create ? this.open(true, guard) : this.existing(guard);
+	}
+	/** @internal Revalidate exact schema inside the migration's stable transaction. */
+	migrationValidateSchema(db: ArchiveDatabase): void {
+		if (db.prepare("PRAGMA user_version").get()?.user_version !== VERSION) failure("database version");
+		this.validateSchema(db);
+	}
+	/** @internal Validate provenance without parsing or renormalizing raw JSON. */
+	migrationValidateRecord(row: Record<string, unknown>): void {
+		summary(row);
+		if (!Number.isSafeInteger(row.record_rowid) || !Number.isSafeInteger(row.characters) ||
+			(row.characters as number) < 1 || (row.characters as number) > (row.bytes as number) ||
+			row.actual_bytes !== row.bytes || row.actual_characters !== row.characters ||
+			!Number.isSafeInteger(row.index_bytes) || (row.index_bytes as number) < 0 ||
+			(row.index_bytes as number) > ARCHIVE_STORE_LIMITS.indexBytes ||
+			row.raw_type !== "text" || row.index_type !== "text") failure("migration record");
+	}
+	/** @internal Rollback is cleanup, permitted even when the live guard revokes.
+	 * Invoke the guard before SQL, but do not let revocation prevent rollback. */
+	migrationRollback(guard: () => void): void {
+		try { guard(); } catch {}
+		this.db?.exec("ROLLBACK");
+	}
+	/** @internal Commit/checkpoint/close must already have succeeded. No live DB
+	 * descriptors may remain when fsync opens/closes FDs (POSIX lock hazard). */
+	migrationSync(guard: () => void): void {
+		guard();
+		if (this.db) failure("live migration target");
+		if (!this.checkDirectories(false)) failure("missing storage directory");
+		this.checkFiles();
+		const sync = (path: string, info: Stats, directory: boolean, owned = true) => {
+			guard();
+			const fd = openSync(path, constants.O_RDONLY | (directory ? constants.O_DIRECTORY ?? 0 : 0) | (constants.O_NOFOLLOW ?? 0));
+			try {
+				const opened = fstatSync(fd);
+				if (!same(info, opened)) failure("replaced storage entry");
+				if (directory) { if (!opened.isDirectory()) failure("storage directory"); if (owned) owner(opened); }
+				else regular(opened);
+				guard(); fsyncSync(fd);
+			} finally { closeSync(fd); }
+			const after = stat(path);
+			if (!after || !same(info, after)) failure("replaced storage entry");
+		};
+		for (const name of AUXILIARIES) {
+			const path = join(dirname(this.databasePath), name), info = stat(path);
+			if (info) sync(path, info, false);
+		}
+		for (const [path, info] of [...this.directories].reverse()) sync(path, info, true);
+		// Persist every recursively-created ancestor entry, not only the final
+		// agent root. Ancestors outside the owned root need not share its owner.
+		const parents = new Map(this.rootCreationParents), parent = dirname(this.root!);
+		if (!parents.has(parent)) parents.set(parent, lstatSync(parent));
+		for (const [path, info] of parents) sync(path, info, true, false);
+		guard();
+		if (!this.checkDirectories(false)) failure("missing storage directory");
+		this.checkFiles();
+	}
+
 	close(): void {
 		const db = this.db;
 		this.db = undefined;
 		this.statements.clear();
 		// Keep observed path/inode pins: even an explicit close is not consent to
 		// silently read a replacement database or retargeted root.
-		db?.close();
+		try { db?.close(); }
+		catch { throw Object.assign(new Error("Archive database cleanup failed; restart Pi before recovery."), { closeFailed: true }); }
 	}
 }

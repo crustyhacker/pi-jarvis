@@ -12,6 +12,7 @@ type PackageManifest = {
 	exports?: Record<string, unknown>;
 	pi?: { extensions?: string[] };
 	dependencies?: Record<string, string>;
+	optionalDependencies?: Record<string, string>;
 	devDependencies?: Record<string, string>;
 	peerDependencies?: Record<string, string>;
 	peerDependenciesMeta?: Record<string, { optional?: boolean }>;
@@ -53,7 +54,7 @@ function main(): void {
 	assert.equal(lock.version, manifest.version);
 	assert.equal(lock.lockfileVersion, 3);
 	assert.equal(lock.packages[""].version, manifest.version);
-	for (const key of ["devDependencies", "peerDependencies", "peerDependenciesMeta", "engines"] as const) {
+	for (const key of ["devDependencies", "optionalDependencies", "peerDependencies", "peerDependenciesMeta", "engines"] as const) {
 		assert.deepEqual(lock.packages[""][key], manifest[key], `lockfile root ${key} must match manifest`);
 	}
 	assert.ok(readFileSync("README.md", "utf8").includes(`<strong>Current version:</strong> ${manifest.version}`), "README version must match manifest");
@@ -67,6 +68,9 @@ function main(): void {
 	assert.deepEqual(Object.keys(manifest.peerDependencies ?? {}).sort(), hostPeers.slice().sort(), "only validated Pi host peers may be advertised");
 	assert.deepEqual(Object.keys(manifest.peerDependenciesMeta ?? {}).sort(), hostPeers.slice().sort());
 	assert.deepEqual(manifest.dependencies ?? {}, {}, "published extension must not install its host runtime");
+	assert.deepEqual(manifest.optionalDependencies, {
+		"@napi-rs/keyring": "2.1.0", "better-sqlite3-multiple-ciphers": "13.0.3",
+	}, "native encryption dependencies must remain exact-pinned and optional");
 	for (const peer of hostPeers) {
 		assert.equal(manifest.peerDependencies?.[peer], "*", "Pi package docs require wildcard host peers");
 		assert.equal(manifest.peerDependenciesMeta?.[peer]?.optional, true);
@@ -75,6 +79,7 @@ function main(): void {
 	}
 	for (const forbidden of ["pi-mcp-adapter", "@mariozechner/pi-ai", "@mariozechner/pi-coding-agent", "@mariozechner/pi-tui"]) {
 		assert.equal(manifest.dependencies?.[forbidden], undefined);
+		assert.equal(Object.hasOwn(manifest.optionalDependencies ?? {}, forbidden), false);
 		assert.equal(manifest.devDependencies?.[forbidden], undefined);
 		assert.equal(manifest.peerDependencies?.[forbidden], undefined);
 		assert.equal(lock.packages[`node_modules/${forbidden}`], undefined);
@@ -86,11 +91,13 @@ function main(): void {
 	assert.equal(packed.name, manifest.name);
 	assert.equal(packed.version, manifest.version);
 	const packedPaths = new Set((packed.files ?? []).map((entry) => normalizeManifestEntry(entry.path)));
-	for (const path of ["package.json", "README.md", "AGENTS.md", "LICENSE", ...[
+	for (const path of ["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md", ...[
 		"index", "jarvis-config", "main-context", "main-session-state", "model-picker", "overlay", "session-ref", "side-session",
 		"draft-editor", "overlay-layout", "transcript-viewport", "native-mcp", "jarvis-branding",
 		"memory-types", "memory-config", "memory-content", "memory-store", "memory-service", "memory-extension",
 		"archive-types", "archive-config", "archive-store", "archive-service", "archive-extension", "archive-import",
+		"archive-crypto", "archive-keychain", "archive-secret-input", "archive-unlock", "archive-sqlite",
+		"archive-migration", "archive-vault-files", "archive-vault",
 	].flatMap((name) => [`dist/${name}.js`, `dist/${name}.d.ts`])]) {
 		assert.ok(existsSync(join(process.cwd(), path)), `missing built/release artifact: ${path}`);
 		assert.ok(packedPaths.has(path), `missing expected packaged path: ${path}`);
@@ -102,7 +109,7 @@ function main(): void {
 	for (const path of packedPaths) {
 		assert.ok(!/(^|\/)(test|tmp|prompts|coord|node_modules|\.pi|\.git)\//.test(path), `forbidden payload path: ${path}`);
 		assert.ok(!path.endsWith(".tgz"), `archive must not be repacked: ${path}`);
-		assert.ok(path.startsWith("dist/") || ["package.json", "README.md", "AGENTS.md", "LICENSE"].includes(path), `unexpected source artifact: ${path}`);
+		assert.ok(path.startsWith("dist/") || ["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md"].includes(path), `unexpected source artifact: ${path}`);
 		assert.ok(!path.startsWith("dist/mcp-policy."), `stale removed artifact: ${path}`);
 	}
 	console.log("release verification passed");

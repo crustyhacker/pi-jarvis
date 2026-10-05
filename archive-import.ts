@@ -120,17 +120,22 @@ export interface TranscriptImportResult extends ImportCounts {
 	changed?: boolean;
 	cleanupFailed?: boolean;
 }
+export type ImportAppendOutcome = "saved" | "duplicate" | "deleted";
 interface TranscriptImportOptions {
 	check: () => void;
-	append: (input: ArchiveInput) => "saved" | "duplicate" | "deleted";
+	/** Synchronous receipt only after Store.append returns, before outer vault
+	 * post-action guards/lock release. A later throw stops but keeps this count. */
+	append: (input: ArchiveInput, acknowledge: (outcome: ImportAppendOutcome) => void) => void;
 	project: (path: string) => string;
 	headerEntry: (header: { timestamp?: unknown }) => ArchiveInput["entry"];
 	candidate?: ImportCandidate;
 }
 // Only known entry-validation/conflict/size errors may continue to another file.
 // Unknown backend failures (including SQLite/path ownership errors) stop a batch.
-function appendFailure(error: unknown): ArchiveImportFailure {
-	const message = error instanceof Error ? error.message : "";
+function appendFailure(error: unknown, acknowledged: boolean): ArchiveImportFailure {
+	// Once acknowledged, any later failure is an outer guard/cleanup failure,
+	// not an entry rejection that could permit the batch to continue.
+	const message = !acknowledged && error instanceof Error ? error.message : "";
 	if (/^Invalid archive (?:input|project|session ID|lane|session entry|entry ID|entry type|parent ID|timestamp|role|JSON number|JSON value|JSON object|JSON serialization)$/.test(message) ||
 		message === "Archive entry identity has a conflicting serialized payload; not saved or replaced" ||
 		/^Archive (?:entry exceeds 64 MiB UTF-8|search index exceeds 64 MiB UTF-8 normalization\/index budget|search normalization context exceeds 64K UTF-16 budget); (?:not saved or truncated|entry not saved or truncated)$/.test(message)) {
@@ -173,10 +178,19 @@ export async function importArchiveTranscript(path: string, options: TranscriptI
 			await verifyDirectories(candidate.parent, check); check();
 		};
 		const save = (entry: ArchiveInput["entry"]) => {
-			let outcome: "saved" | "duplicate" | "deleted";
-			try { outcome = options.append({ project: header!.cwd, sessionId: header!.id, lane: "import", entry }); }
-			catch (error) { throw appendFailure(error); }
-			if (outcome === "saved") counts.saved++; else if (outcome === "duplicate") counts.duplicates++; else counts.deleted++;
+			let accepting = true, acknowledged = false;
+			try {
+				options.append({ project: header!.cwd, sessionId: header!.id, lane: "import", entry }, outcome => {
+					if (!accepting || acknowledged || !["saved", "duplicate", "deleted"].includes(outcome)) throw new Error("Invalid synchronous archive append receipt.");
+					acknowledged = true;
+					if (outcome === "saved") counts.saved++; else if (outcome === "duplicate") counts.duplicates++; else counts.deleted++;
+				});
+				if (!acknowledged) throw new Error("Archive append receipt missing.");
+			} catch (error) { throw appendFailure(error, acknowledged); }
+			finally { accepting = false; }
+			// Also stop on legacy/capture/import-owner revocation after an ack,
+			// including the last record with no following newline or append.
+			check();
 		};
 		const consume = (bytes: Buffer) => {
 			line++;

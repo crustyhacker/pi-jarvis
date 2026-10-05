@@ -1,10 +1,10 @@
 {
   "name": "pi-jarvis",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "engines": {
     "node": ">=22.19.0"
   },
-  "description": "A Pi side-conversation overlay with shared memory, an optional searchable session archive, and confirmed bulk history import.",
+  "description": "A Pi side-conversation overlay with shared memory, an optional searchable session archive, password encryption, and confirmed history import.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,6 +19,7 @@
     "dist",
     "README.md",
     "AGENTS.md",
+    "docs/archive-encryption-design.md",
     "LICENSE"
   ],
   "license": "MIT",
@@ -51,7 +52,7 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "check": "tsc --noEmit",
     "prepack": "npm run build",
-    "test": "npm run check && node --import tsx --test test/jarvis.test.ts test/config-regression.test.ts test/index-regression.test.ts test/main-context-regression.test.ts test/overlay-regression.test.ts test/side-runtime.test.ts test/editor-polish.test.ts test/layout-polish.test.ts test/scroll-polish.test.ts test/status-polish.test.ts test/ux-polish.test.ts test/native-mcp.test.ts test/release-automation.test.ts test/branding.test.ts test/memory-config.test.ts test/memory-content.test.ts test/memory-store.test.ts test/memory-integration.test.ts test/archive-config.test.ts test/archive-store.test.ts test/archive-extension.test.ts test/archive-integration.test.ts test/archive-bulk.test.ts",
+    "test": "npm run check && node --import tsx --test test/jarvis.test.ts test/config-regression.test.ts test/index-regression.test.ts test/main-context-regression.test.ts test/overlay-regression.test.ts test/side-runtime.test.ts test/editor-polish.test.ts test/layout-polish.test.ts test/scroll-polish.test.ts test/status-polish.test.ts test/ux-polish.test.ts test/native-mcp.test.ts test/release-automation.test.ts test/branding.test.ts test/memory-config.test.ts test/memory-content.test.ts test/memory-store.test.ts test/memory-integration.test.ts test/archive-config.test.ts test/archive-store.test.ts test/archive-extension.test.ts test/archive-integration.test.ts test/archive-bulk.test.ts test/archive-crypto.test.ts test/archive-keychain.test.ts test/archive-secret-input.test.ts test/archive-unlock.test.ts test/archive-sqlite.test.ts test/archive-encrypted-store.test.ts test/archive-encryption-foundation.test.ts test/archive-migration.test.ts test/archive-vault-files.test.ts test/archive-vault.test.ts test/archive-vault-integration.test.ts test/archive-vault-index.test.ts",
     "verify:release": "node --import tsx test/release-verification.test.ts",
     "check:tags": "node scripts/check-tags.mjs",
     "render:branding": "npm run build && node scripts/render-branding.mjs"
@@ -79,5 +80,9 @@
     "@types/node": "^24.5.2",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
+  },
+  "optionalDependencies": {
+    "@napi-rs/keyring": "2.1.0",
+    "better-sqlite3-multiple-ciphers": "13.0.3"
   }
 }

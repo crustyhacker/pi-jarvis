@@ -829,3 +829,28 @@ test("resuming an old real side journal does not import it; only explicit import
 		});
 	});
 });
+
+for (const outcome of ["saved", "duplicate", "deleted"] as const) {
+	test(`legacy single import preserves acknowledged ${outcome} counts and stops on final-record cancellation at EOF`, async t => {
+		await fixture(async f => {
+			const ctx = f.context(); await enable(f, ctx);
+			const path = transcript(f, "receipt-eof", [entry("final", user("receipteoffixture"))]);
+			writeFileSync(path, readFileSync(path).subarray(0, statSync(path).size - 1));
+			if (outcome !== "saved") await f.service.command(`import --confirm-sensitive ${path}`, ctx);
+			if (outcome === "deleted") await f.service.command("prune --confirm 2027-01-01T00:00:00Z", ctx);
+			const before = readFileSync(path), append = f.service.store.append.bind(f.service.store); let receipts = 0;
+			t.mock.method(f.service.store, "append", (input: ArchiveInput) => {
+				const result = append(input); receipts++;
+				if (input.entry.id === "final") { assert.equal(result, outcome); f.service.cancelImports(); }
+				return result;
+			});
+			await assert.rejects(f.service.command(`import --confirm-sensitive ${path}`, ctx), error => {
+				safePartial(outcome === "saved" ? 2 : 0)(error);
+				assert.match((error as Error).message, new RegExp(`${outcome === "duplicate" ? 2 : 0} duplicates, ${outcome === "deleted" ? 2 : 0} deleted identities skipped`));
+				return true;
+			});
+			assert.equal(receipts, 2, "no automatic replay after final receipt");
+			assert.deepEqual(readFileSync(path), before);
+		});
+	});
+}

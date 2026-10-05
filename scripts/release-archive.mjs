@@ -38,7 +38,7 @@ export function archiveFiles(bytes) {
 export function validateArchive(bytes, { name, version }) {
 	const files = archiveFiles(bytes);
 	for (const path of files.keys()) {
-		if (!path.startsWith("dist/") && !["package.json", "README.md", "AGENTS.md", "LICENSE"].includes(path)) throw new Error(`Forbidden packaged path: ${path}`);
+		if (!path.startsWith("dist/") && !["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md"].includes(path)) throw new Error(`Forbidden packaged path: ${path}`);
 		if (/(^|\/)(test|tmp|prompts|coord|node_modules|\.pi|\.git)\//.test(path) || path.endsWith(".tgz") || path.startsWith("dist/mcp-policy.")) throw new Error(`Forbidden packaged path: ${path}`);
 	}
 	for (const path of ["package.json", "README.md", "AGENTS.md", "LICENSE", "dist/index.js", "dist/index.d.ts"]) {

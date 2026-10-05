@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.10.0] - 2026-10-05
+
+### Added
+- Optional password encryption for the full-session archive's active SQLite database, FTS index and journal/WAL content. Encryption is OFF by default and agent-wide, independent of recording, model access, shared memory and Repo tools; no existing archive or setting is automatically migrated or changed.
+- Human-only local encryption status/on/off, unlock/lock, password rewrap, startup policy, verified generation migration, explicit rollback recovery, retired-source cleanup and abandoned-lock controls. Migration/recovery/cleanup require `--confirm-sensitive --confirm-stopped`; rollback also requires `--rollback`. Sources are retained until explicit cleanup, with at most eight retired generations.
+- Main-session, process, fixed-duration, idle and explicitly OS-backed remembered unlock choices. Main Pi and Jarvis share a main-owned lease; supported main new/resume/fork handoffs preserve non-session grants and original timed deadlines. Startup defaults to manual; prompt/remember are explicit main-lifecycle choices.
+- Private masked password entry only in Pi regular TUI (`pi --tui-mode regular`), with fresh typed verification for every submit/cancel, including typed-only input. Immediate backend cancellation retains a private cancel-only sink until verified exit; coordinated Jarvis/model-picker/main-memory-review admission prevents overlapping ordinary dialogs.
+
+### Fixed
+- Full-page archive reads accept valid noncanonical JSON without rewriting its original spelling; migration preserves exact raw/index/provenance data.
+- Import partial counts retain acknowledged append outcomes when a later permission check or lock release fails, while uncertain commits remain uncounted and remaining work stops without replay.
+- Preserve final side/main archive snapshots before ownership invalidation. Encryption guards preserve native SQLite locks, revoke on throwing/mid-operation trust denial, and recheck expiry after idle activity handling.
+
+### Safety and limitations
+- Plaintext remains the archive default; shared memory remains plaintext and unchanged. Encryption does not protect original Pi transcripts, attachments/exports, retained plaintext sources, outside backups or already-retrieved/provider-sent context. Password change rewraps the same random data key, not key rotation. Public/private-key unlocking remains deferred.
+- Safe setup guidance reviews effective global/project controls and pauses CAPTURE before enabling/migrating when avoiding new plaintext archive captures. Archive administration requires enabled/trusted policy, not capture/model access; verify unlock/storage/cleanup before explicitly resuming capture. Global capture-off does not defeat project overrides. No automatic user-control or renderer changes.
+- Locked/transition/invalid/unsafe vaults block reads, capture, imports and ordinary deletion without plaintext fallback or history backfill. Timed/idle grants cannot convert to plaintext; explicitly unlock session/process first. Missing known sources require manual inspection/restoration and preservation of possible target copies. Cleanup rechecks authorization between auxiliary/main deletions and may leave partial retained backups.
+- Uncertain native cleanup, publication or lock release requires an actual Pi process restart before further access/recovery; logical reload/quit and new facades do not clear that safety block. Publication may already have succeeded; no automatic repair or replay of uncertain operations. Durable revisions are observed across processes at operation boundaries, not instant key erasure.
+- Forced host reload/quit or trusted external focus replacement cannot preserve password-input quarantine; use verified cancellation. Trusted same-user code, swap/core dumps and post-verified-release/teardown input are outside this boundary. No independently audited cryptography, official/vendor-audited SQLCipher, FIPS, sandbox or forensic-erasure claim.
+- Exact optional native backends are lazy loaded and fail closed when missing/incompatible. Linux glibc prebuilds require glibc >=2.35; local runtime validation is Linux-only. Remembered unlock requires an authorized OS credential service (Linux explicitly Secret Service, no kernel-keyring downgrade); real OS credential integration and other platforms are not certified by the local synthetic validation. No runtime install-script/build/download fallback.
+
 ## [1.9.1] - 2026-10-04
 
 ### Fixed
@@ -38,7 +59,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Promote both complementary memory features in the README: default-on shared memory and the separate, disabled-by-default full-session archive, with a side-by-side comparison of controls, retrieval and privacy.
 
 ### Safety and limitations
-- Raw archive storage is unredacted plaintext and can retain credentials/private data; model reads can send it to the active provider. Off blocks record reads/writes while retaining data; trust/config failures pause access.
+- Raw archive storage defaults to unredacted plaintext and can retain credentials/private data (optional archive-only encryption is added in 1.10.0); model reads can send it to the active provider. Off blocks record reads/writes while retaining data; trust/config failures pause access.
 - Capture uses finalized journal snapshots after message-redaction hooks. It is not a crash-safe event/wire log: hidden/unpersisted content, earlier truncation, disabled periods and late shutdown writes cannot be recovered automatically. Oversized raw/index data beyond 64 MiB and pathological normalization contexts beyond 64K UTF-16 units are rejected explicitly, never silently shortened. Conflicting payloads for an existing identity fail without overwriting history.
 - Bounds apply to search/read output, not accepted persisted payloads. Storage grows until explicit cleanup or filesystem limits; large writes/indexing can pause the UI. Deletion does not erase transcripts, result copies, backups or already-sent context, and is not forensic erasure.
 

@@ -7,7 +7,7 @@ export interface MemoryExtensionOptions {
 	lifetimeSignal?: AbortSignal;
 	isProjectTrusted?: () => boolean;
 	onToolsChanged?: () => void;
-	confirmForget?: (review: string, signal?: AbortSignal) => Promise<boolean>;
+	confirmForget?: (review: string, signal: AbortSignal | undefined, ctx: ExtensionContext) => Promise<boolean>;
 }
 
 export function stripMemoryPrompt(prompt: string): string {
@@ -112,7 +112,7 @@ export function createMemoryExtensionFactory(service: SharedMemoryService, lane:
 					confirmations.add(pending);
 					const combined = AbortSignal.any([pending.signal, ...(signal ? [signal] : []), ...(ctx.signal ? [ctx.signal] : []), ...(options.lifetimeSignal ? [options.lifetimeSignal] : [])]);
 					try {
-						const answer = options.confirmForget ? options.confirmForget(review, combined) :
+						const answer = options.confirmForget ? options.confirmForget(review, combined, ctx) :
 							ctx.hasUI ? ctx.ui.confirm("Forget this shared memory?", review, { signal: combined }) : Promise.resolve(false);
 						const confirmed = await cancellableConfirmation(answer, combined);
 						check("jarvis_memory_forget", ctx, combined);

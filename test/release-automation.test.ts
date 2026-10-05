@@ -303,6 +303,22 @@ test("prepare CLI packs actual validated bytes, skips scripts, and preserves exi
 	assert.deepEqual(readFileSync(join(out, bundle.filename)), bytes);
 });
 
+test("release payload permits only the named archive security document, not arbitrary docs", async (t) => {
+	for (const name of ["archive-encryption-design.md", "private-notes.md"]) await t.test(name, t => {
+		const r = repo(t), path = `docs/${name}`;
+		const pkg = JSON.parse(readFileSync(join(r.cwd, "package.json"), "utf8"));
+		pkg.files.push(path);
+		writeFileSync(join(r.cwd, "package.json"), JSON.stringify(pkg));
+		mkdirSync(join(r.cwd, "docs"));
+		writeFileSync(join(r.cwd, path), "synthetic release boundary documentation\n");
+		annotate(r.cwd, commit(r.cwd), "v1.5.0");
+		const out = join(r.root, "bundle");
+		const result = cli(r.cwd, "prepare-release.mjs", ["--baseline", r.baseline, "--tag", "v1.5.0", "--out-dir", out]);
+		if (name === "archive-encryption-design.md") ok(result);
+		else { fails(result, /Forbidden packaged path/); assert.equal(existsSync(out), false); }
+	});
+});
+
 test("prepare rejects dirty tracked state and forbidden actual payloads", async (t) => {
 	await t.test("dirty checkout", (t) => {
 		const r = releaseFixture(t);

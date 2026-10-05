@@ -29,6 +29,7 @@ import { SharedMemoryService } from "./memory-service.js";
 import { createMemoryExtensionFactory } from "./memory-extension.js";
 import { SharedArchiveService } from "./archive-service.js";
 import { createArchiveExtensionFactory } from "./archive-extension.js";
+import { abandonArchiveSecretPrompt, isArchiveSecretPromptActive, revokeArchiveSecretPrompt } from "./archive-secret-input.js";
 
 type JarvisModelSelection =
 	| { mode: "follow-main" }
@@ -74,6 +75,7 @@ type MainState = {
 	bridge: JarvisOverlayBridge;
 	memory: SharedMemoryService;
 	archive: SharedArchiveService;
+	mainArchiveSnapshot?: () => void;
 	mainSession: MainSessionTracker;
 	mainContext: MainSessionContextPayload;
 	lastJarvisSeenMainContext?: MainSessionContextPayload;
@@ -84,6 +86,8 @@ type MainState = {
 	flushPromise?: Promise<void>;
 	closeOverlay?: () => void;
 	overlayOpen?: boolean;
+	modelPickerOpen?: boolean;
+	memoryReviewOpen?: boolean;
 	queuedMessages: string[];
 	model?: Model<any>;
 	jarvisModelSelection: JarvisModelSelection;
@@ -117,7 +121,16 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	const state: MainState = {
 		bridge: new JarvisOverlayBridge(),
 		memory: new SharedMemoryService(getAgentDir()),
-		archive: new SharedArchiveService(getAgentDir()),
+		archive: new SharedArchiveService(getAgentDir(), {
+			beforeSecretPrompt: async () => {
+				if (state.modelPickerOpen || state.memoryReviewOpen) {
+					throw new Error("Finish the current Jarvis picker or memory review before entering an archive password.");
+				}
+				// Use a private editor-area component, never a nested custom overlay.
+				state.closeOverlay?.();
+				await Promise.resolve();
+			},
+		}),
 		mainSession,
 		mainContext: buildMainSessionContext(mainSession.snapshot()),
 		lastJarvisSeenMainContext: undefined,
@@ -141,6 +154,10 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/jarvis requires Pi's interactive terminal UI.", "warning");
+				return;
+			}
+			if (isArchiveSecretPromptActive()) {
+				ctx.ui.notify("Finish the private archive password/exit verification before opening Jarvis.", "warning");
 				return;
 			}
 			const archiveRequest = parseArchiveCommand(args);
@@ -247,11 +264,18 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify("No /jarvis models are currently available from the main model registry.", "warning");
 					return undefined;
 				}
-				return ctx.ui.custom<Model<any> | undefined>(
-					(tui, theme, keybindings, done) => new JarvisModelPicker(
-						tui, theme, keybindings, models, (model) => done(model), () => done(undefined), initialSearchInput,
-					),
-				);
+				if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen) {
+					ctx.ui.notify("Finish the current private archive prompt or Jarvis dialog before opening the model picker.", "warning");
+					return undefined;
+				}
+				state.modelPickerOpen = true;
+				try {
+					return await ctx.ui.custom<Model<any> | undefined>(
+						(tui, theme, keybindings, done) => new JarvisModelPicker(
+							tui, theme, keybindings, models, (model) => done(model), () => done(undefined), initialSearchInput,
+						),
+					);
+				} finally { state.modelPickerOpen = false; }
 			};
 
 			const rollbackSelection = async (
@@ -507,15 +531,26 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => { dispatchMemoryCommand(state, args, ctx, false); },
 	});
 
-	pi.on("session_before_switch", () => { state.runtime?.flushArchive?.(); state.archive.cancelImports(); });
-	pi.on("session_before_fork", () => { state.runtime?.flushArchive?.(); state.archive.cancelImports(); });
-	pi.on("session_before_tree", () => { state.runtime?.flushArchive?.(); state.archive.cancelImports(); });
+	const beforeMainNavigation = (_event: unknown, ctx: ExtensionContext) => {
+		if (isArchiveSecretPromptActive()) {
+			// Permission/work cancellation must not restore an editor into a paste
+			// tail. Keep the private cancellation sink and reject this transition.
+			revokeArchiveSecretPrompt();
+			ctx.ui.notify("Archive password entry cancelled. Complete its private exit verification, then retry session navigation.", "warning");
+			return { cancel: true as const };
+		}
+		state.runtime?.flushArchive?.();
+		state.archive.cancelImports();
+	};
+	pi.on("session_before_switch", beforeMainNavigation);
+	pi.on("session_before_fork", beforeMainNavigation);
+	pi.on("session_before_tree", beforeMainNavigation);
 	pi.on("session_start", async (_event, ctx) => {
 		state.runtime?.flushArchive?.();
 		state.archive.cancelImports();
 		state.closeOverlay?.();
-		state.bootGeneration += 1;
-		state.runtime?.dispose();
+		try { state.runtime?.dispose(); }
+		finally { state.bootGeneration += 1; }
 		state.runtime = undefined;
 		state.bootPromise = undefined;
 		state.flushPromise = undefined;
@@ -557,6 +592,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			);
 		}
 		state.bridge.reset();
+		await state.archive.start(ctx);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
@@ -583,8 +619,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			state.archive.cancelImports();
 			state.runtime?.flushArchive?.();
 			state.closeOverlay?.();
-			state.bootGeneration += 1;
-			state.runtime?.dispose();
+			try { state.runtime?.dispose(); }
+			finally { state.bootGeneration += 1; }
 			state.runtime = undefined;
 			state.bootPromise = undefined;
 			state.flushPromise = undefined;
@@ -658,10 +694,18 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		// Forced reload/exit may already have replaced/stopped host UI. Wipe and
+		// revoke without a stale done() restoring an editor; no tail quarantine
+		// across host-forced replacement/process exit is claimed.
+		abandonArchiveSecretPrompt();
 		state.runtime?.flushArchive?.();
+		state.mainArchiveSnapshot?.();
 		state.closeOverlay?.();
-		state.bootGeneration += 1;
-		state.runtime?.dispose();
+		// Dispose performs a final side snapshot too. Its lifetime must end
+		// before the supplemental boot guard changes, or a retiring side lane
+		// would revoke the shared process lease as apparent trust loss.
+		try { state.runtime?.dispose(); }
+		finally { state.bootGeneration += 1; }
 		state.runtime = undefined;
 		state.bootPromise = undefined;
 		state.flushPromise = undefined;
@@ -683,10 +727,20 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		state.bridge.reset();
 	});
 
-	createMemoryExtensionFactory(state.memory, "main")(pi);
-	createArchiveExtensionFactory(state.archive, "main")(pi);
+	createMemoryExtensionFactory(state.memory, "main", {
+		confirmForget: async (review, signal, ctx) => {
+			// A background main turn must not replace the private password sink.
+			if (!ctx.hasUI || signal?.aborted || isArchiveSecretPromptActive() || state.memoryReviewOpen || state.modelPickerOpen) return false;
+			state.memoryReviewOpen = true;
+			try { return await ctx.ui.confirm("Forget this shared memory?", review, { signal }); }
+			finally { state.memoryReviewOpen = false; }
+		},
+	})(pi);
+	createArchiveExtensionFactory(state.archive, "main", {
+		registerFinalSnapshot: snapshot => { state.mainArchiveSnapshot = snapshot; },
+	})(pi);
 	// Close shared storage only after the archive lane's final snapshot/disposal.
-	pi.on("session_shutdown", () => { state.archive.close(); });
+	pi.on("session_shutdown", (event) => { state.archive.close(event.reason); });
 }
 
 function updateContextState(pi: ExtensionAPI, state: MainState, ctx: ExtensionContext): void {
@@ -1102,8 +1156,9 @@ async function executeJarvisSideCommand(
 
 	state.archive.cancelImports();
 	state.runtime?.flushArchive?.();
-	const generation = ++state.bootGeneration;
-	state.runtime?.dispose();
+	let generation: number;
+	try { state.runtime?.dispose(); }
+	finally { generation = ++state.bootGeneration; }
 	state.runtime = undefined;
 	state.bootPromise = undefined;
 	state.lastJarvisSeenMainContext = undefined;

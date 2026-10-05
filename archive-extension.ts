@@ -51,7 +51,10 @@ export function createArchiveExtensionFactory(
 		let pendingChange = false;
 		const warnings = new Set<string>();
 		const live = () => active && !disposed && !options.lifetimeSignal?.aborted;
-		const trusted = (ctx: ExtensionContext) => ctx.isProjectTrusted() && (options.isProjectTrusted?.() ?? true);
+		const trusted = (ctx: ExtensionContext) => {
+			try { return ctx.isProjectTrusted() && (options.isProjectTrusted?.() ?? true); }
+			catch { return false; }
+		};
 		// Preserve Pi's live accessors; copying a context would snapshot its signal.
 		const context = (ctx: ExtensionContext): ExtensionContext => Object.create(ctx, {
 			isProjectTrusted: { value: () => trusted(ctx) },
@@ -167,7 +170,12 @@ export function createArchiveExtensionFactory(
 				}
 				lastContext = ctx;
 				let policy: ArchivePolicy;
-				try { policy = trusted(ctx) ? service.policy(context(ctx)) : OFF; }
+				try {
+					// Even a denied trust observation must reach the shared owner so it
+					// revokes keys/pending async grants, not merely this lane's tools.
+					policy = service.policy(context(ctx));
+					if (!trusted(ctx)) policy = OFF;
+				}
 				catch {
 					policy = OFF;
 					warn(ctx, "policy", "Session archive is paused because its live policy could not be checked safely.");

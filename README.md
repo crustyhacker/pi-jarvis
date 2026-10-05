@@ -6,11 +6,11 @@
 
 ## A cinematic side-conversation overlay for Pi
 
-**A second lane of thought—with shared memory and an optional searchable history archive.**
+**A second lane of thought—with shared memory, searchable history, and optional archive encryption.**
 
 `pi-jarvis` adds `/jarvis`: a polished overlay where you can ask for status, inspect the repo when you explicitly allow it, and send a quiet note or a confirmed redirect back to the main lane.
 
-**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects. **New in the 1.9 series: bulk-import existing Pi sessions with a preview and explicit confirmation.**
+**Remember what matters. Find the original history when you need it.** Main Pi and Jarvis share [persistent memory](#shared-memory); the separate, opt-in [full-session archive](#full-session-archive) adds indexed history search across sessions and, when explicitly requested, projects. **New in 1.10.0: optional password encryption for the archive database and index.** Plaintext remains the default; bulk history import still requires a preview and explicit confirmation.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -18,11 +18,12 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.9.1</p>
+<p><strong>Current version:</strong> 1.10.0</p>
 
 <p>
   <strong>Shared persistent memory</strong> ·
   <strong>Optional indexed session archive</strong> ·
+  <strong>Optional password encryption</strong> ·
   <strong>Confirmed bulk history import</strong> ·
   <strong>Persistent side session</strong> ·
   <strong>Live main-session awareness</strong> ·
@@ -86,11 +87,12 @@ The main Pi session should stay on the critical path.
 | **What it keeps** | Curated notes plus bounded finalized user/assistant text captures | Complete accepted finalized Pi journal entries, with provenance and paged raw reads |
 | **Default** | **On in trusted projects**, with separate capture/recall controls | **Off**; recording and model access are separately controlled |
 | **Retrieval** | Automatic recall from global/current-project memory; explicit broader search | Local indexed search and session browsing; no automatic context injection |
+| **Storage** | Local plaintext SQLite | Plaintext by default; optional password encryption for the archive database, index and SQLite journals |
 | **Manage it** | `/jarvis-memory` · overlay `/memory` | `/jarvis-archive` · overlay `/archive` |
 
 Both work across main Pi and Jarvis, independently of **Repo tools** and whether the overlay is open. Each has its own local SQLite store and global/project controls. Turning one off does not turn the other off.
 
-**Privacy matters:** storage is local plaintext. Archive content is unredacted and can include secrets; granting model access can send retrieved content to your model provider. “Full” means accepted finalized data exposed by Pi—not hidden provider reasoning or a crash-safe audit log. Historical import is explicit. See the [memory controls](#shared-memory) and [archive limits](#full-session-archive) before enabling more access.
+**Privacy matters:** shared memory remains local plaintext. The archive also defaults to plaintext, with separate, [optional password encryption](#optional-archive-encryption). Archive content is unredacted and can include secrets; encryption does not prevent authorized model reads from sending retrieved content to your provider. It does not protect original Pi transcripts, shared memory or retained plaintext backups. “Full” means accepted finalized data exposed by Pi—not hidden provider reasoning or a crash-safe audit log. Historical import is explicit. Review the [memory controls](#shared-memory), [archive limits](#full-session-archive) and encryption boundary before enabling more access.
 
 ---
 
@@ -100,6 +102,7 @@ Both work across main Pi and Jarvis, independently of **Repo tools** and whether
 |---|---|
 | **Shared memory** | Main Pi and Jarvis remember useful discussions across sessions; enabled by default, with global/project controls and a master off switch |
 | **Optional full-session archive** | Off by default; raw finalized entries, local indexed cross-session search, separate model permission, and preview-confirmed bulk history import |
+| **Optional archive encryption** | Off by default; password-protected database/index/journals, explicit migration and cleanup, and selectable unlock lifetimes |
 | **Persistent side lane** | `/jarvis` keeps its own isolated conversation state and restores prior side-session history |
 | **Live awareness** | Jarvis sees the current main-session summary plus a delta since the last `/jarvis` turn |
 | **Permission-gated tools** | Local `read`, `bash`, `edit`, `write`, and configured native MCP stay off until you enable Repo tools |
@@ -179,7 +182,7 @@ Requires **Pi 1.0.0** and **Node.js 22.19.0 or newer**. Version **1.6.0** suppor
 `pi install` registers the package automatically. For local development, build and load `./dist/index.js` with `pi -e ./dist/index.js`.
 **New in 1.7.0: shared memory is enabled by default in trusted projects**, including main Pi even if you never open the overlay. A first-use notice explains capture and recall. Already using another memory extension? Run `/jarvis-memory off` before your first prompt; this disables both main and Jarvis memory without deleting anything.
 
-**New in 1.8.0: the separate full-session archive is OFF by default.** Nothing is imported or recorded by that subsystem until you opt in. See [Full-session archive](#full-session-archive).
+**The separate full-session archive is OFF by default.** Nothing is imported or recorded by that subsystem until you opt in. **Version 1.10.0 adds optional password encryption, also OFF by default**; installation does not encrypt an existing archive or change your recording/model/memory settings. If you want to avoid new plaintext archive captures during setup, pause effective **capture before enabling or migrating**. See [Full-session archive](#full-session-archive) and [safe encryption setup](#safe-initial-setup).
 
 ### 3) Open Jarvis
 
@@ -235,7 +238,7 @@ Removes the selected scope so `/jarvis` thinking falls back through the remainin
 Reports shared-memory status. Use `/jarvis-memory help` for controls and data-management commands. Memory controls default to **global**, unlike model/thinking controls. See [Shared memory](#shared-memory) below.
 
 ### `/jarvis-archive`
-Reports the separate full-session archive's status. It defaults **OFF**, with independent capture and model-access controls. `/jarvis-archive help` documents enablement warnings, paging, explicit import, and deletion. See [Full-session archive](#full-session-archive).
+Reports the separate full-session archive's status. It defaults **OFF**, with independent capture, model-access and optional encryption controls. `/jarvis-archive help` documents enablement warnings, paging, explicit import, deletion and human-only encryption administration. See [Full-session archive](#full-session-archive).
 
 ### Side-session commands inside `/jarvis`
 The `/jarvis` input handles a small set of built-in commands against the isolated side-session:
@@ -256,6 +259,8 @@ This is a **separate, optional subsystem**, not a change to shared memory's cura
 
 ### Enable only after reviewing the risks
 
+These examples opt into recording; they are **not encrypted-first setup**. If you want to avoid new plaintext archive captures, [pause effective capture before enabling or migrating](#safe-initial-setup), then verify encryption/cleanup before explicitly resuming capture.
+
 ```text
 /jarvis-archive                                    # status; no archive-record reads
 /jarvis-archive --project on --confirm-sensitive    # record here only
@@ -272,7 +277,7 @@ Controls default to **global**; use `--project` for an override. Resolution is p
 - Project: `.pi/jarvis-archive.json`
 - Shape: `{ "archive": { "enabled": true, "capture": true, "modelAccess": false } }`
 
-Enabling/model-access commands require the literal warning acknowledgment, and direct-file enablement shows a first-use warning. **This archive is unredacted plaintext and may retain passwords, tokens, private files, and sensitive tool output.** Model access can send retrieved data to the active provider. It is not a sandbox, encryption mechanism, or a substitute for carefully managing secrets.
+Enabling/model-access commands require the literal warning acknowledgment, and direct-file enablement shows a first-use warning. **This archive is unredacted, PLAINTEXT by default, and may retain passwords, tokens, private files, and sensitive tool output.** Optional password encryption protects only its active database, index and SQLite journals; original Pi transcripts, shared memory and retained plaintext sources/backups remain outside that protection. Model access can send retrieved data to the active provider even when storage is encrypted. Neither mode is a sandbox or a substitute for carefully managing secrets. Review [safe encryption setup](#safe-initial-setup) **before** enabling if you want to avoid new plaintext archive captures.
 
 ### What “full” means
 
@@ -344,7 +349,97 @@ Bulk import is a human command, not a model tool. It requires enabled recording 
 
 Single-file import is **human-only**, requires enabled recording and an explicit regular v3 JSONL file, and preserves the source header's project/session identity—even if different from the current project. Directory discovery happens only through the explicit bulk preview above; no silent historical import occurs. Both import modes require v3 session files; legacy session versions require a separately reviewed conversion first. Completed entries survive a partial/cancelled import, with counts reported; duplicate entries are skipped, differing payloads for an existing identity are rejected, and originals are never modified. Deletion defaults to this project; `--all` is explicit. Stable identity tombstones prevent re-import of deleted entries, not every semantic copy or other previously unarchived entry.
 
-Storage is lazy SQLite under `<active-agent-dir>/extensions/pi-jarvis-archive/archive.sqlite`, defaulting to `~/.pi/agent/extensions/pi-jarvis-archive/archive.sqlite`. Owned directories/files use private permissions where supported, with defensive link/type checks and concurrent-writer transactions. There is no background watcher: observed settings changes are propagated between mounted lanes, while other processes recheck at operation boundaries. Deletion does not erase original Pi files, prior search-result copies, already-sent model context or backups, and does not guarantee reclaimed disk space or forensic erasure. For a complete reset, stop all Pi processes using the store and remove only its archive directory yourself; that also removes tombstones. Shared memory stays separate and unchanged. To stop both Jarvis persistence layers, use both `/jarvis-archive off` and `/jarvis-memory off`; neither disables Pi's original session transcripts.
+Storage is lazy SQLite under `<active-agent-dir>/extensions/pi-jarvis-archive/`: the plaintext default uses `archive.sqlite` (normally `~/.pi/agent/extensions/pi-jarvis-archive/archive.sqlite`). After explicit encryption management, `archive.vault.json` selects a generation at `vaults/<UUID>/archive.sqlite`; the same root retains prior generations until explicit cleanup. Owned directories/files use private permissions where supported, with defensive link/type checks and concurrent-writer transactions. There is no background watcher: observed settings changes are propagated between mounted lanes, while other processes recheck at operation boundaries. Deletion does not erase original Pi files, prior search-result copies, already-sent model context or backups, and does not guarantee reclaimed disk space or forensic erasure. For a complete reset, stop all Pi processes using the store and remove only its archive directory yourself; that also removes tombstones. Shared memory stays separate and unchanged. To stop both Jarvis persistence layers, use both `/jarvis-archive off` and `/jarvis-memory off`; neither disables Pi's original session transcripts.
+
+---
+
+## Optional archive encryption
+
+Version **1.10.0** provides **optional, OFF-by-default password encryption** for the full-session archive. It is **agent-wide**, shared by main Pi and Jarvis in the same active agent directory, not a project-scoped setting. Encryption is independent of archive enablement, capture, model access, shared memory, Repo tools and bridge permissions. No archive is automatically migrated, no history is backfilled, and no user setting is changed automatically.
+
+### What it protects—and what it does not
+
+Encrypted operation protects the **active archive SQLite database, its FTS search index and SQLite journal/WAL content**, not just message bodies. A random 256-bit data key is password-wrapped with scrypt and AES-256-GCM; the database uses a SQLCipher-4-compatible AES-256-CBC/HMAC-SHA512 profile provided by SQLite3MultipleCiphers. Ordinary encrypted operation does not use a temporary plaintext database; temporary SQLite work is memory-only.
+
+It does **not** encrypt Pi's original JSONL/session files, shared-memory SQLite, external attachments, exports, independently retained backups, or previously retrieved/provider-sent context. **Migration retains its source, including plaintext, until explicit cleanup.** Vault metadata (generation identities, wrapping parameters and startup policy) and filesystem metadata are not concealed. An unlocked process and authorized tools can read the contents; swap, core dumps, trusted extensions and malicious same-user code are outside this boundary. There is **no independently audited cryptography, official/vendor-audited SQLCipher, FIPS, sandbox or forensic-erasure claim**. Public/private-key unlocking is deferred.
+
+Choose a strong, unique password and keep it safely outside Pi conversation history. Passwords are valid Unicode, **1–4096 UTF-8 bytes**, without control characters or line breaks; they are not trimmed or normalized. There is no password-recovery bypass. `/jarvis-archive password` requires an unlocked archive, asks for a new password twice, and locks afterward. It **rewraps the same data key, not key rotation**: old key/envelope backups may still unlock that key's data.
+
+### Safe initial setup
+
+These are **explicit user actions**, not permission for an agent or extension to change your settings.
+
+1. Start Pi yourself in **regular TUI**: `pi --tui-mode regular`. Stop **all other Pi instances using this agent directory**, including older versions, before migration, recovery or cleanup. Review available disk space: migration retains both source and target.
+2. Run `/jarvis-archive status` and review the configured/effective enablement, capture and model-access settings, trust and any config errors. Project fields override global defaults; an explicit global archive `off` is a master-off. Repair malformed settings manually without discarding privacy controls.
+3. **If avoiding new plaintext archive captures, pause CAPTURE before enabling or migrating**, for example `/jarvis-archive --project capture off`, then check status for effective **capture off**. A global `capture off` alone does not defeat project `capture on` overrides. Review every scope you intend to enable; do not start sensitive work until the effective pause is confirmed. This pause does not stop Pi's own transcripts or shared-memory capture.
+4. Enable the archive only in your intended scope, for example `/jarvis-archive --project on --confirm-sensitive`, and confirm that it is configured **ON in a trusted project with capture still off**. Project `on` cannot override an explicit global master-off; choose any global change yourself, recognizing that global enablement can affect other projects. Encryption administration requires enabled/trusted archive policy, but **does not require capture or model access to be on**. Leave model access off unless you separately want it.
+5. Run `/jarvis-archive encryption on --confirm-sensitive --confirm-stopped`. Enter the new password twice in the private prompt, verifying **each** submission as described below. On success the encrypted generation is unlocked for the current main session; your capture setting is unchanged. Inspect `/jarvis-archive encryption status` and, if desired, manually inspect records with capture/model access still off. A pre-existing archive's accepted records are migrated exactly; old Pi session files are not imported.
+6. Verify that the active encrypted archive is usable **before deleting its retained source**. If you choose to remove retired plaintext, run `/jarvis-archive encryption cleanup --confirm-sensitive --confirm-stopped` with a live unlock. Cleanup ends the local grant: unlock again, check status/retired plaintext counts and inspect any reported partial cleanup. Do not call the archive protected while plaintext copies you care about still remain. Cleanup does not touch outside backups or original transcripts.
+7. **Resume capture explicitly only when ready**, in the scope you paused, for example `/jarvis-archive --project capture on`; check effective status again. Unlocking and migration do not turn capture on or recover the paused period. Enable model access separately only if intended.
+
+### Human commands
+
+These commands run locally without a provider call and are **not model tools**. No password, key, path or scope arguments are accepted. The overlay's `/archive …` alias also works locally; password entry closes Jarvis and uses the main editor area, revoking the overlay's transient permissions.
+
+```text
+/jarvis-archive encryption [status]
+/jarvis-archive encryption on --confirm-sensitive --confirm-stopped
+/jarvis-archive encryption off --confirm-sensitive --confirm-stopped
+/jarvis-archive encryption cleanup --confirm-sensitive --confirm-stopped
+/jarvis-archive encryption recover --rollback --confirm-sensitive --confirm-stopped
+/jarvis-archive encryption break-lock --confirm-sensitive --confirm-stopped
+/jarvis-archive unlock [session|process|remember|for MINUTES|idle MINUTES]
+/jarvis-archive lock
+/jarvis-archive password
+/jarvis-archive startup manual|prompt|remember
+```
+
+**`encryption on` migrates the active archive to an encrypted generation; `encryption off` converts it to plaintext. Neither turns recording on/off.** In contrast, `/jarvis-archive off` is the ordinary archive master-off: it pauses reads/capture without decrypting or deleting stored files. `lock` revokes the local key first and then attempts durable remembered-authorization revocation; a failure is reported honestly, not silently repaired. Other processes observe durable revisions at operation boundaries, not instantaneously.
+
+### Private password entry
+
+**Only Pi regular TUI is supported** (`pi --tui-mode regular`). Fullscreen, unknown/missing renderer modes and non-TUI operation refuse password entry; there is no ordinary-editor, RPC, argument or environment fallback. Do not change renderer settings automatically. Passwords are masked and never routed through normal editors/history, model tools, session entries, notifications or logs.
+
+**Every submit or cancel—including typed-only Enter, Escape and Ctrl+C—requires a fresh displayed code typed by hand, followed by Enter.** Pasting a code cannot approve completion. Cancellation immediately revokes backend work, but retains a **cancel-only private input sink** until you verify its exit; a completed/aborted backend promise does not restore the editor. Jarvis, its model picker and main-memory review cannot overlap that ownership. Cancellable main-session switch/fork/tree navigation is refused until verified exit; retry navigation afterward. Resize a tiny terminal if the code is not readable. Repeated hostile input can deny service; this is not proof that every buffered transport byte has drained.
+
+**Do not force `/reload`, quit or focus replacement while entering a password.** Forced host reload/quit and trusted external focus replacement cannot preserve input quarantine. The extension abandons ownership and wipes/revokes what it owns without stale editor-restoration callbacks, but cannot protect bytes routed after host/process teardown or genuine human-verified release. Trusted extensions with input/screen/process access are not isolated. Use the displayed verified cancellation instead.
+
+### Unlock lifetimes and startup
+
+| Choice | Behavior |
+|---|---|
+| `unlock` / `unlock session` | Default. Main-session-owned grant shared with Jarvis; overlay close and side `/new` do not end it. Replacing the main session ends it. |
+| `unlock process` | Process-local grant; supported main `new`/`resume`/`fork` handoffs preserve it. Reload, quit and process restart end it. |
+| `unlock for MINUTES` | Fixed-duration grant, 1–10080 integer minutes. Handoff preserves the original deadline. |
+| `unlock idle MINUTES` | Locks after that many minutes without successful archive data activity. Status/policy checks do not refresh it; handoff preserves the deadline. |
+| `unlock remember` | Explicitly saves the random data key—not the password—in the OS credential store and selects `startup remember`. Persistent-local grant can be restored on later permitted main startup. |
+| `startup manual` | Default. No automatic prompt/credential restore; clears remembered authorization and locks the local grant. |
+| `startup prompt` | Clears remembered authorization and locks locally; later permitted main startup requests a password for a session grant. Requires regular TUI. |
+| `startup remember` | Requires an already unlocked encrypted archive; explicitly authorizes OS-backed restoration. |
+
+Timed grants check both monotonic and wall time, including access-boundary expiry after suspend/delayed timers; no immediate erasure during sleep is promised. **Plaintext conversion refuses fixed/idle timed grants before copying a key or publishing a transition**: explicitly `unlock session` or `unlock process` first if you really intend conversion. Any grant can be revoked by explicit lock, observed full-off/trust/config failure, revision changes or unsafe storage. No instantaneous cross-process key erasure is promised.
+
+Startup runs only from the **main** lifecycle, never Jarvis boot. Full-off, untrusted/malformed policy and restart-required storage suppress prompts, credential access and database authentication. Restoring trust does not silently reuse a revoked local grant. An explicit nonremember unlock clears an existing remembered authorization (and changes remembered startup to manual); a startup manual/prompt selection also clears it. Explicit lock clears remembered authorization durably before best-effort native credential deletion. Failed deletion can leave a key in the OS store and is reported; durable revocation is not a promise that all OS copies are erased.
+
+### Migration, cleanup and recovery
+
+Migration uses a distinct generation, verifies exact stored raw JSON spelling, index text, provenance, row IDs and tombstones, and checks/checkpoints/closes/fsyncs the target before publication. Capture pauses without buffering or backfill. The source becomes a retired generation, **not automatically deleted**. At most **eight retired generations** are tracked; further migration requires explicit cleanup. Check status for retained **plaintext** generations. There is no hard total-disk quota.
+
+Cleanup deletes only recognized retired SQLite files under the owned layout, never the active database or outside backups. It preflights files, deletes auxiliaries before the main file, and rechecks live authorization between deletions. Encrypted cleanup needs a live lease and authentication of the **existing active database**; a missing active database is not recreated. Failure can leave a **partial retained backup**; inspect the report/metadata, do not assume rollback or automatic deletion retry. Cleanup ends the local lease.
+
+A pending Transition blocks archive reads, capture, import and ordinary deletion. `recover --rollback` is an explicit source-checked rollback, not a retry/resume of migration: it can discard only the known unpublished target. **A missing/empty/unsafe/changed known source requires manual inspection/restoration; preserve the target and metadata as potential copies.** An explicitly originally absent legacy source is different from a lost source. Never publish a missing known source as an empty archive or delete its possible remaining target. Invalid metadata requires manual inspection; it is not repaired automatically.
+
+Locks are cooperative, not a filesystem sandbox. `break-lock` never steals a live or unknown lock: it requires a demonstrably dead local PID on the same host plus identity/token rechecks. The confirmation flags acknowledge that other Pi instances have actually been stopped; they do not stop them for you.
+
+**Uncertain native close, publication or lock release requires stopping Pi, inspecting status/storage and an actual Pi process restart before further access or recovery.** `/reload`, new sessions, aliases and logical quit do not clear restart-required state. Publication may already have succeeded even if an operation reported failure: never assume a guaranteed Transition, replay an uncertain write or automatically retry cleanup/recovery. Restart clears the process-local safety block, not invalid metadata, missing sources or a durable Transition; inspect again and choose recovery explicitly.
+
+### Dependencies and platform limits
+
+Encryption lazily loads exact optional **`better-sqlite3-multiple-ciphers@13.0.3`**; plaintext uses `node:sqlite`. Remembered unlock separately needs exact optional **`@napi-rs/keyring@2.1.0`** and an available, authorized OS credential service. On Linux this is explicitly **Secret Service**, with no kernel-keyring downgrade; macOS/Windows use the adapter's native OS stores. A headless/locked/unavailable service can refuse remembered unlock. Manual password unlock does not require remembered-key storage.
+
+Linux glibc prebuilt bindings require **glibc 2.35 or newer**. Upstream advertises musl/macOS/Windows bindings, but **local runtime validation is Linux-only**; other platforms and real OS credential integration are not certified by that validation. Missing, omitted or incompatible optional dependencies **fail closed**—no plaintext database, ordinary input, unprotected key file or alternative credential backend fallback. Runtime does not execute install scripts or auto-build/download replacement binaries. A failed remembered restore stays locked; manually choose a password unlock if desired.
+
+See [Archive encryption design and operating contract](docs/archive-encryption-design.md) for the format, lifecycle and validation limits.
 
 ---
 
@@ -599,10 +694,12 @@ Use narrowly scoped credentials and trust your configured servers. Enabling Repo
 
 ## Development
 
-Install dependencies:
+Archive encryption is optional and off by default; its [design and operating contract](docs/archive-encryption-design.md) documents the shipped password-based feature and its limits. Development validation uses disposable synthetic archives and injected credential stores—never real user migrations or OS credentials. Keep optional native packages lazy, exact-pinned and fail-closed; public/private-key support remains deferred.
+
+Install dependencies without running lifecycle scripts:
 
 ```bash
-npm install
+npm install --ignore-scripts
 ```
 
 Type-check:
