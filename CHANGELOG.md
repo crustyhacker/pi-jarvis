@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.11.2] - 2026-10-05
+
+### Fixed
+- Correct a cold archive-reader filesystem-observation race exposed by release validation: a creator can publish the main SQLite file and auxiliaries between separate stat checks. Re-observe a missing main file before declaring a true orphan; retain unsafe/pinned-missing-file refusals, read-only initialization rules and no uncertain-write replay.
+- Preserve the 1.11.1 commit/tag after its release validation stopped before publication. This corrected release includes the conversation-first visual polish.
+
 ## [1.11.1] - 2026-10-05
 
 ### Presentation

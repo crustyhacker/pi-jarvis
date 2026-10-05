@@ -22,7 +22,7 @@ And `/jarvis` still gives you a polished side-conversation overlay: a second opi
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.11.1</p>
+<p><strong>Current version:</strong> 1.11.2</p>
 
 ```bash
 pi install npm:pi-jarvis

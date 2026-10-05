@@ -450,12 +450,19 @@ export class ArchiveStore {
 		return true;
 	}
 	private checkFiles(): void {
-		const database = stat(this.databasePath);
+		let database = stat(this.databasePath);
 		if (this.file && (!database || !same(this.file, database))) failure(database ? "replaced database" : "missing database");
 		for (const name of AUXILIARIES) {
 			const info = name === "archive.sqlite" ? database : stat(join(dirname(this.databasePath), name));
 			if (!info) continue;
-			if (!database) failure("orphaned SQLite auxiliary file");
+			if (!database) {
+				// A first writer may publish main + WAL after our missing main stat.
+				// Re-observe once, stat-only; known pinned loss already fails above.
+				database = stat(this.databasePath);
+				if (!database) failure("orphaned SQLite auxiliary file");
+				regular(database);
+				if (this.file && !same(this.file, database)) failure("replaced database");
+			}
 			regular(info);
 		}
 	}

@@ -898,6 +898,140 @@ test("reader observes a paused creator's empty OS file without initializing or l
 	assert.equal(readAll(store, opaqueId(input), f.a), JSON.stringify(input.entry));
 });
 
+test("cold reader re-observes main published with WAL after its missing stat; peer writes exactly once", { timeout: 20_000 }, async (t) => {
+	const f = fixture(t), reader = f.store(), input = f.input();
+	const start = join(f.root, "start"), published = join(f.root, "published"), finish = join(f.root, "finish");
+	fs.mkdirSync(dirname(reader.path), { recursive: true, mode: 0o700 });
+	const script = `import assert from 'node:assert/strict'; import fs from 'node:fs'; import {createRequire} from 'node:module';
+		const {ArchiveStore}=await import(${JSON.stringify(storeUrl)}); const [agent,raw,start,published,finish]=process.argv.slice(1);
+		const s=new ArchiveStore(agent), {DatabaseSync}=createRequire(import.meta.url)('node:sqlite');
+		const prepare=DatabaseSync.prototype.prepare, exec=DatabaseSync.prototype.exec; let writes=0, fts=0, commits=0;
+		DatabaseSync.prototype.prepare=function(sql) { const statement=prepare.call(this,sql), run=statement.run.bind(statement);
+			if(sql.startsWith('INSERT INTO records(')||sql.startsWith('INSERT INTO records_fts(')) statement.run=(...args)=>{
+				if(sql.startsWith('INSERT INTO records(')) writes++; else fts++; return run(...args); }; return statement; };
+		DatabaseSync.prototype.exec=function(sql) { if(sql==='COMMIT') commits++; return exec.call(this,sql); };
+		const sleep=new Int32Array(new SharedArrayBuffer(4));
+		const wait=path=>{ const deadline=Date.now()+10000; while(!fs.existsSync(path)) {
+			if(Date.now()>=deadline) throw new Error('stat race fixture timed out'); Atomics.wait(sleep,0,0,10); } };
+		process.send('ready'); wait(start);
+		try { const result=s.append(JSON.parse(raw)); assert.equal(result,'saved');
+			for(const suffix of ['', '-wal', '-shm']) fs.chmodSync(s.path+suffix,0o644);
+			fs.writeFileSync(published,JSON.stringify({result,writes,fts,commits})); wait(finish);
+		} finally {s.close(); process.disconnect();}`;
+	const writer = pausedWorker(t, script, [f.agent, JSON.stringify(input), start, published, finish]);
+	await writer.ready;
+	const lstat = fs.lstatSync, open = fs.openSync, observations: string[] = [];
+	let released = false;
+	t.mock.method(fs, "lstatSync", (path: fs.PathLike) => {
+		if (String(path).startsWith(reader.path)) observations.push(String(path).slice(reader.path.length) || "main");
+		if (path === reader.path + "-wal" && !released) {
+			assert.deepEqual(observations, ["main", "-wal"]);
+			assert.equal(fs.existsSync(reader.path), false, "creator cannot publish until after the missing main stat");
+			released = true; fs.writeFileSync(start, "publish");
+			const deadline = Date.now() + 10_000, sleep = new Int32Array(new SharedArrayBuffer(4));
+			while (!fs.existsSync(published)) {
+				if (Date.now() >= deadline) assert.fail("creator did not publish");
+				Atomics.wait(sleep, 0, 0, 10);
+			}
+			assert.ok(lstat(reader.path + "-wal").size > 0);
+		}
+		return lstat(path);
+	});
+	t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+		assert.ok(!String(args[0]).startsWith(reader.path), "stat observations must not open/close main or SHM descriptors");
+		return open(...args);
+	});
+	const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite"), exec = DatabaseSync.prototype.exec;
+	t.mock.method(DatabaseSync.prototype, "exec", function(this: DatabaseSync, sql: string) {
+		assert.doesNotMatch(sql, /BEGIN IMMEDIATE|CREATE|INSERT|DELETE|PRAGMA user_version=/, "reader must not initialize or write records");
+		return exec.call(this, sql);
+	});
+	syncBuiltinESMExports();
+	try {
+		assert.equal(reader.search({ project: f.a, query: "fixture" }).records[0].id, opaqueId(input));
+		assert.deepEqual(observations.slice(0, 3), ["main", "-wal", "main"]);
+		assert.deepEqual(JSON.parse(fs.readFileSync(published, "utf8")), { result: "saved", writes: 1, fts: 1, commits: 2 });
+		assert.equal(readAll(reader, opaqueId(input), f.a), JSON.stringify(input.entry));
+		for (const suffix of ["", "-wal", "-shm"]) assert.equal(lstat(reader.path + suffix).mode & 0o777, 0o600);
+	} finally {
+		t.mock.restoreAll(); syncBuiltinESMExports();
+		reader.close(); fs.writeFileSync(finish, "close"); await writer.done;
+	}
+	assert.equal(f.store().stats(f.a).records, 1);
+});
+
+test("cold main re-observation is bounded and true auxiliaries remain orphaned before any open/write", async (t) => {
+	for (const suffix of ["-wal", "-shm", "-journal"]) await t.test(suffix, (t) => {
+		const f = fixture(t), store = f.store(); fs.mkdirSync(dirname(store.path), { recursive: true });
+		fs.writeFileSync(store.path + suffix, "orphan fixture", { mode: 0o600 });
+		const lstat = fs.lstatSync; let mainStats = 0;
+		t.mock.method(fs, "lstatSync", (path: fs.PathLike) => { if (path === store.path) mainStats++; return lstat(path); });
+		t.mock.method(fs, "openSync", () => assert.fail("orphan preflight must fail before any descriptor or database creation"));
+		syncBuiltinESMExports();
+		try {
+			assert.throws(() => store.search({ project: f.a }), /orphaned SQLite auxiliary file/); assert.equal(mainStats, 2);
+			assert.throws(() => store.append(f.input()), /orphaned SQLite auxiliary file/); assert.equal(mainStats, 4);
+			assert.equal(fs.existsSync(store.path), false);
+			assert.equal(fs.readFileSync(store.path + suffix, "utf8"), "orphan fixture");
+		} finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+	});
+});
+
+test("cold main re-observation validates main and auxiliary type, owner and nlink; I/O errors are not retried", async (t) => {
+	for (const location of ["main", "auxiliary"] as const) {
+		for (const kind of ["symlink", "hardlink", "directory", "owner", "I/O"] as const) await t.test(`${location} ${kind}`, (t) => {
+			if (kind === "owner" && typeof process.getuid !== "function") return t.skip("no owner check on this platform");
+			const f = fixture(t), store = f.store(), victim = join(f.root, "victim");
+			fs.mkdirSync(dirname(store.path), { recursive: true }); fs.writeFileSync(victim, "unchanged", { mode: 0o600 });
+			const unsafe = location === "main" ? store.path : store.path + "-wal";
+			fs.writeFileSync(location === "main" ? store.path + "-wal" : store.path, "fixture", { mode: 0o600 });
+			if (kind === "symlink") fs.symlinkSync(victim, unsafe);
+			else if (kind === "hardlink") fs.linkSync(victim, unsafe);
+			else if (kind === "directory") fs.mkdirSync(unsafe);
+			else fs.writeFileSync(unsafe, "fixture", { mode: 0o600 });
+			const lstat = fs.lstatSync, ioError = Object.assign(new Error("fixture stat I/O error"), { code: "EACCES" });
+			let mainStats = 0, unsafeStats = 0;
+			t.mock.method(fs, "lstatSync", (path: fs.PathLike) => {
+				if (path === store.path && ++mainStats === 1) throw Object.assign(new Error("fixture initial absence"), { code: "ENOENT" });
+				if (path === unsafe) { unsafeStats++; if (kind === "I/O") throw ioError; }
+				const info = lstat(path);
+				if (path === unsafe && kind === "owner") info.uid = process.getuid!() + 1;
+				return info;
+			});
+			t.mock.method(fs, "openSync", () => assert.fail("unsafe re-observation must reject before any descriptor or SQLite open"));
+			syncBuiltinESMExports();
+			try {
+				assert.throws(() => store.search({ project: f.a }), error => kind === "I/O" ? error === ioError : /Invalid archive storage (?:file|owner)/.test(String(error)));
+				assert.equal(mainStats, location === "auxiliary" && kind === "I/O" ? 1 : 2); assert.equal(unsafeStats, 1);
+				assert.equal(fs.readFileSync(victim, "utf8"), "unchanged");
+			} finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+		});
+	}
+});
+
+test("pinned missing/replaced main fails before auxiliary observation and stays refused after close", async (t) => {
+	for (const kind of ["missing", "replaced"] as const) await t.test(kind, (t) => {
+		const f = fixture(t), store = f.store(); assert.equal(store.append(f.input()), "saved"); store.close();
+		const old = join(f.root, "old.sqlite"); fs.renameSync(store.path, old);
+		if (kind === "replaced") fs.copyFileSync(old, store.path);
+		fs.writeFileSync(store.path + "-wal", "orphan fixture", { mode: 0o600 });
+		const lstat = fs.lstatSync; let mainStats = 0;
+		t.mock.method(fs, "lstatSync", (path: fs.PathLike) => {
+			if (path === store.path) mainStats++;
+			else assert.ok(!String(path).startsWith(store.path), "known pinned loss/replacement must fail before auxiliary probing");
+			return lstat(path);
+		});
+		t.mock.method(fs, "openSync", () => assert.fail("known pinned database must not be reopened/recreated"));
+		syncBuiltinESMExports();
+		try {
+			assert.throws(() => store.search({ project: f.a }), new RegExp(`Invalid archive ${kind} database`)); assert.equal(mainStats, 1);
+			store.close();
+			assert.throws(() => store.append(f.input({ id: "must-not-save" })), new RegExp(`Invalid archive ${kind} database`)); assert.equal(mainStats, 2);
+		} finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+		assert.equal(rows(old, "SELECT count(*) AS count FROM records")[0].count, 1);
+	});
+});
+
 test("simultaneous writer/deleter/reader processes initialize safely with no resurrection or lost updates", { timeout: 40_000 }, async (t) => {
 	const f = fixture(t);
 	const script = `const {ArchiveStore}=await import(${JSON.stringify(storeUrl)}); const [agent,project,worker]=process.argv.slice(1); const s=new ArchiveStore(agent);
