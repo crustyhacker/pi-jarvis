@@ -792,16 +792,33 @@ test("an empty valid inventory has a confirmable zero-file report rather than im
 	});
 });
 
-for (const revoke of ["cancel", "signal", "trust", "capture"] as const) {
-	test(`legacy bulk final-record ${revoke} at EOF keeps its receipt and stops remaining files`, async t => {
+for (const reverse of [false, true]) for (const revoke of ["cancel", "signal", "trust", "capture"] as const) {
+	test(`legacy bulk final-record ${revoke} at EOF keeps its receipt and stops remaining files (${reverse ? "reverse" : "forward"} discovery)`, async t => {
 		await fixture(async f => {
 			let trusted = true;
 			const abort = new AbortController(), ctx = { ...f.context(f.projectA, "bulk-owner", () => trusted), signal: abort.signal };
-			const path = transcript(f, "01-final.jsonl", [message("final", "receipteoffixture")]);
-			fs.writeFileSync(path, fs.readFileSync(path).subarray(0, fs.statSync(path).size - 1));
-			transcript(f, "02-next.jsonl", [message("next", "RECEIPT_MUST_NOT_RESUME")]);
-			const before = snapshot(path); await enable(f, ctx); const p = await preview(f, ctx);
-			assert.equal(p.samples[0]!.path, path);
+			const sources = ["alpha", "bravo"].map(name => {
+				const token = `receipteoffixture${name}`, path = transcript(f, `${name}.jsonl`, [message("final", token)]);
+				fs.writeFileSync(path, fs.readFileSync(path).subarray(0, fs.statSync(path).size - 1));
+				return { path, token, before: snapshot(path) };
+			});
+			// Exercise both real Dirent orders; filenames never define production discovery order.
+			const opendir = fsp.opendir;
+			t.mock.method(fsp, "opendir", (async (...args: any[]) => {
+				const handle = await Reflect.apply(opendir, fsp, args);
+				if (String(args[0]) === f.sessions) {
+					const entries: fs.Dirent[] = []; let entry;
+					while ((entry = await handle.read())) entries.push(entry);
+					entries.sort((a, b) => a.name.localeCompare(b.name) * (reverse ? -1 : 1));
+					handle.read = (async () => entries.shift() ?? null) as typeof handle.read;
+				}
+				return handle;
+			}) as typeof opendir); syncBuiltinESMExports();
+			await enable(f, ctx); let p: Preview;
+			try { p = await preview(f, ctx); } finally { restore(t); }
+			assert.deepEqual(p.samples.map(sample => sample.path), (reverse ? [...sources].reverse() : sources).map(source => source.path));
+			const first = sources.find(source => source.path === p.samples[0]!.path)!;
+			const remaining = sources.find(source => source !== first)!;
 			const append = f.service.store.append.bind(f.service.store); let receipts = 0;
 			t.mock.method(f.service.store, "append", (input: ArchiveInput) => {
 				const result = append(input); receipts++;
@@ -817,8 +834,9 @@ for (const revoke of ["cancel", "signal", "trust", "capture"] as const) {
 			assert.equal(result.saved, 2); assert.ok(result.stopped); assert.equal(result.failed, 1); assert.equal(result.unprocessed, 1);
 			assert.equal(receipts, 2); restore(t); trusted = true;
 			const files = await allResults(f, result.reportId); assert.equal(files[0]!.saved, 2); assert.equal(files[0]!.status, "failed");
-			assert.equal(search(f, "receipteoffixture").length, 1); assert.equal(search(f, "RECEIPT_MUST_NOT_RESUME").length, 0);
-			assert.deepEqual(snapshot(path), before);
+			assert.equal(files[0]!.path, first.path); assert.equal(files[1]!.path, remaining.path); assert.equal(files[1]!.status, "unprocessed");
+			assert.equal(search(f, first.token).length, 1); assert.equal(search(f, remaining.token).length, 0);
+			for (const source of sources) assert.deepEqual(snapshot(source.path), source.before);
 		});
 	});
 }

@@ -540,15 +540,21 @@ test("observed main, side and supplemental trust loss revokes the shared lease, 
 // Receipt tests deliberately revoke/fault only AFTER Store.append has returned.
 // Import counts may cross that boundary, but data/read results may not.
 type ReceiptKind = "single" | "bulk";
-async function receiptSource(f: Fixture, ctx: ExtensionContext, kind: ReceiptKind): Promise<{ path: string; before: Buffer; args: string }> {
-	const path = transcript(f, "01-receipt", "receiptfixture acknowledged");
-	// Exercise final-record EOF with no following newline, chunk or entry guard.
-	writeFileSync(path, readFileSync(path).subarray(0, fs.statSync(path).size - 1));
-	if (kind === "single") return { path, before: readFileSync(path), args: `import --confirm-sensitive ${path}` };
-	transcript(f, "02-unprocessed", "RECEIPT_MUST_NOT_RESUME");
+interface ReceiptSource { path: string; before: Buffer; args: string; sessionId: string; unprocessedId?: string }
+async function receiptSource(f: Fixture, ctx: ExtensionContext, kind: ReceiptKind): Promise<ReceiptSource> {
+	const sources = (kind === "single" ? ["01-receipt"] : ["01-receipt", "02-unprocessed"]).map(sessionId => {
+		const path = transcript(f, sessionId, "receiptfixture acknowledged");
+		// Every candidate exercises final-record EOF, regardless of native directory order.
+		writeFileSync(path, readFileSync(path).subarray(0, fs.statSync(path).size - 1));
+		return { path, sessionId, before: readFileSync(path) };
+	});
+	if (kind === "single") return { ...sources[0]!, args: `import --confirm-sensitive ${sources[0]!.path}` };
 	const p = JSON.parse(await f.service.command("import-all", ctx));
-	assert.equal(p.candidates, 2); assert.equal(p.samples[0].path, path);
-	return { path, before: readFileSync(path), args: `import-all --confirm-sensitive --preview ${p.previewId}` };
+	assert.equal(p.candidates, 2);
+	const first = sources.find(source => source.path === p.samples[0].path);
+	assert.ok(first, "first reviewed candidate must be one of the synthetic sources");
+	return { ...first, unprocessedId: sources.find(source => source !== first)!.sessionId,
+		args: `import-all --confirm-sensitive --preview ${p.previewId}` };
 }
 async function stoppedReceipt(f: Fixture, ctx: ExtensionContext, kind: ReceiptKind, args: string, saved: number): Promise<string> {
 	let output = "";
@@ -565,10 +571,11 @@ async function stoppedReceipt(f: Fixture, ctx: ExtensionContext, kind: ReceiptKi
 	}
 	noLeak(f, output); return output;
 }
-async function receiptRecords(f: Fixture, ctx: ExtensionContext, encrypted: boolean): Promise<void> {
+async function receiptRecords(f: Fixture, ctx: ExtensionContext, encrypted: boolean, source: ReceiptSource): Promise<void> {
 	if (encrypted && !f.service.policy(ctx).enabled) assert.match(await f.service.command("unlock process", ctx), /unlocked/);
 	assert.equal(page(f.service.search({ query: "receiptfixture", scope: "all" }, ctx, false)).records.length, 1);
-	assert.equal(page(f.service.search({ query: "RECEIPT_MUST_NOT_RESUME", scope: "all" }, ctx, false)).records.length, 0);
+	assert.equal(page(f.service.session({ sessionId: source.sessionId, scope: "all" }, ctx, false)).records.length, 2);
+	if (source.unprocessedId) assert.equal(page(f.service.session({ sessionId: source.unprocessedId, scope: "all" }, ctx, false)).records.length, 0);
 }
 for (const encrypted of [false, true]) for (const kind of ["single", "bulk"] as const) {
 	for (const revoke of ["trust", "signal", "capture", "cancel"] as const) {
@@ -592,7 +599,7 @@ for (const encrypted of [false, true]) for (const kind of ["single", "bulk"] as 
 			await stoppedReceipt(f, ctx, kind, source.args, 2);
 			assert.equal(receipts, 2, "only header and final entry acknowledged, no replay/remaining file");
 			t.mock.restoreAll(); trusted = true;
-			await receiptRecords(f, f.context(), encrypted); assert.deepEqual(readFileSync(source.path), source.before); noLeak(f);
+			await receiptRecords(f, f.context(), encrypted, source); assert.deepEqual(readFileSync(source.path), source.before); noLeak(f);
 		});
 	}
 
@@ -612,7 +619,7 @@ for (const encrypted of [false, true]) for (const kind of ["single", "bulk"] as 
 		});
 		await stoppedReceipt(f, ctx, kind, source.args, 1);
 		assert.equal(commits, 1); assert.equal(attempts, 2); assert.equal(receipts, 1, "only header returned an acknowledged outcome");
-		t.mock.restoreAll(); await receiptRecords(f, ctx, encrypted);
+		t.mock.restoreAll(); await receiptRecords(f, ctx, encrypted, source);
 		assert.deepEqual(readFileSync(source.path), source.before); noLeak(f);
 	});
 }
@@ -633,7 +640,7 @@ for (const kind of ["single", "bulk"] as const) {
 		}) as typeof lstat); syncBuiltinESMExports();
 		try { await stoppedReceipt(f, ctx, kind, source.args, 2); }
 		finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
-		assert.equal(receipts, 2); assert.ok(faults > 0); await receiptRecords(f, ctx, true);
+		assert.equal(receipts, 2); assert.ok(faults > 0); await receiptRecords(f, ctx, true, source);
 		assert.deepEqual(readFileSync(source.path), source.before); noLeak(f);
 	});
 
@@ -674,8 +681,8 @@ for (const kind of ["single", "bulk"] as const) {
 			let db: ArchiveDatabase | undefined;
 			try {
 				db = openEncryptedArchiveDatabase(databasePath, key);
-				assert.equal(db.prepare("SELECT count(*) AS count FROM records WHERE session_id=?").get("01-receipt")!.count, 2);
-				assert.equal(db.prepare("SELECT count(*) AS count FROM records WHERE session_id=?").get("02-unprocessed")!.count, 0);
+				assert.equal(db.prepare("SELECT count(*) AS count FROM records WHERE session_id=?").get(source.sessionId)!.count, 2);
+				assert.equal(db.prepare("SELECT count(*) AS count FROM records WHERE session_id=?").get(source.unprocessedId ?? "02-unprocessed")!.count, 0);
 			} finally { try { db?.close(); } finally { key.fill(0); } }
 			noLeak(f);
 		});

@@ -18,7 +18,7 @@
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.10.0</p>
+<p><strong>Current version:</strong> 1.10.1</p>
 
 <p>
   <strong>Shared persistent memory</strong> ·

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.10.1] - 2026-10-05
+
+### Fixed
+- Make bulk-import receipt tests independent of filesystem directory enumeration order, including explicit forward/reverse discovery coverage. Retain exact acknowledged counts, EOF cancellation, unprocessed-file and unchanged-source assertions; runtime behavior is unchanged.
+- Preserve the `v1.10.0` commit/tag after GitHub validation exposed the test-only ordering assumption. Its release job stopped before publishing an artifact; 1.10.1 is the corrected password-encryption release.
+
 ## [1.10.0] - 2026-10-05
 
 ### Added
