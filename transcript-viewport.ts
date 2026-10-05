@@ -1,5 +1,8 @@
 import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 
+/** Optional bounded source identity/character offset supplied by a wrapping caller. */
+export interface TranscriptLineAnchor { key: string; offset: number }
+
 export interface TranscriptViewportStatus {
 	following: boolean;
 	hiddenBelow: number;
@@ -31,7 +34,9 @@ const ANCHOR_SEARCH_RADIUS = 256;
  * is re-anchored nearby when the previous top row can still be found. Height
  * changes clamp that index without resuming follow. Width changes find the top row
  * near its proportional new position (exact or shared-prefix match), then fall
- * back to the old index. Reflow cannot be perfectly anchored without source IDs.
+ * back to the old index. Optional bounded per-row source anchors identify the
+ * source text and character offset across reflow, instead of guessing from rows.
+ * These add a scan of that caller-bounded metadata only during reflow/source shifts.
  * Call reset() on thread/branch replacement, including same-length replacements.
  */
 export class TranscriptViewport {
@@ -41,9 +46,9 @@ export class TranscriptViewport {
 	private endLine = 0;
 	private height = 0;
 	private width = 0;
-	private anchor?: { index: number; text: string };
+	private anchor?: { index: number; text: string; source?: TranscriptLineAnchor };
 
-	render(lines: readonly string[], height: number, width: number): string[] {
+	render(lines: readonly string[], height: number, width: number, anchors?: readonly (TranscriptLineAnchor | undefined)[]): string[] {
 		height = dimension(height);
 		width = dimension(width);
 		const previousTotal = this.totalLines;
@@ -57,12 +62,12 @@ export class TranscriptViewport {
 			this.anchor = undefined;
 		} else if (!this.following && width > 0 && previousWidth > 0 && width !== previousWidth
 			&& this.anchor?.index === this.startLine) {
-			this.restoreAnchor(lines, previousTotal);
+			if (!this.restoreSourceAnchor(anchors)) this.restoreAnchor(lines, previousTotal);
 		} else if (!this.following && this.anchor?.index === this.startLine && width > 0
 			&& anchorText(lines[this.startLine] ?? "") !== this.anchor.text) {
 			// A caller's bounded history can evict older rows during an append.
 			// Search near the old index, not a resize-proportional position.
-			this.restoreAnchor(lines, lines.length);
+			if (!this.restoreSourceAnchor(anchors)) this.restoreAnchor(lines, lines.length);
 		}
 		this.updateRange();
 
@@ -73,27 +78,28 @@ export class TranscriptViewport {
 		// Keep only a small, unstyled anchor, never the source row or returned array.
 		if (visible.length > 0) {
 			const text = anchorText(visible[0]!);
-			this.anchor = text ? { index: this.startLine, text } : undefined;
+			const source = anchors?.[this.startLine];
+			this.anchor = text ? { index: this.startLine, text, source: source ? { key: source.key.slice(0, ANCHOR_CHAR_LIMIT), offset: source.offset } : undefined } : undefined;
 		}
 		return visible;
 	}
 
-	/** Pause and move one last-rendered viewport height toward older rows. */
-	pageUp(): void {
-		if (this.totalLines === 0) return;
-		this.following = false;
-		this.startLine = Math.max(0, this.startLine - Math.max(1, this.height));
+	/** Logical lines, matching Pi's public normalized fullscreen wheel delta. */
+	scrollLines(delta: number): void {
+		if (!Number.isFinite(delta) || delta === 0 || this.totalLines === 0) return;
+		const steps = Math.sign(delta) * Math.max(1, Math.floor(Math.abs(delta)));
+		if (steps < 0) this.following = false;
+		this.startLine = Math.max(0, Math.min(this.latestStart(), this.startLine + steps));
+		if (steps > 0 && this.startLine === this.latestStart()) this.following = true;
 		this.anchor = undefined;
 		this.updateRange();
 	}
 
+	/** Pause and move one last-rendered viewport height toward older rows. */
+	pageUp(): void { this.scrollLines(-Math.max(1, this.height)); }
+
 	/** Move one page toward the tail; reaching it explicitly resumes following. */
-	pageDown(): void {
-		this.startLine = Math.min(this.latestStart(), this.startLine + Math.max(1, this.height));
-		if (this.startLine === this.latestStart()) this.following = true;
-		this.anchor = undefined;
-		this.updateRange();
-	}
+	pageDown(): void { this.scrollLines(Math.max(1, this.height)); }
 
 	toLatest(): void {
 		this.following = true;
@@ -126,6 +132,25 @@ export class TranscriptViewport {
 	private updateRange(): void {
 		this.startLine = this.following ? this.latestStart() : Math.min(this.startLine, this.latestStart());
 		this.endLine = Math.min(this.totalLines, this.startLine + this.height);
+	}
+
+	private restoreSourceAnchor(anchors?: readonly (TranscriptLineAnchor | undefined)[]): boolean {
+		const source = this.anchor?.source;
+		if (!source || !anchors) return false;
+		let bestIndex: number | undefined, bestOffset = -Infinity, bestDistance = Infinity;
+		// Only a caller that supplies bounded source metadata pays for this scan,
+		// and only on reflow/source shifts. Ordinary renders remain O(height).
+		for (let i = 0; i < anchors.length; i++) {
+			const candidate = anchors[i];
+			if (!candidate || candidate.key !== source.key || candidate.offset > source.offset) continue;
+			const distance = Math.abs(i - this.startLine);
+			if (candidate.offset > bestOffset || (candidate.offset === bestOffset && distance < bestDistance)) {
+				bestIndex = i; bestOffset = candidate.offset; bestDistance = distance;
+			}
+		}
+		if (bestIndex === undefined) return false;
+		this.startLine = bestIndex;
+		return true;
 	}
 
 	private restoreAnchor(lines: readonly string[], previousTotal: number): void {

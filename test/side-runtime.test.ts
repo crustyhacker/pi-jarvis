@@ -5,11 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import {
 	createAssistantMessageEventStream, InMemoryCredentialStore,
-	type AssistantMessage, type Model, type Provider, type SimpleStreamOptions, type TranscriptContext,
+	type AssistantMessage, type Model, type Provider, type ProviderHeaders, type SimpleStreamOptions, type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import {
-	ModelRegistry, ModelRuntime,
-	type AgentSession, type AgentSessionEvent, type ExtensionContext, type ExtensionToolContext,
+	DefaultResourceLoader, ModelRegistry, ModelRuntime,
+	type AgentSession, type AgentSessionEvent, type ExtensionContext, type ExtensionFactory, type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import { JarvisOverlayBridge } from "../overlay.js";
 import { createSideModelRuntime, createSideSessionFile, JarvisSideSessionRuntime } from "../side-session.js";
@@ -46,7 +46,10 @@ function response(selected: Model<any>, content: AssistantMessage["content"] = [
 	return stream;
 }
 
-async function hostRegistry(streamSimple: Provider["streamSimple"] = (selected) => response(selected)) {
+async function hostRegistry(
+	streamSimple: Provider["streamSimple"] = (selected) => response(selected),
+	beforeAuth?: (signal: AbortSignal) => Promise<void>,
+) {
 	const hostRuntime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, refreshOnCreate: false });
 	const registry = new ModelRegistry(hostRuntime);
 	const provider: Provider = {
@@ -54,10 +57,13 @@ async function hostRegistry(streamSimple: Provider["streamSimple"] = (selected) 
 		auth: { apiKey: {
 			name: "Test memory credential",
 			check: async ({ credential }) => credential?.key ? { type: "api_key" } : undefined,
-			resolve: async ({ credential }) => credential?.key ? {
-				auth: { apiKey: credential.key, headers: { "x-host": "yes" }, baseUrl: "https://request.invalid" },
-				env: { SIDE_TEST: "host" },
-			} : undefined,
+			resolve: async ({ credential, signal }) => {
+				await beforeAuth?.(signal);
+				return credential?.key ? {
+					auth: { apiKey: credential.key, headers: { "x-host": "yes" }, baseUrl: "https://request.invalid" },
+					env: { SIDE_TEST: "host" },
+				} : undefined;
+			},
 		} },
 		stream: (selected, context, options) => streamSimple(selected, context, options as SimpleStreamOptions | undefined), streamSimple,
 	};
@@ -83,7 +89,7 @@ function sessionOf(runtime: JarvisSideSessionRuntime): AgentSession {
 async function fixture(run: (f: {
 	cwd: string; agentDir: string; bridge: JarvisOverlayBridge;
 	create: (overrides?: Partial<Parameters<typeof JarvisSideSessionRuntime.create>[0]>) => Promise<JarvisSideSessionRuntime>;
-}) => Promise<void>, stream?: Provider["streamSimple"]) {
+}) => Promise<void>, stream?: Provider["streamSimple"], beforeAuth?: (signal: AbortSignal) => Promise<void>) {
 	const root = mkdtempSync(join(tmpdir(), "pi-jarvis-side-runtime-"));
 	const cwd = join(root, "workspace");
 	const agentDir = join(root, "agent");
@@ -93,7 +99,7 @@ async function fixture(run: (f: {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	const runtimes: JarvisSideSessionRuntime[] = [];
 	try {
-		const { host } = await hostRegistry(stream);
+		const { host } = await hostRegistry(stream, beforeAuth);
 		const bridge = new JarvisOverlayBridge();
 		await run({ cwd, agentDir, bridge, create: async (overrides = {}) => {
 			const runtime = await JarvisSideSessionRuntime.create({
@@ -370,4 +376,299 @@ test("retry/compaction events preserve working state until settlement and expose
 		handle({ type: "agent_settled" });
 		assert.equal(bridge.snapshot().workingMessage, undefined);
 	});
+});
+
+
+async function until(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 200; attempt++) {
+		if (predicate()) return;
+		await new Promise<void>(resolve => setImmediate(resolve));
+	}
+	assert.fail("timed out waiting for isolated SDK fixture state");
+}
+
+test("stop uses public SDK abort/clearQueue and keeps the side owner, grants and bridge reusable", async () => {
+	let calls = 0;
+	await fixture(async ({ create, bridge }) => {
+		const runtime = await create({ toolAccessProvider: () => true });
+		const session = sessionOf(runtime), file = session.sessionManager.getSessionFile();
+		let renders = 0; bridge.attach(() => { renders++; });
+		const sending = runtime.sendMessage("cancel active synthetic stream");
+		await until(() => calls === 1 && session.isStreaming);
+		await session.steer("discard SDK waiting input");
+		assert.ok(session.pendingMessageCount > 0);
+		await runtime.cancelWork(); await sending;
+		assert.equal(session.pendingMessageCount, 0);
+		assert.equal(session.isStreaming, false); assert.equal(runtime.isReady(), true);
+		assert.equal(runtime.getThinkingLevel(), session.thinkingLevel, "actual thinking uses only the public SDK property");
+		assert.ok(session.getActiveToolNames().includes("read"), "stop does not revoke access");
+		assert.equal(bridge.snapshot().workingMessage, undefined);
+		assert.equal(sessionOf(runtime), session); assert.equal(session.sessionManager.getSessionFile(), file);
+		const before = renders; bridge.notify("still subscribed after stop"); assert.ok(renders > before);
+		await runtime.sendMessage("new explicit input"); assert.equal(calls, 2, "cancelled SDK queue never replays");
+	}, (selected, _context, options) => {
+		calls++;
+		if (calls > 1) return response(selected);
+		const stream = createAssistantMessageEventStream();
+		void response(selected).result().then(message => {
+			stream.push({ type: "start", partial: message });
+			const abort = () => {
+				stream.push({ type: "error", reason: "aborted", error: { ...message, content: [], stopReason: "aborted", errorMessage: "Synthetic stream cancelled" } });
+				stream.end();
+			};
+			if (options?.signal?.aborted) abort(); else options?.signal?.addEventListener("abort", abort, { once: true });
+		});
+		return stream;
+	});
+});
+
+test("foreground-only confirmation blocks closed redirects but does not revoke separately granted Note main", async () => {
+	await fixture(async ({ create }) => {
+		let foreground = true, notes = 0, redirects = 0;
+		const bridge = new JarvisOverlayBridge(() => foreground);
+		const runtime = await create({
+			bridge,
+			communicationPermissionsProvider: () => ({ allowFollowUpToMain: true, allowSteerToMain: true }),
+			confirmSteerToMain: (message, signal) => bridge.requestConfirmation("Redirect", message, signal),
+			sendFollowUpToMain: () => { notes++; }, sendSteerToMain: () => { redirects++; },
+		});
+		const pending = executeSteer(runtime);
+		foreground = false; bridge.resolveConfirmation(false);
+		assert.equal(((await pending).details as { status: string }).status, "cancelled");
+		assert.equal(((await executeSteer(runtime)).details as { status: string }).status, "cancelled");
+		assert.equal(bridge.hasPendingConfirmation(), false, "closed tools never hang awaiting an invisible review");
+		const session = sessionOf(runtime);
+		await session.getToolDefinition("jarvis_send_follow_up_to_main")!.execute("background-note", { message: "user-authorized note" }, undefined, undefined,
+			session.extensionRunner.createContext() as ExtensionToolContext);
+		assert.equal(notes, 1); assert.equal(redirects, 0);
+		foreground = true;
+		const reopened = executeSteer(runtime); bridge.resolveConfirmation(true);
+		assert.equal(((await reopened).details as { status: string }).status, "sent"); assert.equal(redirects, 1);
+	});
+});
+
+function latch() {
+	let release!: () => void;
+	const promise = new Promise<void>(resolve => { release = resolve; });
+	return { promise, release };
+}
+
+// Load fixture hooks with the public inline-extension loader and mount its
+// public records. Do not patch prompt(), inspect an Agent or host internals.
+async function mountFixtureHooks(session: AgentSession, agentDir: string, factory: ExtensionFactory): Promise<void> {
+	const loader = new DefaultResourceLoader({
+		cwd: session.sessionManager.getCwd(), agentDir, noExtensions: true,
+		settingsManager: session.settingsManager, extensionFactories: [factory],
+	});
+	await loader.reload();
+	session.resourceLoader.getExtensions().extensions.unshift(...loader.getExtensions().extensions);
+}
+
+test("immediate stop revokes actual SDK idle preflight without a provider call; fresh explicit input works", async () => {
+	let calls = 0;
+	await fixture(async ({ create, bridge }) => {
+		const runtime = await create({ toolAccessProvider: () => true });
+		const session = sessionOf(runtime);
+		const old = runtime.sendMessage("stop before SDK startup");
+		const stopping = runtime.cancelWork();
+		await Promise.all([old, stopping]);
+		assert.equal(calls, 0, "idle SDK abort must not allow the pending prompt to dispatch later");
+		assert.equal(session.isStreaming, false);
+		assert.equal(session.pendingMessageCount, 0);
+		assert.equal(runtime.isReady(), true);
+		assert.equal(sessionOf(runtime), session);
+		assert.ok(session.getActiveToolNames().includes("read"));
+		assert.equal(bridge.snapshot().workingMessage, undefined);
+		await runtime.sendMessage("fresh explicit post-stop request");
+		assert.equal(calls, 1, "no cancelled input is retried or queued");
+	}, selected => { calls++; return response(selected); });
+});
+
+for (const operation of ["stop", "dispose"] as const) {
+	test(`${operation} revokes delayed SDK preflight; new sends cannot revive the old permit`, async () => {
+		let calls = 0;
+		await fixture(async ({ create, agentDir }) => {
+			const runtime = await create();
+			const session = sessionOf(runtime);
+			const entered = latch(), held = latch();
+			await mountFixtureHooks(session, agentDir, pi => {
+				pi.on("before_agent_start", async event => {
+					if (event.prompt !== "old held preflight") return;
+					entered.release();
+					await held.promise;
+				});
+			});
+			const old = runtime.sendMessage("old held preflight");
+			try {
+				await entered.promise;
+				assert.equal(session.isStreaming, false, "hook really precedes active SDK ownership");
+				if (operation === "stop") await runtime.cancelWork();
+				else runtime.dispose();
+				const freshRuntime = operation === "stop" ? runtime : await create();
+				await freshRuntime.sendMessage("fresh while old SDK preflight is still held");
+				assert.equal(calls, 1);
+				held.release();
+				await old;
+				assert.equal(calls, 1, "fresh permit must not authorize late cancelled dispatch");
+				await freshRuntime.sendMessage("fresh after old SDK prompt settles");
+				assert.equal(calls, 2);
+				if (operation === "stop") assert.equal(session.pendingMessageCount, 0);
+				else await assert.rejects(runtime.sendMessage("disposed input"), /not ready/);
+			} finally {
+				held.release();
+				await old.catch(() => {});
+			}
+		}, selected => { calls++; return response(selected); });
+	});
+}
+
+test("a delayed old input cannot enter a fresh active SDK run after stop", async () => {
+	let calls = 0;
+	const finishFresh = latch();
+	await fixture(async ({ create, agentDir }) => {
+		const runtime = await create(), session = sessionOf(runtime);
+		const entered = latch(), held = latch();
+		await mountFixtureHooks(session, agentDir, pi => {
+			pi.on("input", async event => {
+				if (event.text !== "old input") return;
+				entered.release();
+				await held.promise;
+			});
+		});
+		const old = runtime.sendMessage("old input");
+		let fresh: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			await runtime.cancelWork();
+			fresh = runtime.sendMessage("fresh active input");
+			await until(() => calls === 1 && session.isStreaming);
+			held.release();
+			await old;
+			assert.equal(session.pendingMessageCount, 0, "revoked input must not become a steer/follow-up in a new run");
+			finishFresh.release();
+			await fresh;
+			assert.equal(calls, 1);
+			assert.equal(session.messages.some(message => message.role === "user" && JSON.stringify(message.content).includes("old input")), false);
+			await runtime.sendMessage("another explicit post-stop input");
+			assert.equal(calls, 2);
+		} finally {
+			held.release(); finishFresh.release();
+			await Promise.allSettled([old, fresh]);
+		}
+	}, selected => {
+		calls++;
+		if (calls > 1) return response(selected);
+		const stream = createAssistantMessageEventStream();
+		void finishFresh.promise.then(async () => {
+			const message = await response(selected).result();
+			stream.push({ type: "done", reason: "stop", message }); stream.end();
+		});
+		return stream;
+	});
+});
+
+for (const operation of ["stop", "dispose"] as const) {
+	test(`${operation} during synthetic host auth prevents provider dispatch despite late auth completion`, async () => {
+		let calls = 0, holdAuth = false;
+		let authSignal: AbortSignal | undefined;
+		const entered = latch(), held = latch(), authFinished = latch();
+		await fixture(async ({ create }) => {
+			const runtime = await create();
+			holdAuth = true;
+			const old = runtime.sendMessage("held host auth");
+			let stopping: Promise<void> | undefined;
+			try {
+				await entered.promise;
+				assert.equal(calls, 0);
+				if (operation === "stop") stopping = runtime.cancelWork();
+				else runtime.dispose();
+				assert.equal(authSignal?.aborted, true, "permit reaches the host's public auth operation");
+				holdAuth = false;
+				held.release();
+				await Promise.all([old, stopping, authFinished.promise]);
+				assert.equal(calls, 0, "auth resolver deliberately ignores cancellation; no late provider call is allowed");
+				const freshRuntime = operation === "stop" ? runtime : await create();
+				await freshRuntime.sendMessage("fresh explicit request after held auth");
+				assert.equal(calls, 1);
+			} finally {
+				holdAuth = false; held.release();
+				await Promise.allSettled([old, stopping]);
+			}
+		}, selected => { calls++; return response(selected); }, async signal => {
+			if (!holdAuth) return;
+			authSignal = signal; entered.release();
+			await held.promise; // Deliberately non-cooperative fixture resolver.
+			authFinished.release();
+		});
+	});
+}
+
+test("stop during asynchronous SDK header transforms rejects before host provider dispatch", async () => {
+	let calls = 0, headersSeen = 0;
+	await fixture(async ({ create, agentDir }) => {
+		const runtime = await create(), session = sessionOf(runtime);
+		const entered = latch(), held = latch();
+		await mountFixtureHooks(session, agentDir, pi => {
+			pi.on("before_provider_headers", async event => {
+				headersSeen++;
+				assert.equal(event.headers["x-host"], "yes", "host assembles auth exactly once before transforms");
+				event.headers["x-fixture"] = "preserved";
+				if (headersSeen !== 1) return;
+				entered.release(); await held.promise;
+			});
+		});
+		const old = runtime.sendMessage("held header transform");
+		let stopping: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			stopping = runtime.cancelWork();
+			held.release();
+			await Promise.all([old, stopping]);
+			assert.equal(calls, 0);
+			await runtime.sendMessage("fresh explicit request after header cancellation");
+			assert.equal(calls, 1);
+			assert.equal(headersSeen, 2);
+		} finally {
+			held.release(); await Promise.allSettled([old, stopping]);
+		}
+	}, (selected, _context, options) => {
+		calls++;
+		assert.equal(options?.headers?.["x-fixture"], "preserved");
+		assert.equal(options?.apiKey, "test-only-runtime-key");
+		return response(selected);
+	});
+});
+
+test("both delegated public stream methods capture and enforce the request permit", async () => {
+	let calls = 0, transformed = 0;
+	const { host } = await hostRegistry(selected => { calls++; return response(selected); });
+	let permit = new AbortController();
+	const { modelRuntime } = await createSideModelRuntime(host, () => permit.signal);
+	permit.abort();
+	assert.throws(() => modelRuntime.stream(model, { messages: [] }), { name: "AbortError" });
+	assert.throws(() => modelRuntime.streamSimple(model, { messages: [] }), { name: "AbortError" });
+	assert.equal(calls, 0);
+	for (const method of ["stream", "streamSimple"] as const) {
+		permit = new AbortController();
+		const captured = permit;
+		const entered = latch(), held = latch();
+		const result = modelRuntime[method](model, { messages: [] }, {
+			transformHeaders: async (headers: ProviderHeaders) => {
+				transformed++; entered.release(); await held.promise;
+				return { ...headers, "x-delegated": "yes" };
+			},
+		}).result();
+		await entered.promise;
+		captured.abort();
+		permit = new AbortController(); // Must not revive the captured request.
+		held.release();
+		const cancelled = await result;
+		assert.equal(cancelled.stopReason, "error");
+		assert.match(cancelled.errorMessage!, /aborted/);
+		assert.equal(calls, 0);
+		assert.equal((await modelRuntime[method](model, { messages: [] }).result()).stopReason, "stop");
+		assert.equal(calls, 1);
+		calls = 0;
+	}
+	assert.equal(transformed, 2, "existing header transforms run only once");
 });

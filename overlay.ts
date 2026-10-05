@@ -1,8 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type KeybindingsManager, type TUI } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, getKeybindings, isKeyRelease, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type KeybindingsManager, type TUI, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { JarvisDraftEditor } from "./draft-editor.js";
-import { renderJarvisHeader, renderJarvisActivity } from "./overlay-layout.js";
-import { TranscriptViewport } from "./transcript-viewport.js";
+import { renderJarvisHeader, renderJarvisActivity, renderJarvisControls } from "./overlay-layout.js";
+import { JarvisChoicePicker, type JarvisPickerChoice } from "./model-picker.js";
+import { TranscriptViewport, type TranscriptLineAnchor } from "./transcript-viewport.js";
 import { JarvisIntroAnimation, renderJarvisIntro } from "./jarvis-branding.js";
 
 export interface JarvisDisplayEntry {
@@ -19,6 +20,11 @@ export interface JarvisOverlayView {
 	getIsProcessing?(): boolean;
 	getModelLabel(): string;
 	getModelModeLabel(): string;
+	getThinkingLabel?(): string;
+	getModelChoices?(): Promise<readonly JarvisPickerChoice[]>;
+	configureModel?(request: string): Promise<void>;
+	configureThinking?(request: string): Promise<void>;
+	cancelWork?(): Promise<void>;
 	getMainStatusLabel(): string;
 	getMainModelLabel(): string;
 	getMainFocusLabel(): string;
@@ -35,9 +41,26 @@ export interface JarvisOverlayView {
 }
 
 type NotificationType = "info" | "warning" | "error";
-type OverlayFocusTarget = "input" | "tools" | "followUp" | "steer";
+type OverlayFocusTarget = "input" | "tools" | "followUp" | "steer" | "model" | "thinking" | "history";
 
-const OVERLAY_FOCUS_ORDER: readonly OverlayFocusTarget[] = ["input", "tools", "followUp", "steer"];
+const OVERLAY_FOCUS_ORDER: readonly OverlayFocusTarget[] = ["input", "tools", "followUp", "steer", "model", "thinking", "history"];
+
+type PickerState = {
+	kind: "model" | "thinking";
+	thread: number;
+	transcript: number;
+	picker?: JarvisChoicePicker;
+	loading: boolean;
+	saving: boolean;
+	error?: string;
+};
+
+const THINKING_CHOICES: readonly JarvisPickerChoice[] = [
+	{ value: "auto", label: "auto (follow main when model follows main; otherwise off)" },
+	{ value: "follow-main", label: "follow-main (follow main thinking)" },
+	...["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value, label: value })),
+	{ value: "clear", label: "clear (remove project thinking override)" },
+];
 
 interface NotificationItem {
 	message: string;
@@ -63,6 +86,16 @@ export interface JarvisOverlaySnapshot {
 
 export class JarvisOverlayBridge {
 	private requestRender?: () => void;
+	private readonly listeners = new Set<() => void>();
+
+	constructor(private readonly canConfirm: () => boolean = () => true) {}
+
+	/** Presentation-independent observers, e.g. the main-session footer. */
+	onChange(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => { this.listeners.delete(listener); };
+	}
+
 	private statuses = new Map<string, string>();
 	private notifications: NotificationItem[] = [];
 	private workingMessage?: string;
@@ -143,6 +176,8 @@ export class JarvisOverlayBridge {
 
 	requestConfirmation(title: string, message: string, signal?: AbortSignal): Promise<boolean> {
 		if (signal?.aborted) return Promise.resolve(false);
+		try { if (!this.canConfirm()) return Promise.resolve(false); }
+		catch { return Promise.resolve(false); }
 		if (this.pendingConfirmation) {
 			const previous = this.pendingConfirmation;
 			this.pendingConfirmation = undefined;
@@ -193,6 +228,9 @@ export class JarvisOverlayBridge {
 	}
 
 	private emit(): void {
+		for (const listener of this.listeners) {
+			try { listener(); } catch { /* Observers cannot break work/confirmation settlement. */ }
+		}
 		this.requestRender?.();
 	}
 }
@@ -208,6 +246,8 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	private historySeeded = false;
 	private readonly viewport = new TranscriptViewport();
 	private disposed = false;
+	private pickerState?: PickerState;
+	private stopping = false;
 	private releaseBridge?: () => boolean;
 	private confirmationToken?: object;
 	private confirmationLayout = "";
@@ -225,6 +265,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	private transcriptCache: Array<{ kind: JarvisDisplayEntry["kind"]; text: string; lines: string[] }> = [];
 	private transcriptLines: string[] = [];
 	private transcriptContinuationLabels: Array<string | undefined> = [];
+	private transcriptAnchors: Array<TranscriptLineAnchor | undefined> = [];
 
 	constructor(
 		private readonly tui: TUI,
@@ -281,6 +322,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			this.transcriptGeneration = transcriptGeneration;
 			this.viewport.reset();
 			this.transcriptCacheWidth = -1;
+			this.dismissPicker();
 		}
 		const generation = this.bridge.getThreadGeneration();
 		if (generation === this.threadGeneration) {
@@ -301,7 +343,10 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	attachBridge(): void {
 		if (this.disposed) return;
 		this.releaseBridge?.();
-		this.releaseBridge = this.bridge.attach(() => this.tui.requestRender());
+		this.releaseBridge = this.bridge.attach(() => {
+			if (this.bridge.hasPendingConfirmation()) this.dismissPicker();
+			this.tui.requestRender();
+		});
 	}
 
 	handleInput(data: string): void {
@@ -321,11 +366,22 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	private handleKey(data: string): void {
 		const kb = this.keybindings;
 		const hasConfirmation = this.bridge.hasPendingConfirmation();
-		if (this.input.handlePasteInput(data, hasConfirmation)) {
-			if (!hasConfirmation) this.focusTarget = "input";
+		if (hasConfirmation) this.dismissPicker();
+		// The same framing owner drains paste even across picker/confirmation/reset.
+		if (this.input.handlePasteInput(data, hasConfirmation || Boolean(this.pickerState))) {
+			if (!hasConfirmation && !this.pickerState) this.focusTarget = "input";
 			return;
 		}
 		if (isKeyRelease(data)) return;
+		// Pi's default select.cancel includes Ctrl+C; Jarvis reserves it for stop.
+		if (matchesKey(data, "ctrl+c")) {
+			// Review owns input: Ctrl+C cancels review, never approves or stops
+			// a task as a side effect of selector/confirmation cancellation.
+			if (hasConfirmation) this.bridge.resolveConfirmation(false);
+			else if (this.pickerState) this.dismissPicker();
+			else this.stopWork();
+			return;
+		}
 		if (hasConfirmation) {
 			if (matchesKey(data, "y") || matchesKey(data, "shift+y")) {
 				if (this.focused && this.confirmationCanApprove && this.confirmationToken === this.bridge.getConfirmationToken()
@@ -348,7 +404,16 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			// Other keys cannot submit input or toggle permissions while reviewing.
 			return;
 		}
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (this.pickerState) {
+			if (matchesKey(data, "escape") || kb.matches(data, "tui.select.cancel")) this.dismissPicker();
+			else if (!this.pickerState.loading && !this.pickerState.saving) this.pickerState.picker?.handleInput(data);
+			return;
+		}
+		if (matchesKey(data, "f2") || matchesKey(data, "f3")) {
+			this.openPicker(matchesKey(data, "f2") ? "model" : "thinking");
+			return;
+		}
+		if (matchesKey(data, "escape") || kb.matches(data, "tui.select.cancel")) {
 			this.dispose();
 			return;
 		}
@@ -370,6 +435,14 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		}
 		if (kb.matches(data, "tui.editor.pageDown")) {
 			this.viewport.pageDown();
+			return;
+		}
+		if (matchesKey(data, "alt+up") || matchesKey(data, "alt+down")) {
+			this.viewport.scrollLines(matchesKey(data, "alt+up") ? -1 : 1);
+			return;
+		}
+		if (this.focusTarget === "history" && (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down"))) {
+			this.viewport.scrollLines(kb.matches(data, "tui.select.up") ? -1 : 1);
 			return;
 		}
 		if (matchesKey(data, "shift+tab")) {
@@ -396,20 +469,23 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		const maxHeight = this.maxHeightProvider();
 		const snapshot = this.bridge.snapshot();
 		const hasConfirmation = Boolean(snapshot.pendingConfirmation);
-		if (hasConfirmation || snapshot.notifications.some((item) => item.type !== "info")) this.intro.finish();
-		this.input.focused = this.focused && !hasConfirmation && this.focusTarget === "input";
+		if (hasConfirmation) this.dismissPicker();
+		if (hasConfirmation || this.pickerState || snapshot.notifications.some((item) => item.type !== "info")) this.intro.finish();
+		this.input.focused = this.focused && !hasConfirmation && !this.pickerState && this.focusTarget === "input";
 		this.renderedRows = this.tui.terminal.rows;
 		this.renderedColumns = this.tui.terminal.columns;
 		this.confirmationCanApprove = false;
 		if (width === 0 || maxHeight === 0) {
+			this.pickerState?.picker?.invalidate();
 			this.intro.finish();
 			this.stopThinkingAnimation();
 			return [];
 		}
 		if (width < 5 || maxHeight < 3) {
+			this.pickerState?.picker?.invalidate();
 			this.intro.finish();
 			this.stopThinkingAnimation();
-			return hasConfirmation ? [truncateToWidth("Enlarge to review; Esc cancel", width, "", true)] : this.renderInputLines(width, 1);
+			return hasConfirmation || this.pickerState ? [truncateToWidth("Enlarge to review; Esc cancel", width, "", true)] : this.renderInputLines(width, 1);
 		}
 		const innerWidth = width - 4;
 		const maxBodyLines = maxHeight - 2;
@@ -420,15 +496,25 @@ export class JarvisOverlayComponent implements Component, Focusable {
 				this.borderBottom(innerWidth)];
 		}
 
-		const inputLines = this.renderInputLines(innerWidth, Math.max(1, Math.min(5, Math.floor(maxBodyLines / 4))));
+		if (this.pickerState) {
+			this.stopThinkingAnimation();
+			return [this.borderTop(innerWidth), ...this.renderPicker(innerWidth, maxBodyLines).map((line) => this.row(line, innerWidth)), this.borderBottom(innerWidth)];
+		}
+
+		// Keep at least three history rows on typical terminals, even with a
+		// multiline draft. The editor's public cursor crop retains all draft text.
+		const inputBudget = Math.max(1, Math.min(5, maxBodyLines >= 14 ? maxBodyLines - 14 : Math.floor(maxBodyLines / 4)));
+		const inputLines = this.renderInputLines(innerWidth, inputBudget);
 		const footerLines = maxBodyLines >= 10 ? [
-			`${this.keyLabel("tui.input.submit")} send • ${this.keyLabel("tui.input.newLine")} newline • ${this.keyLabel("tui.input.tab")} access • ${this.keyLabel("tui.select.cancel")} close`,
-			snapshot.notifications.length ? "ctrl+l dismiss notice • ctrl+o details • ctrl+end live"
-				: `${this.keyLabel("tui.editor.pageUp")}/${this.keyLabel("tui.editor.pageDown")} scroll • ctrl+end live • ctrl+o details`,
-		] : maxBodyLines >= 3 ? [`${this.keyLabel("tui.input.submit")} send • ${this.keyLabel("tui.input.newLine")} newline • ${this.keyLabel("tui.select.cancel")} close`] : [];
+			`${this.keyLabel("tui.input.submit")} send • ${this.keyLabel("tui.input.newLine")} newline • esc close`,
+			`${this.keyLabel("tui.editor.pageUp")}/${this.keyLabel("tui.editor.pageDown")} • alt+↑/↓ history • ctrl+end live`,
+			`${this.keyLabel("tui.input.tab")} controls • ctrl+c stop • ${snapshot.notifications.length ? "ctrl+l notice" : "ctrl+o details"}`,
+		] : maxBodyLines >= 3 ? ["F2 Model • F3 Thinking • esc close", "PgUp/PgDn scroll • ctrl+c stop"] : [];
+		const panel = maxBodyLines >= 9 && innerWidth >= 12;
 		const promptSection = [
-			...(maxBodyLines >= 7 ? [this.sectionDivider("Message", innerWidth)] : []),
+			...(maxBodyLines >= 7 ? [this.promptBorder("Prompt · Message", innerWidth, true)] : []),
 			...inputLines,
+			...(panel ? [this.promptBorder("", innerWidth, false)] : []),
 			...footerLines.map((line) => truncateToWidth(this.theme.fg("dim", line), innerWidth, "", true)),
 		];
 		let remaining = Math.max(0, maxBodyLines - promptSection.length);
@@ -442,6 +528,13 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			? [...header.slice(0, headerBudget - 1), header[header.length - 1]!]
 			: headerBudget === 1 ? [this.focusTarget === "input" ? header[0]! : header[header.length - 1]!] : [];
 		remaining -= top.length;
+		if (remaining > 1 || ["model", "thinking", "history"].includes(this.focusTarget)) {
+			if (remaining === 0 && top.length) { top.pop(); remaining++; }
+			if (remaining > 0) {
+				top.push(renderJarvisControls(this.theme, this.view, innerWidth, { expanded: this.expandedDetails, focusTarget: this.focusTarget, focused: this.focused }));
+				remaining--;
+			}
+		}
 		const active = Boolean(this.view.getIsProcessing?.() || this.view.isStreaming());
 		this.syncThinkingAnimation(active && remaining > 0);
 		if (remaining > 0) {
@@ -460,14 +553,121 @@ export class JarvisOverlayComponent implements Component, Focusable {
 		if (remaining < 3) this.intro.finish();
 		const introFrame = this.intro.frame();
 		if (introFrame !== undefined) {
+			// Seed only on initial layout/reflow, not every animation tick. The
+			// first scrolling key dismisses decoration AND navigates real history.
+			if (this.transcriptCacheWidth !== innerWidth || this.viewport.getStatus().totalLines === 0) this.renderTranscript(innerWidth, Math.max(0, remaining - 1), snapshot);
 			top.push(...renderJarvisIntro(this.theme, innerWidth, remaining, introFrame));
 		} else if (remaining > 0) {
 			const transcript = this.renderTranscript(innerWidth, Math.max(0, remaining - 1), snapshot);
 			const position = this.viewport.getStatus();
-			const label = position.following ? "Conversation · live" : `History · ${position.hiddenBelow} lines below · ctrl+end live`;
+			const historyFocus = this.focused && this.focusTarget === "history" ? "[History ↑/↓] · " : "";
+			const label = historyFocus + (position.following ? "Conversation · live" : `History · ${position.hiddenBelow} lines below · ctrl+end live`);
 			top.push(this.sectionDivider(label, innerWidth), ...transcript);
 		}
 		return [this.borderTop(innerWidth), ...[...top, ...promptSection].slice(0, maxBodyLines).map((line) => this.row(line, innerWidth)), this.borderBottom(innerWidth)];
+	}
+
+	/** Fullscreen public normalized events only; regular-mode wheel is terminal-owned. */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (this.disposed || event.type !== "wheel") return undefined;
+		this.syncThread();
+		if (this.bridge.hasPendingConfirmation() || this.input.hasPendingPaste()) return { handled: true, render: false };
+		if (this.pickerState) {
+			return this.pickerState.picker?.handleMouse(event) ?? { handled: true, render: false };
+		}
+		this.intro.finish();
+		this.viewport.scrollLines(event.wheelDelta ?? 0);
+		this.tui.requestRender();
+		return { handled: true, render: true };
+	}
+
+	private openPicker(kind: PickerState["kind"]): void {
+		const configure = kind === "model" ? this.view.configureModel : this.view.configureThinking;
+		if (!configure || (kind === "model" && !this.view.getModelChoices)) {
+			this.bridge.notify(`Jarvis ${kind} selection is unavailable in this host.`, "warning");
+			return;
+		}
+		this.intro.finish();
+		this.focusTarget = "input";
+		const state: PickerState = { kind, thread: this.bridge.getThreadGeneration(), transcript: this.bridge.getTranscriptGeneration(), loading: true, saving: false };
+		this.pickerState = state;
+		const load = async () => {
+			try {
+				const choices = kind === "model" ? await this.view.getModelChoices!() : THINKING_CHOICES;
+				if (!this.pickerIsCurrent(state)) return;
+				state.picker = new JarvisChoicePicker(this.tui, this.theme, this.keybindings, choices,
+					(choice) => { void this.applyChoice(state, choice.value); }, () => this.dismissPicker(),
+					`Jarvis ${kind} · project override (main unchanged)`);
+				state.loading = false;
+			} catch (error) {
+				if (!this.pickerIsCurrent(state)) return;
+				state.loading = false;
+				state.error = String(error);
+			}
+			if (this.pickerIsCurrent(state)) this.tui.requestRender();
+		};
+		void load();
+	}
+
+	private pickerIsCurrent(state: PickerState): boolean {
+		return !this.disposed && this.pickerState === state && state.thread === this.bridge.getThreadGeneration()
+			&& state.transcript === this.bridge.getTranscriptGeneration() && !this.bridge.hasPendingConfirmation();
+	}
+
+	private async applyChoice(state: PickerState, request: string): Promise<void> {
+		if (!this.pickerIsCurrent(state) || state.saving || !this.focused
+			|| this.renderedRows !== this.tui.terminal.rows || this.renderedColumns !== this.tui.terminal.columns) return;
+		state.saving = true;
+		state.error = undefined;
+		this.tui.requestRender();
+		try {
+			if (state.kind === "model") await this.view.configureModel!(request);
+			else await this.view.configureThinking!(request);
+			if (this.pickerIsCurrent(state)) this.dismissPicker();
+		} catch (error) {
+			if (!this.pickerIsCurrent(state)) return;
+			state.saving = false;
+			state.error = String(error);
+		}
+		if (!this.disposed && state.thread === this.bridge.getThreadGeneration()) this.tui.requestRender();
+	}
+
+	private dismissPicker(): void {
+		if (!this.pickerState) return;
+		this.pickerState.picker?.invalidate();
+		this.pickerState = undefined;
+		this.focusTarget = "input";
+	}
+
+	private renderPicker(width: number, budget: number): string[] {
+		const state = this.pickerState!;
+		if (state.loading || state.saving || !state.picker) {
+			return [this.theme.fg("accent", `Jarvis ${state.kind}`),
+				this.theme.fg("muted", state.loading ? "Loading host model choices…" : state.saving ? "Applying project override…" : "Selection unavailable"),
+				...this.wrapBlock(this.theme.fg("error", sanitizeOverlayDisplayText(state.error ?? "")), width).slice(0, Math.max(0, budget - 3)),
+				this.theme.fg("dim", "Esc back • draft preserved")].slice(0, budget);
+		}
+		state.picker.focused = this.focused;
+		const errorLines = state.error ? this.wrapBlock(this.theme.fg("error", `Error: ${sanitizeOverlayDisplayText(state.error)}`), width).slice(0, Math.max(1, Math.min(3, budget - 4))) : [];
+		return [...state.picker.render(width, Math.max(1, budget - errorLines.length)), ...errorLines].slice(0, budget);
+	}
+
+	private stopWork(): void {
+		if (this.stopping) return;
+		if (!this.view.cancelWork) { this.bridge.notify("Stop is unavailable in this host.", "warning"); return; }
+		this.stopping = true;
+		const generation = this.bridge.getThreadGeneration();
+		const stop = async () => {
+			try { await this.view.cancelWork!(); }
+			catch (error) { if (!this.disposed && generation === this.bridge.getThreadGeneration()) this.bridge.notify(String(error), "error"); }
+			finally { this.stopping = false; }
+		};
+		void stop();
+	}
+
+	private promptBorder(label: string, width: number, top: boolean): string {
+		const text = label ? ` ${label} ` : "";
+		return truncateToWidth(this.theme.fg("borderAccent", (top ? "┌" : "└") + text + "─".repeat(Math.max(0, width - visibleWidth(text) - 1))), width, "", true);
 	}
 
 	private renderConfirmation(confirmation: JarvisPendingConfirmation, innerWidth: number, budget: number): string[] {
@@ -505,6 +705,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 
 	invalidate(): void {
 		this.input.invalidate();
+		this.pickerState?.picker?.invalidate();
 		this.transcriptCacheWidth = -1;
 		this.confirmationCanApprove = false;
 	}
@@ -512,6 +713,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.dismissPicker();
 		this.intro.finish();
 		this.input.focused = false;
 		this.input.dispose();
@@ -548,6 +750,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 			this.transcriptCacheWidth = innerWidth;
 			this.transcriptLines = [];
 			this.transcriptContinuationLabels = [];
+			this.transcriptAnchors = [];
 			const cache: typeof this.transcriptCache = [];
 			const labels = { user: "User:", assistant: "Jarvis:", tool: "Tool:", status: "Note:", system: "" };
 			for (let i = 0; i < entries.length; i++) {
@@ -555,15 +758,24 @@ export class JarvisOverlayComponent implements Component, Focusable {
 				const previous = this.transcriptCache[i];
 				const block = previous?.kind === entry.kind && previous.text === entry.text ? previous.lines : this.renderEntry(entry, innerWidth);
 				cache.push({ ...entry, lines: block });
-				if (i > 0 && entries[i - 1]!.kind !== entry.kind) { this.transcriptLines.push(""); this.transcriptContinuationLabels.push(undefined); }
+				if (i > 0 && entries[i - 1]!.kind !== entry.kind) { this.transcriptLines.push(""); this.transcriptContinuationLabels.push(undefined); this.transcriptAnchors.push(undefined); }
+				const safeText = sanitizeOverlayDisplayText(entry.text);
+				const key = `${entry.kind}:${safeText.slice(0, 500)}`;
+				let offset = 0;
 				for (let j = 0; j < block.length; j++) {
 					this.transcriptLines.push(block[j]!);
 					this.transcriptContinuationLabels.push(j > 0 ? labels[entry.kind] || undefined : undefined);
+					const label = labels[entry.kind];
+					const text = stripTerminalSequences(block[j]!).slice(label ? label.length + (j === 0 ? 1 : 2) : 0);
+					const found = text ? safeText.indexOf(text, offset) : offset;
+					if (found >= 0) offset = found;
+					this.transcriptAnchors.push({ key, offset });
+					offset += text.length;
 				}
 			}
 			this.transcriptCache = cache;
 		}
-		const visible = this.viewport.render(this.transcriptLines, budget, innerWidth);
+		const visible = this.viewport.render(this.transcriptLines, budget, innerWidth, this.transcriptAnchors);
 		const start = this.viewport.getStatus().startLine;
 		const label = this.transcriptContinuationLabels[start];
 		if (label && visible.length) visible[0] = truncateToWidth(`${this.theme.fg("muted", label)} ${visible[0]!.trimStart()}`, innerWidth, "", true);
@@ -588,11 +800,14 @@ export class JarvisOverlayComponent implements Component, Focusable {
 	}
 
 	private renderInputLines(innerWidth: number, maxLines: number): string[] {
-		const prefix = innerWidth >= 3 ? `${this.theme.fg("accent", "›")} ` : "";
-		const inputWidth = Math.max(1, innerWidth - visibleWidth(prefix));
-		return this.input.render(inputWidth, maxLines).map((line, index) => truncateToWidth(
-			(index === 0 ? prefix : " ".repeat(visibleWidth(prefix))) + line, innerWidth, "", true,
-		));
+		const prompt = innerWidth >= 12 ? "jarvis > " : innerWidth >= 3 ? "> " : "";
+		const continuation = innerWidth >= 12 ? "     ... " : innerWidth >= 3 ? "| " : "";
+		const inputWidth = Math.max(1, innerWidth - visibleWidth(prompt));
+		return this.input.render(inputWidth, maxLines).map((line, index) => {
+			const content = truncateToWidth(this.theme.fg("accent", index === 0 ? prompt : continuation) + this.theme.fg("text", line), innerWidth, "", true);
+			const padded = content + " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
+			return typeof this.theme.bg === "function" ? this.theme.bg("userMessageBg", padded) : padded;
+		});
 	}
 
 	private notificationLines(items: readonly NotificationItem[], innerWidth: number): string[] {
@@ -605,7 +820,7 @@ export class JarvisOverlayComponent implements Component, Focusable {
 
 	private sectionDivider(label: string, innerWidth: number): string {
 		const plain = ` ${label} `;
-		const fillWidth = Math.max(0, innerWidth - plain.length);
+		const fillWidth = Math.max(0, innerWidth - visibleWidth(plain));
 		const left = Math.floor(fillWidth / 2);
 		const right = fillWidth - left;
 		return truncateToWidth(this.theme.fg("borderMuted", `${"─".repeat(left)}${plain}${"─".repeat(right)}`), innerWidth, "", true);
@@ -631,6 +846,12 @@ export class JarvisOverlayComponent implements Component, Focusable {
 				break;
 			case "steer":
 				this.view.toggleSteerToMain();
+				break;
+			case "model":
+			case "thinking":
+				this.openPicker(this.focusTarget);
+				break;
+			case "history":
 				break;
 		}
 	}

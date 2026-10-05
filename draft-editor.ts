@@ -77,6 +77,8 @@ export class JarvisDraftEditor implements Focusable {
 
 	/** Includes all pasted text, never a display-only paste placeholder. */
 	getText(): string { return this.editor.getExpandedText(); }
+	/** Parent mouse handlers must not act on protocol bytes inside paste either. */
+	hasPendingPaste(): boolean { return this.inPaste || Boolean(this.startTail); }
 
 	/** Silent programmatic replacement/restore; does not publish onChange. */
 	setText(text: string): void {

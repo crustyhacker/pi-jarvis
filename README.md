@@ -22,7 +22,7 @@ And `/jarvis` still gives you a polished side-conversation overlay: a second opi
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.10.2</p>
+<p><strong>Current version:</strong> 1.11.0</p>
 
 ```bash
 pi install npm:pi-jarvis
@@ -236,12 +236,17 @@ Or open it and send the first message immediately:
 - turn `Note main` on when you want Jarvis to quietly message the main session
 - turn `Redirect` on when you want Jarvis to propose a redirect that you still explicitly confirm
 
+**Close is not stop:** assigned work and enabled access now survive ordinary window close/reopen within the same running main/side session. Check main Pi's Jarvis status, use `/jarvis stop` to request cancellation, or `/jarvis access off` to revoke access. Defaults remain off; reload/restart does not restore grants.
+
 ---
 
 ## Command surface
 
 ### `/jarvis`
-Opens the side overlay. If text follows the command, that text becomes the first side-session prompt.
+Opens the side overlay. Task text following the command becomes the first side-session prompt. Closing the window does **not** stop an assigned task or clear enabled access within the same running main/side session.
+
+### `/jarvis status` · `/jarvis stop` · `/jarvis access off`
+Local controls work even with the window closed, without booting a side session or sending a model prompt. `status` reports activity, waiting inputs and access; `stop` requests cancellation of active work and clears waiting inputs; `access off` disables Repo tools, Note main and Redirect and cancels pending reviews. These are explicit reserved command forms, not task prompts. Stopping/revocation is best effort—not rollback of tools or remote work already started.
 
 ### `/jarvis-model`
 In Pi's terminal UI, running `/jarvis-model` with no argument opens a searchable model picker. In RPC, JSON, and print modes it reports the current selection; exact model-setting commands still work. `/jarvis` itself requires the terminal UI and does not start hidden work in other modes.
@@ -281,6 +286,7 @@ The `/jarvis` input handles a small set of built-in commands against the isolate
 - `/tree <entry-id>` navigates the `/jarvis` session tree to that entry.
 - `/tree --summarize <entry-id> [instructions]` navigates and summarizes the branch being left.
 - `/new` starts a fresh `/jarvis` side-session without changing the main Pi session.
+- `/status`, `/stop`, `/access off` (or `/jarvis status|stop|access off`) are immediate local background controls, without model/queue work.
 - `/memory …` or `/jarvis-memory …` manages shared memory immediately, without sending a model prompt or waiting for queued side work. Initial forms such as `/jarvis /memory off` are also handled locally, without booting a side session.
 - `/archive …` or `/jarvis-archive …` manages the separate optional archive locally, without model/queue work; initial `/jarvis /archive …` works without booting a side session.
 
@@ -581,7 +587,11 @@ The overlay header exposes three controls, all **off by default**:
 | `Note main` | Sends a concise, non-interrupting note to the main session | Explicit opt-in |
 | `Redirect` | Sends a redirecting instruction to the main session | Explicit opt-in + per-send confirmation |
 
-`Note main` and `Redirect` can be forcibly disabled when the active `/jarvis` model is incompatible with bridge tools. Closing the overlay revokes all three permissions and cancels pending confirmations. Already-running local operations are not undone; newly starting calls are blocked.
+`Note main` and `Redirect` can be forcibly disabled when the active `/jarvis` model is incompatible with bridge tools. **Ordinary close keeps assigned work and enabled switches running**; reopen to continue the same side conversation. Main Pi's status area shows Jarvis's activity and enabled access while the window is closed. Enabled Repo tools may continue local/native MCP work, and enabled Note main may deliver a follow-up in the background.
+
+**Redirect still requires visible, per-send human confirmation.** Closing cancels pending confirmations, and new background redirect/deletion reviews are refused rather than left hidden or automatically approved. Nothing is automatically resent on reopen.
+
+Use `/jarvis stop` to request cancellation and clear waiting inputs, or `/jarvis access off` to revoke all three grants without relying on window close. Grants live only in memory: side `/new`, main/side-reference replacement, observed trust denial and reload/quit revoke them. Archive password entry explicitly revokes the transient grants before closing Jarvis. Already-running operations are not undone; native cancellation remains best effort.
 
 Long redirects are paged: review every page with Up/Down or PageUp/PageDown before pressing Y. Resize if the terminal is too small to review safely. Configured Pi selection keybindings are respected.
 
@@ -595,25 +605,33 @@ To skip the intro, start Pi with `PI_JARVIS_NO_ANIMATION=1`. A non-empty `NO_COL
 
 ### Keyboard and drafts
 
-Version **1.5.0** adds compact diagnostics, scrollback, and a multiline draft editor.
+Version **1.11.0** separates close from stop, adds in-window settings pickers and discoverable scrolling, and gives the multiline draft a distinct terminal-style panel.
 
 | Key | Action |
 |---|---|
-| Enter | Send the draft; toggle a focused permission control |
+| Enter | Send the draft; activate a focused control |
 | Shift+Enter / Ctrl+J | Insert a newline |
-| Tab / Shift+Tab | Cycle between the editor and permission controls |
-| Space | Toggle a focused permission control |
+| Tab / Shift+Tab | Cycle between prompt, history, settings and access controls |
+| Space | Toggle a focused permission or open its settings picker |
+| F2 / F3 | Select Jarvis's model / thinking level inside the window |
 | PageUp / PageDown | Scroll conversation history; reaching the bottom resumes live following |
+| Up / Down with history focused | Scroll history line by line |
+| Alt+Up / Alt+Down | Scroll history line by line without leaving the prompt |
 | Ctrl+End | Jump back to live output |
 | Ctrl+O | Expand/collapse model, main-context delta, and access details |
 | Ctrl+L | Dismiss notices |
-| Escape | Close; during redirect review, cancel the confirmation instead |
+| Ctrl+C | Request stopping Jarvis work and clear waiting inputs; reviews/pickers retain their own cancellation behavior |
+| Escape | Close without stopping work; inside a picker/review, cancel it instead |
 
 The compact header keeps main status, the side model, main focus, and permissions visible. Activity and waiting-message counts remain visible while reading older output; counts exclude the active request. The latest notice appears separately; expand details for more of a long notice.
 
 The multiline editor uses Pi's public editor and configured editing keybindings. Up/Down move within a draft; Up at the beginning of the first line (or in an empty editor) recalls prompts. Down past recalled prompts restores the draft. Pasted indentation and newlines are preserved, with Pi's normal tab-to-spaces normalization. Oversized drafts (over 64 KiB) and terminal-control payloads are rejected explicitly, never silently truncated or sent.
 
-Unsent drafts survive closing and reopening `/jarvis` in the same running Pi session. They are not saved to disk. Side `/new`, main-session replacement, and switching to an unrelated side-session reference clear them; navigating the side tree only resets the transcript view. Closing still revokes all three overlay permissions; shared memory follows its separate persistent controls.
+The prompt is a distinct terminal-style **`jarvis >` message editor**, not an operating-system shell. It keeps Pi's multiline editing and indentation. F2/F3 open pickers within the same window and preserve the draft; their choices use project-scoped settings, with follow-main/auto and clear-override options. Model/thinking changes are refused during active work rather than interrupting it; stop or wait, then select. The main model and thinking level stay unchanged.
+
+Keyboard history scrolling works in regular and fullscreen TUI. Supported fullscreen wheel events scroll the overlay; in regular mode the terminal owns wheel/scrollback, so use the keyboard controls for Jarvis history. Reading older output stays anchored while new output arrives; Ctrl+End returns to live.
+
+Unsent drafts and enabled access switches survive closing/reopening in the same running main/side session. They are not saved to disk. Side `/new`, main-session replacement, and switching to an unrelated side-session reference clear them; navigating the side tree only resets the transcript view. Background work is owned by that live Pi session, not a detached daemon: replacement/reload/quit ends it. Shared memory follows its separate persistent controls.
 
 Scrollback follows new output until you scroll up. To bound rendering work, the overlay retains up to 500 recent entries and 512K UTF-16 code units of source text, with a 64K-unit per-entry limit. Omitted content is marked explicitly; these display limits do not modify persisted conversation history. Resizing preserves the reading position on a best-effort basis.
 

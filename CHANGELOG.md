@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.11.0] - 2026-10-05
+
+### Overlay fixes
+- Separate closing Jarvis's window from stopping assigned work; preserve in-memory Repo tools, Note main and Redirect choices across same-owner close/reopen. Keep background activity/access visible in main Pi with explicit local status, stop and access-off controls.
+- Add in-window model/thinking selection using existing scoped settings without changing the main session model or thinking. Refuse changes during active work and invalidate stale picker/configuration results.
+- Make transcript navigation discoverable with keyboard history focus and supported fullscreen wheel scrolling, while preserving the reading anchor as output arrives.
+- Give the multiline prompt a distinct terminal-style message panel, retaining indentation, bounded draft validation and paste-before-shortcut handling.
+
+### Permission and lifetime boundaries
+- Closing cancels pending human reviews and refuses invisible future confirmations; Redirect never bypasses per-send approval. Access-off, observed trust denial, side `/new`, owner/reference replacement and teardown still revoke grants. Archive private-input preparation explicitly revokes grants before closing/yielding.
+- Background work is owned by the live Pi session, not a detached daemon. Stop/revocation is best effort, not rollback or automatic replay; memory/archive controls remain independent.
+
 ## [1.10.2] - 2026-10-05
 
 ### Documentation and package discoverability

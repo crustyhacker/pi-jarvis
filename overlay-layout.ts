@@ -4,12 +4,12 @@ import type { JarvisOverlaySnapshot, JarvisOverlayView } from "./overlay.js";
 
 export interface JarvisHeaderOptions {
 	expanded: boolean;
-	focusTarget: "input" | "tools" | "followUp" | "steer";
+	focusTarget: "input" | "tools" | "followUp" | "steer" | "model" | "thinking" | "history";
 	focused: boolean;
 }
 
 interface PermissionControl {
-	target: Exclude<JarvisHeaderOptions["focusTarget"], "input">;
+	target: "tools" | "followUp" | "steer";
 	label: string;
 	enabled: boolean;
 }
@@ -69,6 +69,32 @@ export function renderJarvisHeader(
 		{ target: "steer", label: "Redirect", enabled: view.isSteerToMainEnabled() },
 	], width, options));
 	return lines;
+}
+
+/** Width-aware selector/history controls; never hide the focused target. */
+export function renderJarvisControls(theme: Theme, view: JarvisOverlayView, width: number, options: JarvisHeaderOptions): string {
+	width = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
+	if (!width) return "";
+	const model = inlineText(view.getModelModeLabel());
+	const thinking = inlineText(view.getThinkingLabel?.() ?? "");
+	const controls = [
+		{ target: "model", label: "F2 Model", detail: model },
+		{ target: "thinking", label: "F3 Thinking", detail: thinking },
+		{ target: "history", label: "History ↑/↓", detail: "" },
+	];
+	const selected = controls.findIndex((control) => control.target === options.focusTarget);
+	const ordered = selected > 0 ? [...controls.slice(selected), ...controls.slice(0, selected)] : controls;
+	const render = (control: typeof controls[number], detail: boolean) => {
+		const label = control.label + (detail && control.detail ? `: ${control.detail}` : "");
+		return options.focused && options.focusTarget === control.target ? theme.bold(theme.fg("accent", `[${label}]`)) : theme.fg("muted", label);
+	};
+	for (const detailTargets of [new Set(["model", "thinking"]), new Set([selected < 0 ? "thinking" : options.focusTarget]), new Set<string>()]) {
+		const row = ordered.map((control) => render(control, detailTargets.has(control.target))).join(theme.fg("dim", " • "));
+		if (visibleWidth(row) <= width) return row;
+	}
+	// At typical inner widths retain both picker shortcuts. History/Tab paths
+	// are also explained by the always-visible keyboard hints.
+	return fit(ordered.slice(0, 2).map((control) => render(control, false)).join(" • "), width, "");
 }
 
 /**

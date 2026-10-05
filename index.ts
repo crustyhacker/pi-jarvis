@@ -84,6 +84,12 @@ type MainState = {
 	bootPromise?: Promise<JarvisSideSessionRuntime>;
 	bootGeneration: number;
 	flushPromise?: Promise<void>;
+	stopPromise?: Promise<void>;
+	workGeneration: number;
+	configuring?: object;
+	statusContext?: ExtensionContext;
+	trustProvider?: () => boolean;
+	overlayOwner?: object;
 	closeOverlay?: () => void;
 	overlayOpen?: boolean;
 	modelPickerOpen?: boolean;
@@ -117,16 +123,22 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	// Presentation-only memory, keyed by MAIN identity, never by the side tree.
 	// Reopening or returning to a session does not replay the intro.
 	const introSeenSessions = new Set<string>();
+	// Do not let an older saving picker overwrite a newer accepted choice in
+	// the same presentation after out-of-order catalog completion.
+	let embeddedModelRequest: object | undefined;
+	let embeddedThinkingRequest: object | undefined;
 	const mainSession = new MainSessionTracker();
 	const state: MainState = {
-		bridge: new JarvisOverlayBridge(),
+		bridge: new JarvisOverlayBridge(() => Boolean(state.overlayOpen) && !isArchiveSecretPromptActive()),
 		memory: new SharedMemoryService(getAgentDir()),
 		archive: new SharedArchiveService(getAgentDir(), {
 			beforeSecretPrompt: async () => {
 				if (state.modelPickerOpen || state.memoryReviewOpen) {
 					throw new Error("Finish the current Jarvis picker or memory review before entering an archive password.");
 				}
-				// Use a private editor-area component, never a nested custom overlay.
+				// Password preparation explicitly revokes access BEFORE closing/yielding.
+				// Ordinary presentation close deliberately preserves these grants.
+				resetTransientAccessControls(state);
 				state.closeOverlay?.();
 				await Promise.resolve();
 			},
@@ -147,11 +159,16 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		allowFollowUpToMain: false,
 		allowSteerToMain: false,
 		bootGeneration: 0,
+		workGeneration: 0,
 	};
 
+	state.bridge.onChange(() => refreshMainStatus(state));
+
 	pi.registerCommand("jarvis", {
-		description: "Open the /jarvis side conversation overlay",
+		description: "Open Jarvis; status, stop, or access off control background work locally",
 		handler: async (args, ctx) => {
+			const localControl = parseLocalControl(args, true);
+			if (localControl) { await dispatchLocalControl(state, localControl, ctx, Boolean(state.overlayOpen)); return; }
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/jarvis requires Pi's interactive terminal UI.", "warning");
 				return;
@@ -174,8 +191,15 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("/jarvis is already open.", "info");
 				return;
 			}
+			if (state.configuring) {
+				ctx.ui.notify("Wait for /jarvis configuration to finish, then reopen.", "warning");
+				return;
+			}
 			updateContextState(pi, state, ctx);
+			const overlayOwner = {};
+			state.overlayOwner = overlayOwner;
 			state.overlayOpen = true;
+			state.bridge.refresh();
 
 			void ensureRuntime(pi, state, ctx).catch((error) => {
 				if (isStaleJarvisBootError(error)) {
@@ -185,12 +209,12 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			});
 
 			const initialMessage = normalizeInitialMessage(args);
-			if (initialMessage) {
+			if (initialMessage && !state.stopPromise) {
 				queueMessage(state, initialMessage);
 				void flushQueuedMessages(pi, state, ctx);
 			}
 
-			const overlayView = createOverlayView(pi, state, ctx);
+			const overlayView = createOverlayView(pi, state, ctx, configureModel, configureThinking);
 			try {
 				await ctx.ui.custom<void>(
 					(tui, theme, keybindings, done) => {
@@ -199,8 +223,12 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 						const closeOverlay = () => {
 							if (closed) return;
 							closed = true;
-							resetTransientAccessControls(state);
-							state.bridge.resolveConfirmation(false);
+							if (state.overlayOwner === overlayOwner) {
+								state.overlayOpen = false;
+								state.closeOverlay = undefined;
+								state.bridge.resolveConfirmation(false);
+								state.bridge.refresh();
+							}
 							done(undefined);
 							queueMicrotask(() => tui.requestRender());
 						};
@@ -226,299 +254,373 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 					},
 				);
 			} finally {
-				state.overlayOpen = false;
-				state.closeOverlay = undefined;
-				resetTransientAccessControls(state);
-				state.bridge.resolveConfirmation(false);
+				if (state.overlayOwner === overlayOwner) {
+					state.overlayOpen = false;
+					state.closeOverlay = undefined;
+					state.bridge.resolveConfirmation(false);
+					state.bridge.refresh();
+				}
 			}
 		},
 	});
 
-	pi.registerCommand("jarvis-model", {
-		description: "Set the model used by /jarvis without changing the main agent model",
-		handler: async (args, ctx) => {
-			updateContextState(pi, state, ctx);
+	const configureModel = async (args: string, ctx: ExtensionCommandContext, embedded = false): Promise<void> => {
+		const owner = state.queuedMessages, interaction = state.overlayOwner, thread = state.bridge.getThreadGeneration();
+		const requestToken = {};
+		let accepted = false;
+		const superseded = () => accepted && (embeddedModelRequest !== requestToken || state.bridge.getThreadGeneration() !== thread);
+		const notify = (message: string, type?: "info" | "warning" | "error") => {
+			if (state.queuedMessages !== owner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen))) return;
+			if (embedded) state.bridge.notify(message, type); else ctx.ui.notify(message, type);
+		};
+		const assertOwner = () => {
+			if (state.queuedMessages !== owner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen || isArchiveSecretPromptActive()))) {
+				throw new Error("/jarvis configuration owner changed; submit again in the current session.");
+			}
+		};
+		updateContextState(pi, state, ctx);
+		if (isArchiveSecretPromptActive()) {
+			notify("Finish the private archive password/exit verification before configuring Jarvis.", "warning");
+			return;
+		}
 
-			let parsedCommand: ParsedJarvisModelCommand;
+		let parsedCommand: ParsedJarvisModelCommand;
+		try {
+			parsedCommand = parseJarvisModelCommand(args);
+		} catch (error) {
+			notify(error instanceof Error ? error.message : String(error), "error");
+			return;
+		}
+
+		const { request, scope, clearScope } = parsedCommand;
+		const scopeLabel = formatJarvisModelSelectionScope(scope);
+		if ((request || (ctx.mode === "tui" && !embedded)) && isJarvisBusy(state)) {
+			notify("/jarvis is busy. Wait or use /jarvis stop, then retry model/thinking selection.", "warning");
+			return;
+		}
+		if (embedded) { embeddedModelRequest = requestToken; accepted = true; }
+
+		const loadModels = async (): Promise<readonly Model<any>[]> => {
 			try {
-				parsedCommand = parseJarvisModelCommand(args);
+				return await getAvailableJarvisModels(ctx.modelRegistry);
 			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-				return;
+				notify(`Failed to refresh /jarvis models: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return [];
 			}
-
-			const { request, scope, clearScope } = parsedCommand;
-			const scopeLabel = formatJarvisModelSelectionScope(scope);
-
-			const loadModels = async (): Promise<readonly Model<any>[]> => {
-				try {
-					return await getAvailableJarvisModels(ctx.modelRegistry);
-				} catch (error) {
-					ctx.ui.notify(`Failed to refresh /jarvis models: ${error instanceof Error ? error.message : String(error)}`, "error");
-					return [];
-				}
-			};
-			const selectModelFromMenu = async (models: readonly Model<any>[], initialSearchInput?: string): Promise<Model<any> | undefined> => {
-				models = models.filter((model) => model.api !== "pi-virtual");
-				if (models.length === 0) {
-					ctx.ui.notify("No /jarvis models are currently available from the main model registry.", "warning");
-					return undefined;
-				}
-				if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen) {
-					ctx.ui.notify("Finish the current private archive prompt or Jarvis dialog before opening the model picker.", "warning");
-					return undefined;
-				}
-				state.modelPickerOpen = true;
-				try {
-					return await ctx.ui.custom<Model<any> | undefined>(
-						(tui, theme, keybindings, done) => new JarvisModelPicker(
-							tui, theme, keybindings, models, (model) => done(model), () => done(undefined), initialSearchInput,
-						),
-					);
-				} finally { state.modelPickerOpen = false; }
-			};
-
-			const rollbackSelection = async (
-				previousSelection: JarvisModelSelection,
-				previousSource: JarvisModelSelectionSource,
-			): Promise<void> => {
-				await applyJarvisModelSelection(state, previousSelection);
-				state.jarvisModelSelectionSource = previousSource;
-			};
-
-			const persistSelection = async (selection: JarvisModelSelection): Promise<void> => {
-				const previousSelection = state.jarvisModelSelection;
-				const previousSource = state.jarvisModelSelectionSource;
-				const stored = toStoredJarvisModelSelection(selection);
-				const resolved = resolveJarvisModelSelectionFromSettings(
-					scope === "project" ? stored : loadJarvisModelSelectionForClear(ctx.cwd, "project", ctx),
-					scope === "global" ? stored : loadJarvisModelSelectionForClear(ctx.cwd, "global", ctx),
-					ctx.modelRegistry,
-				);
-				await applyJarvisModelSelection(state, resolved.selection);
-				try {
-					saveJarvisModelSelectionSetting(ctx.cwd, scope, stored);
-					state.jarvisModelSelectionSource = resolved.source;
-				} catch (error) {
-					await rollbackSelection(previousSelection, previousSource);
-					throw error;
-				}
-			};
-
-			const clearScopedSelection = async (): Promise<ResolvedJarvisModelSelection> => {
-				const previousSelection = state.jarvisModelSelection;
-				const previousSource = state.jarvisModelSelectionSource;
-				const projectSelection = scope === "project" ? undefined : loadJarvisModelSelectionForClear(ctx.cwd, "project", ctx);
-				const globalSelection = scope === "global" ? undefined : loadJarvisModelSelectionForClear(ctx.cwd, "global", ctx);
-				const resolvedSelection = resolveJarvisModelSelectionFromSettings(projectSelection, globalSelection, ctx.modelRegistry);
-				await applyJarvisModelSelection(state, resolvedSelection.selection);
-				try {
-					clearJarvisModelSelectionSetting(ctx.cwd, scope);
-					state.jarvisModelSelectionSource = resolvedSelection.source;
-					return resolvedSelection;
-				} catch (error) {
-					await rollbackSelection(previousSelection, previousSource);
-					throw error;
-				}
-			};
-
-			const pinSelectedModel = async (model: Model<any>): Promise<void> => {
-				try {
-					await persistSelection({ mode: "pinned", model });
-				} catch (error) {
-					ctx.ui.notify(
-						`Failed to pin /jarvis to ${formatModelLabel(model)} ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
-						"error",
-					);
-					return;
-				}
-
-				ctx.ui.notify(
-					`Saved /jarvis model ${formatModelLabel(model)} ${scopeLabel}. /jarvis is ${describeJarvisModelSelection(state)}. The main model is still ${formatModelLabel(state.model)}.`,
-					"info",
-				);
-			};
-
-			if (clearScope) {
-				let resolvedSelection: ResolvedJarvisModelSelection;
-				try {
-					resolvedSelection = await clearScopedSelection();
-				} catch (error) {
-					ctx.ui.notify(
-						`Failed to clear the /jarvis model setting ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
-						"error",
-					);
-					return;
-				}
-
-				if (resolvedSelection.unavailable) {
-					ctx.ui.notify(
-						`Configured /jarvis model ${resolvedSelection.unavailable.modelReference} from the ${resolvedSelection.unavailable.scope} setting is unavailable. Falling back to follow-main.`,
-						"warning",
-					);
-				}
-
-				ctx.ui.notify(`Cleared the /jarvis model setting ${scopeLabel}. /jarvis is now ${describeJarvisModelSelection(state)}.`, "info");
-				return;
+		};
+		const selectModelFromMenu = async (models: readonly Model<any>[], initialSearchInput?: string): Promise<Model<any> | undefined> => {
+			if (embedded) {
+				notify("Select an exact physical provider/model inside Jarvis.", "warning");
+				return undefined;
 			}
-
-			if (request.toLowerCase() === "follow-main") {
-				try {
-					await persistSelection({ mode: "follow-main" });
-				} catch (error) {
-					ctx.ui.notify(
-						`Failed to switch /jarvis back to follow-main ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
-						"error",
-					);
-					return;
-				}
-				ctx.ui.notify(`Saved follow-main ${scopeLabel}. /jarvis is ${describeJarvisModelSelection(state)}.`, "info");
-				return;
+			if (state.queuedMessages !== owner) return undefined;
+			models = models.filter((model) => model.api !== "pi-virtual");
+			if (models.length === 0) {
+				notify("No /jarvis models are currently available from the main model registry.", "warning");
+				return undefined;
 			}
-
-			if (!request) {
-				if (ctx.mode !== "tui") {
-					ctx.ui.notify(
-						`/jarvis is ${describeJarvisModelSelection(state)}. Use /jarvis-model [--project|--global] clear, /jarvis-model [--project|--global] follow-main, or /jarvis-model [--project|--global] <provider/model>.`,
-						"info",
-					);
-					return;
-				}
-
-				const selectedModel = await selectModelFromMenu(await loadModels());
-				if (!selectedModel) {
-					return;
-				}
-				await pinSelectedModel(selectedModel);
-				return;
+			if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen) {
+				notify("Finish the current private archive prompt or Jarvis dialog before opening the model picker.", "warning");
+				return undefined;
 			}
-
-			const availableModels = await loadModels();
-			const exactModel = findExactAvailableModelMatch(request, availableModels);
-			if (exactModel) {
-				await pinSelectedModel(exactModel);
-				return;
-			}
-
-			if (ctx.mode !== "tui") {
-				const errorMessage =
-					availableModels.length === 0
-						? "No /jarvis models are currently available from the main model registry."
-						: `Unknown /jarvis model "${request}". Use /jarvis-model [--project|--global] clear, /jarvis-model [--project|--global] follow-main, or an exact provider/model from the current model registry.`;
-				ctx.ui.notify(errorMessage, "error");
-				return;
-			}
-
-			const selectedModel = await selectModelFromMenu(availableModels, request);
-			if (!selectedModel) {
-				return;
-			}
-			await pinSelectedModel(selectedModel);
-		},
-	});
-
-	pi.registerCommand("jarvis-thinking", {
-		description: "Set the thinking level used by /jarvis without changing the main agent thinking level",
-		handler: async (args, ctx) => {
-			updateContextState(pi, state, ctx);
-
-			let parsedCommand: ParsedJarvisThinkingCommand;
+			state.modelPickerOpen = true;
 			try {
-				parsedCommand = parseJarvisThinkingCommand(args);
-			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-				return;
-			}
-
-			const { request, scope, clearScope } = parsedCommand;
-			const scopeLabel = formatJarvisModelSelectionScope(scope);
-
-			const rollbackSelection = async (
-				previousSelection: JarvisThinkingSelection,
-				previousSource: JarvisThinkingSelectionSource,
-			): Promise<void> => {
-				await applyJarvisThinkingSelection(state, previousSelection);
-				state.jarvisThinkingSelectionSource = previousSource;
-			};
-
-			const persistSelection = async (selection: JarvisThinkingSelection): Promise<void> => {
-				const previousSelection = state.jarvisThinkingSelection;
-				const previousSource = state.jarvisThinkingSelectionSource;
-				const resolved = resolveJarvisThinkingSelectionFromSettings(
-					scope === "project" ? selection : loadJarvisThinkingSelectionForClear(ctx.cwd, "project", ctx),
-					scope === "global" ? selection : loadJarvisThinkingSelectionForClear(ctx.cwd, "global", ctx),
+				return await ctx.ui.custom<Model<any> | undefined>(
+					(tui, theme, keybindings, done) => new JarvisModelPicker(
+						tui, theme, keybindings, models, (model) => done(model), () => done(undefined), initialSearchInput,
+					),
 				);
-				await applyJarvisThinkingSelection(state, resolved.selection);
-				try {
-					saveJarvisThinkingSelectionSetting(ctx.cwd, scope, selection);
-					state.jarvisThinkingSelectionSource = resolved.source;
-				} catch (error) {
-					await rollbackSelection(previousSelection, previousSource);
-					throw error;
-				}
-			};
+			} finally { state.modelPickerOpen = false; }
+		};
 
-			const clearScopedSelection = async (): Promise<ResolvedJarvisThinkingSelection> => {
-				const previousSelection = state.jarvisThinkingSelection;
-				const previousSource = state.jarvisThinkingSelectionSource;
-				const projectSelection = scope === "project" ? undefined : loadJarvisThinkingSelectionForClear(ctx.cwd, "project", ctx);
-				const globalSelection = scope === "global" ? undefined : loadJarvisThinkingSelectionForClear(ctx.cwd, "global", ctx);
-				const resolvedSelection = resolveJarvisThinkingSelectionFromSettings(projectSelection, globalSelection);
-				await applyJarvisThinkingSelection(state, resolvedSelection.selection);
-				try {
-					clearJarvisThinkingSelectionSetting(ctx.cwd, scope);
-					state.jarvisThinkingSelectionSource = resolvedSelection.source;
-					return resolvedSelection;
-				} catch (error) {
-					await rollbackSelection(previousSelection, previousSource);
-					throw error;
-				}
-			};
+		const rollbackSelection = async (
+			previousSelection: JarvisModelSelection,
+			previousSource: JarvisModelSelectionSource,
+		): Promise<void> => {
+			await applyJarvisModelSelection(state, previousSelection);
+			if (state.queuedMessages !== owner) return;
+			state.jarvisModelSelectionSource = previousSource;
+		};
 
-			if (clearScope) {
-				try {
-					await clearScopedSelection();
-				} catch (error) {
-					ctx.ui.notify(
-						`Failed to clear the /jarvis thinking setting ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
-						"error",
-					);
-					return;
-				}
-				ctx.ui.notify(`Cleared the /jarvis thinking setting ${scopeLabel}. /jarvis is now ${describeJarvisThinkingSelection(state)}.`, "info");
-				return;
-			}
-
-			const normalizedRequest = request.toLowerCase();
-			let selection: JarvisThinkingSelection | undefined;
-			if (normalizedRequest === "auto") {
-				selection = { mode: "auto" };
-			} else if (normalizedRequest === "follow-main") {
-				selection = { mode: "follow-main" };
-			} else if (isJarvisThinkingLevel(normalizedRequest)) {
-				selection = { mode: "pinned", thinkingLevel: normalizedRequest };
-			}
-
-			if (!selection) {
-				ctx.ui.notify(
-					`/jarvis is ${describeJarvisThinkingSelection(state)}. Use /jarvis-thinking [--project|--global] clear, auto, follow-main, off, minimal, low, medium, high, xhigh, or max.`,
-					request ? "error" : "info",
-				);
-				return;
-			}
-
+		const persistSelection = async (selection: JarvisModelSelection): Promise<void> => withIdleConfiguration(state, async (guard) => {
+			assertOwner();
+			const previousSelection = state.jarvisModelSelection;
+			const previousSource = state.jarvisModelSelectionSource;
+			const stored = toStoredJarvisModelSelection(selection);
+			const resolved = resolveJarvisModelSelectionFromSettings(
+				scope === "project" ? stored : loadJarvisModelSelectionForClear(ctx.cwd, "project", ctx),
+				scope === "global" ? stored : loadJarvisModelSelectionForClear(ctx.cwd, "global", ctx),
+				ctx.modelRegistry,
+			);
+			assertOwner();
+			await applyJarvisModelSelection(state, resolved.selection);
 			try {
-				await persistSelection(selection);
+				assertOwner();
+				guard();
+				saveJarvisModelSelectionSetting(ctx.cwd, scope, stored);
+				state.jarvisModelSelectionSource = resolved.source;
 			} catch (error) {
-				ctx.ui.notify(
-					`Failed to set /jarvis thinking ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
+				if (state.queuedMessages === owner) await rollbackSelection(previousSelection, previousSource);
+				throw error;
+			}
+		});
+
+		const clearScopedSelection = async (): Promise<ResolvedJarvisModelSelection> => withIdleConfiguration(state, async (guard) => {
+			assertOwner();
+			const previousSelection = state.jarvisModelSelection;
+			const previousSource = state.jarvisModelSelectionSource;
+			const projectSelection = scope === "project" ? undefined : loadJarvisModelSelectionForClear(ctx.cwd, "project", ctx);
+			const globalSelection = scope === "global" ? undefined : loadJarvisModelSelectionForClear(ctx.cwd, "global", ctx);
+			const resolvedSelection = resolveJarvisModelSelectionFromSettings(projectSelection, globalSelection, ctx.modelRegistry);
+			assertOwner();
+			await applyJarvisModelSelection(state, resolvedSelection.selection);
+			try {
+				assertOwner();
+				guard();
+				clearJarvisModelSelectionSetting(ctx.cwd, scope);
+				state.jarvisModelSelectionSource = resolvedSelection.source;
+				return resolvedSelection;
+			} catch (error) {
+				if (state.queuedMessages === owner) await rollbackSelection(previousSelection, previousSource);
+				throw error;
+			}
+		});
+
+		const pinSelectedModel = async (model: Model<any>): Promise<void> => {
+			try {
+				await persistSelection({ mode: "pinned", model });
+			} catch (error) {
+				notify(
+					`Failed to pin /jarvis to ${formatModelLabel(model)} ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
 					"error",
 				);
 				return;
 			}
 
-			ctx.ui.notify(`Set /jarvis thinking to ${formatJarvisThinkingSelection(selection)} ${scopeLabel}. Effective /jarvis thinking is ${getDesiredJarvisThinkingLevel(state) ?? "off"}.`, "info");
-		},
+			notify(
+				`Saved /jarvis model ${formatModelLabel(model)} ${scopeLabel}. /jarvis is ${describeJarvisModelSelection(state)}. The main model is still ${formatModelLabel(state.model)}.`,
+				"info",
+			);
+		};
+
+		if (clearScope) {
+			let resolvedSelection: ResolvedJarvisModelSelection;
+			try {
+				resolvedSelection = await clearScopedSelection();
+			} catch (error) {
+				notify(
+					`Failed to clear the /jarvis model setting ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+				return;
+			}
+
+			if (resolvedSelection.unavailable) {
+				notify(
+					`Configured /jarvis model ${resolvedSelection.unavailable.modelReference} from the ${resolvedSelection.unavailable.scope} setting is unavailable. Falling back to follow-main.`,
+					"warning",
+				);
+			}
+
+			notify(`Cleared the /jarvis model setting ${scopeLabel}. /jarvis is now ${describeJarvisModelSelection(state)}.`, "info");
+			return;
+		}
+
+		if (request.toLowerCase() === "follow-main") {
+			try {
+				await persistSelection({ mode: "follow-main" });
+			} catch (error) {
+				notify(
+					`Failed to switch /jarvis back to follow-main ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+				return;
+			}
+			notify(`Saved follow-main ${scopeLabel}. /jarvis is ${describeJarvisModelSelection(state)}.`, "info");
+			return;
+		}
+
+		if (!request) {
+			if (ctx.mode !== "tui") {
+				notify(
+					`/jarvis is ${describeJarvisModelSelection(state)}. Use /jarvis-model [--project|--global] clear, /jarvis-model [--project|--global] follow-main, or /jarvis-model [--project|--global] <provider/model>.`,
+					"info",
+				);
+				return;
+			}
+
+			const selectedModel = await selectModelFromMenu(await loadModels());
+			if (!selectedModel) {
+				return;
+			}
+			await pinSelectedModel(selectedModel);
+			return;
+		}
+
+		const availableModels = await loadModels();
+		if (state.queuedMessages !== owner || (embedded && !state.overlayOpen)) return;
+		const exactModel = findExactAvailableModelMatch(request, availableModels);
+		if (exactModel) {
+			await pinSelectedModel(exactModel);
+			return;
+		}
+
+		if (ctx.mode !== "tui") {
+			const errorMessage =
+				availableModels.length === 0
+					? "No /jarvis models are currently available from the main model registry."
+					: `Unknown /jarvis model "${request}". Use /jarvis-model [--project|--global] clear, /jarvis-model [--project|--global] follow-main, or an exact provider/model from the current model registry.`;
+			notify(errorMessage, "error");
+			return;
+		}
+
+		const selectedModel = await selectModelFromMenu(availableModels, request);
+		if (!selectedModel) {
+			return;
+		}
+		await pinSelectedModel(selectedModel);
+	};
+
+	pi.registerCommand("jarvis-model", {
+		description: "Set the model used by /jarvis without changing the main agent model",
+		handler: configureModel,
+	});
+
+	const configureThinking = async (args: string, ctx: ExtensionCommandContext, embedded = false): Promise<void> => {
+		const owner = state.queuedMessages, interaction = state.overlayOwner, thread = state.bridge.getThreadGeneration();
+		const requestToken = {};
+		let accepted = false;
+		const superseded = () => accepted && (embeddedThinkingRequest !== requestToken || state.bridge.getThreadGeneration() !== thread);
+		const notify = (message: string, type?: "info" | "warning" | "error") => {
+			if (state.queuedMessages !== owner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen))) return;
+			if (embedded) state.bridge.notify(message, type); else ctx.ui.notify(message, type);
+		};
+		const assertOwner = () => {
+			if (state.queuedMessages !== owner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen || isArchiveSecretPromptActive()))) {
+				throw new Error("/jarvis configuration owner changed; submit again in the current session.");
+			}
+		};
+		updateContextState(pi, state, ctx);
+		if (isArchiveSecretPromptActive()) {
+			notify("Finish the private archive password/exit verification before configuring Jarvis.", "warning");
+			return;
+		}
+
+		let parsedCommand: ParsedJarvisThinkingCommand;
+		try {
+			parsedCommand = parseJarvisThinkingCommand(args);
+		} catch (error) {
+			notify(error instanceof Error ? error.message : String(error), "error");
+			return;
+		}
+
+		const { request, scope, clearScope } = parsedCommand;
+		const scopeLabel = formatJarvisModelSelectionScope(scope);
+		if (request && isJarvisBusy(state)) {
+			notify("/jarvis is busy. Wait or use /jarvis stop, then retry model/thinking selection.", "warning");
+			return;
+		}
+		if (embedded) { embeddedThinkingRequest = requestToken; accepted = true; }
+
+		const rollbackSelection = async (
+			previousSelection: JarvisThinkingSelection,
+			previousSource: JarvisThinkingSelectionSource,
+		): Promise<void> => {
+			await applyJarvisThinkingSelection(state, previousSelection);
+			if (state.queuedMessages !== owner) return;
+			state.jarvisThinkingSelectionSource = previousSource;
+		};
+
+		const persistSelection = async (selection: JarvisThinkingSelection): Promise<void> => withIdleConfiguration(state, async (guard) => {
+			assertOwner();
+			const previousSelection = state.jarvisThinkingSelection;
+			const previousSource = state.jarvisThinkingSelectionSource;
+			const resolved = resolveJarvisThinkingSelectionFromSettings(
+				scope === "project" ? selection : loadJarvisThinkingSelectionForClear(ctx.cwd, "project", ctx),
+				scope === "global" ? selection : loadJarvisThinkingSelectionForClear(ctx.cwd, "global", ctx),
+			);
+			assertOwner();
+			await applyJarvisThinkingSelection(state, resolved.selection);
+			try {
+				assertOwner();
+				guard();
+				saveJarvisThinkingSelectionSetting(ctx.cwd, scope, selection);
+				state.jarvisThinkingSelectionSource = resolved.source;
+			} catch (error) {
+				if (state.queuedMessages === owner) await rollbackSelection(previousSelection, previousSource);
+				throw error;
+			}
+		});
+
+		const clearScopedSelection = async (): Promise<ResolvedJarvisThinkingSelection> => withIdleConfiguration(state, async (guard) => {
+			assertOwner();
+			const previousSelection = state.jarvisThinkingSelection;
+			const previousSource = state.jarvisThinkingSelectionSource;
+			const projectSelection = scope === "project" ? undefined : loadJarvisThinkingSelectionForClear(ctx.cwd, "project", ctx);
+			const globalSelection = scope === "global" ? undefined : loadJarvisThinkingSelectionForClear(ctx.cwd, "global", ctx);
+			const resolvedSelection = resolveJarvisThinkingSelectionFromSettings(projectSelection, globalSelection);
+			assertOwner();
+			await applyJarvisThinkingSelection(state, resolvedSelection.selection);
+			try {
+				assertOwner();
+				guard();
+				clearJarvisThinkingSelectionSetting(ctx.cwd, scope);
+				state.jarvisThinkingSelectionSource = resolvedSelection.source;
+				return resolvedSelection;
+			} catch (error) {
+				if (state.queuedMessages === owner) await rollbackSelection(previousSelection, previousSource);
+				throw error;
+			}
+		});
+
+		if (clearScope) {
+			try {
+				await clearScopedSelection();
+			} catch (error) {
+				notify(
+					`Failed to clear the /jarvis thinking setting ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+				return;
+			}
+			notify(`Cleared the /jarvis thinking setting ${scopeLabel}. /jarvis is now ${describeJarvisThinkingSelection(state)}.`, "info");
+			return;
+		}
+
+		const normalizedRequest = request.toLowerCase();
+		let selection: JarvisThinkingSelection | undefined;
+		if (normalizedRequest === "auto") {
+			selection = { mode: "auto" };
+		} else if (normalizedRequest === "follow-main") {
+			selection = { mode: "follow-main" };
+		} else if (isJarvisThinkingLevel(normalizedRequest)) {
+			selection = { mode: "pinned", thinkingLevel: normalizedRequest };
+		}
+
+		if (!selection) {
+			notify(
+				`/jarvis is ${describeJarvisThinkingSelection(state)}. Use /jarvis-thinking [--project|--global] clear, auto, follow-main, off, minimal, low, medium, high, xhigh, or max.`,
+				request ? "error" : "info",
+			);
+			return;
+		}
+
+		try {
+			await persistSelection(selection);
+		} catch (error) {
+			notify(
+				`Failed to set /jarvis thinking ${scopeLabel}: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+
+		notify(`Set /jarvis thinking to ${formatJarvisThinkingSelection(selection)} ${scopeLabel}. Effective /jarvis thinking is ${state.runtime?.getThinkingLevel?.() ?? getDesiredJarvisThinkingLevel(state) ?? "off"}.`, "info");
+	};
+
+	pi.registerCommand("jarvis-thinking", {
+		description: "Set the thinking level used by /jarvis without changing the main agent thinking level",
+		handler: configureThinking,
 	});
 
 	pi.registerCommand("jarvis-archive", {
@@ -546,6 +648,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	pi.on("session_before_fork", beforeMainNavigation);
 	pi.on("session_before_tree", beforeMainNavigation);
 	pi.on("session_start", async (_event, ctx) => {
+		clearMainStatus(state);
 		state.runtime?.flushArchive?.();
 		state.archive.cancelImports();
 		state.closeOverlay?.();
@@ -554,6 +657,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		state.runtime = undefined;
 		state.bootPromise = undefined;
 		state.flushPromise = undefined;
+		state.stopPromise = undefined;
+		state.configuring = undefined;
 		state.queuedMessages = [];
 		state.bridge.refresh();
 		state.lastJarvisSeenMainContext = undefined;
@@ -624,6 +729,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			state.runtime = undefined;
 			state.bootPromise = undefined;
 			state.flushPromise = undefined;
+			state.stopPromise = undefined;
+			state.configuring = undefined;
 			state.queuedMessages = [];
 			state.bridge.refresh();
 			state.lastJarvisSeenMainContext = undefined;
@@ -709,6 +816,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		state.runtime = undefined;
 		state.bootPromise = undefined;
 		state.flushPromise = undefined;
+		state.stopPromise = undefined;
+		state.configuring = undefined;
 		state.queuedMessages = [];
 		state.bridge.refresh();
 		state.lastJarvisSeenMainContext = undefined;
@@ -725,6 +834,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		// side-session tool execute still waiting on confirmSteerToMain does not
 		// hang while the session is torn down.
 		state.bridge.reset();
+		clearMainStatus(state);
 	});
 
 	createMemoryExtensionFactory(state.memory, "main", {
@@ -748,6 +858,9 @@ function updateContextState(pi: ExtensionAPI, state: MainState, ctx: ExtensionCo
 	state.thinkingLevel = pi.getThinkingLevel();
 	state.systemPrompt = ctx.getSystemPrompt();
 	state.themeProvider = () => ctx.ui.theme;
+	bindMainStatus(state, ctx);
+	state.trustProvider = () => ctx.isProjectTrusted();
+	checkTransientTrust(state);
 	state.mainSession.refreshFromContext(ctx, formatModelLabel(state.model));
 	refreshMainContext(state);
 }
@@ -761,7 +874,125 @@ function resetTransientAccessControls(state: MainState): void {
 	state.allowSideTools = false;
 	state.allowFollowUpToMain = false;
 	state.allowSteerToMain = false;
+	// Resolve before runtime/native tool synchronization can refresh/reenter.
+	state.bridge.resolveConfirmation(false);
 	state.runtime?.setToolAccessEnabled(false);
+	state.bridge.refresh();
+}
+
+
+/** Trust observations are fail-closed and revoke grants, never silently revive. */
+function checkTransientTrust(state: MainState): boolean {
+	let trusted = false;
+	try { trusted = state.trustProvider?.() === true; } catch { /* Throwing is denial. */ }
+	if (!trusted && (state.allowSideTools || state.allowFollowUpToMain || state.allowSteerToMain || state.bridge.hasPendingConfirmation())) {
+		resetTransientAccessControls(state);
+	}
+	return trusted;
+}
+
+const MAIN_STATUS_KEY = "jarvis-background";
+function clearMainStatus(state: MainState): void {
+	try { state.statusContext?.ui.setStatus?.(MAIN_STATUS_KEY, undefined); } catch { /* Retired UI may be unavailable. */ }
+	state.statusContext = undefined;
+}
+function bindMainStatus(state: MainState, ctx: ExtensionContext): void {
+	if (state.statusContext && state.statusContext.ui !== ctx.ui) clearMainStatus(state);
+	state.statusContext = ctx;
+}
+function describeJarvisActivity(state: MainState): string {
+	const activity = state.stopPromise ? "stopping" : state.bootPromise ? "starting" : state.flushPromise || state.runtime?.isStreaming() ? "working" : "idle";
+	return `Jarvis ${state.overlayOpen ? "open" : "closed"} · ${activity} · ${state.queuedMessages.length} queued · Repo tools ${state.allowSideTools ? "ON" : "off"} · Note main ${state.allowFollowUpToMain ? "ON" : "off"} · Redirect ${state.allowSteerToMain ? "ON (foreground confirm)" : "off"}`;
+}
+function refreshMainStatus(state: MainState): void {
+	if (!state.statusContext) return;
+	checkTransientTrust(state);
+	const visible = state.overlayOpen || state.bootPromise || state.flushPromise || state.stopPromise || state.runtime?.isStreaming() || state.allowSideTools || state.allowFollowUpToMain || state.allowSteerToMain;
+	try {
+		if (typeof state.statusContext.ui.setStatus === "function") {
+			const activity = state.stopPromise ? "stopping" : state.bootPromise ? "starting" : state.flushPromise || state.runtime?.isStreaming() ? "working" : "idle";
+			// Prioritize all three grants before optional controls on an 80-column footer.
+			const footer = `Jarvis ${state.overlayOpen ? "open" : "bg"} ${activity} · q${state.queuedMessages.length} · repo ${state.allowSideTools ? "ON" : "off"} · note ${state.allowFollowUpToMain ? "ON" : "off"} · redirect ${state.allowSteerToMain ? "ASK" : "off"} · /jarvis stop`;
+			state.statusContext.ui.setStatus(MAIN_STATUS_KEY, visible ? footer : undefined);
+		}
+	} catch { /* Footer presentation must not interfere with running work. */ }
+}
+
+function isJarvisBusy(state: MainState): boolean {
+	return Boolean(state.bootPromise || state.flushPromise || state.stopPromise || state.configuring || state.runtime?.isStreaming() || state.queuedMessages.length);
+}
+async function withIdleConfiguration<T>(state: MainState, operation: (guard: () => void) => Promise<T>): Promise<T> {
+	if (isJarvisBusy(state)) throw new Error("/jarvis is busy. Wait or use /jarvis stop, then retry model/thinking selection.");
+	const owner = state.queuedMessages, token = {};
+	state.configuring = token;
+	const guard = () => {
+		if (state.queuedMessages !== owner || state.configuring !== token) throw new Error("/jarvis configuration owner changed.");
+		if (state.bootPromise || state.flushPromise || state.stopPromise || state.runtime?.isStreaming()) throw new Error("/jarvis became busy. Stop/wait, then retry configuration.");
+	};
+	try { guard(); return await operation(guard); }
+	finally { if (state.configuring === token) { state.configuring = undefined; state.bridge.refresh(); } }
+}
+
+type LocalControl = "status" | "stop" | "access off";
+function parseLocalControl(text: string, allowBare = false): LocalControl | undefined {
+	const input = text.trim().replace(/\s+/g, " ").toLowerCase();
+	const match = /^\/(?:jarvis )?(status|stop|access off)$/.exec(input);
+	if (match) return match[1] as LocalControl;
+	return allowBare && ["status", "stop", "access off"].includes(input) ? input as LocalControl : undefined;
+}
+async function dispatchLocalControl(state: MainState, control: LocalControl, ctx: ExtensionContext, overlay: boolean): Promise<void> {
+	bindMainStatus(state, ctx);
+	state.trustProvider = () => ctx.isProjectTrusted();
+	checkTransientTrust(state);
+	const owner = state.queuedMessages;
+	let text: string;
+	try {
+		if (control === "stop") {
+			await cancelJarvisWork(state);
+			text = "Stopped /jarvis work; waiting inputs discarded. Already-started external effects cannot be rolled back.";
+		} else if (control === "access off") {
+			resetTransientAccessControls(state);
+			text = "Jarvis Repo tools, Note main and Redirect access off; pending confirmations cancelled. Already-started external effects cannot be rolled back.";
+		} else {
+			text = `${describeJarvisActivity(state)}. Close/reopen preserves work and access for this owner. /jarvis stop cancels work; /jarvis access off revokes the three grants. Background work ends on owner replacement/reload/quit, not a daemon.`;
+		}
+		if (state.queuedMessages !== owner) return;
+		if (overlay) state.bridge.notify(text, "info");
+		else if (ctx.hasUI) ctx.ui.notify(text, "info");
+		else process.stderr.write(`${text}\n`);
+	} catch (error) {
+		if (state.queuedMessages !== owner) return;
+		const message = `Failed to stop /jarvis: ${error instanceof Error ? error.message : String(error)}. Waiting inputs were discarded; nothing was retried.`;
+		if (overlay) state.bridge.notify(message, "error");
+		else if (ctx.hasUI) ctx.ui.notify(message, "error");
+		else process.stderr.write(`${message}\n`);
+	}
+	state.bridge.refresh();
+}
+function cancelJarvisWork(state: MainState): Promise<void> {
+	if (state.stopPromise) return state.stopPromise;
+	const owner = state.queuedMessages, boot = state.bootPromise, flush = state.flushPromise;
+	state.workGeneration += 1;
+	owner.length = 0;
+	let stopping: Promise<void>;
+	stopping = Promise.resolve().then(async () => {
+		const first = state.runtime;
+		let failure: unknown;
+		try { await first?.cancelWork(); } catch (error) { failure = error; }
+		// Retain a booting runtime for reuse, but never send its cancelled input.
+		try { await boot; } catch { /* Startup errors are already reported by its owner. */ }
+		try { await flush; } catch (error) { failure ??= error; }
+		if (state.queuedMessages === owner && state.runtime !== first) {
+			try { await state.runtime?.cancelWork(); } catch (error) { failure ??= error; }
+		}
+		if (failure) throw failure;
+	}).finally(() => {
+		if (state.stopPromise === stopping) { state.stopPromise = undefined; state.bridge.refresh(); }
+	});
+	state.stopPromise = stopping;
+	state.bridge.resolveConfirmation(false);
+	state.bridge.refresh();
+	return stopping;
 }
 
 function getDesiredJarvisModel(state: MainState): Model<any> | undefined {
@@ -853,7 +1084,7 @@ function formatJarvisThinkingSelection(selection: JarvisThinkingSelection): stri
 
 function describeJarvisThinkingSelection(state: MainState): string {
 	const sourceLabel = formatJarvisModelSelectionSource(state.jarvisThinkingSelectionSource);
-	return `thinking ${formatJarvisThinkingSelection(state.jarvisThinkingSelection)} (effective ${getDesiredJarvisThinkingLevel(state) ?? "off"}; ${sourceLabel})`;
+	return `thinking ${formatJarvisThinkingSelection(state.jarvisThinkingSelection)} (effective ${state.runtime?.getThinkingLevel?.() ?? getDesiredJarvisThinkingLevel(state) ?? "off"}; ${sourceLabel})`;
 }
 
 function resolveStoredJarvisModelSelection(
@@ -1036,7 +1267,7 @@ function describeJarvisModelSelection(state: MainState): string {
 
 async function getAvailableJarvisModels(modelRegistry: ExtensionContext["modelRegistry"]): Promise<readonly Model<any>[]> {
 	await modelRegistry.refresh();
-	return modelRegistry.getAvailable();
+	return modelRegistry.getAvailable().filter((model) => model.api !== "pi-virtual");
 }
 
 function findExactAvailableModelMatch(
@@ -1094,16 +1325,19 @@ async function applyJarvisModelSelection(state: MainState, selection: JarvisMode
 	if (selection.mode === "pinned" && selection.model.api === "pi-virtual") {
 		throw new Error("/jarvis requires a physical model; Pi's public registry does not expose virtual routing.");
 	}
+	const owner = state.queuedMessages;
 	const previousSelection = state.jarvisModelSelection;
 	state.jarvisModelSelection = selection;
 	try {
 		await syncRuntimeModelSelection(state);
+		if (state.queuedMessages !== owner) throw new Error("/jarvis configuration owner changed.");
 		enforceCompatibilityGuard(state);
 	} catch (error) {
+		if (state.queuedMessages !== owner) throw error;
 		state.jarvisModelSelection = previousSelection;
 		try {
 			await syncRuntimeModelSelection(state);
-			enforceCompatibilityGuard(state);
+			if (state.queuedMessages === owner) enforceCompatibilityGuard(state);
 		} catch {
 			// Keep the original sync failure; rollback is best-effort only.
 		}
@@ -1112,11 +1346,14 @@ async function applyJarvisModelSelection(state: MainState, selection: JarvisMode
 }
 
 async function applyJarvisThinkingSelection(state: MainState, selection: JarvisThinkingSelection): Promise<void> {
+	const owner = state.queuedMessages;
 	const previousSelection = state.jarvisThinkingSelection;
 	state.jarvisThinkingSelection = selection;
 	try {
 		await syncRuntimeModelSelection(state);
+		if (state.queuedMessages !== owner) throw new Error("/jarvis configuration owner changed.");
 	} catch (error) {
+		if (state.queuedMessages !== owner) throw error;
 		state.jarvisThinkingSelection = previousSelection;
 		try {
 			await syncRuntimeModelSelection(state);
@@ -1262,19 +1499,38 @@ function parseJarvisSideCommand(message: string): JarvisSideCommand | undefined 
 	return undefined;
 }
 
-function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCommandContext): JarvisOverlayView {
-	const queue = state.queuedMessages;
+function createOverlayView(
+	pi: ExtensionAPI, state: MainState, ctx: ExtensionCommandContext,
+	configureModel: (request: string, ctx: ExtensionCommandContext, embedded?: boolean) => Promise<void>,
+	configureThinking: (request: string, ctx: ExtensionCommandContext, embedded?: boolean) => Promise<void>,
+): JarvisOverlayView {
+	const queue = state.queuedMessages, interaction = state.overlayOwner;
+	const ownsPresentation = () => state.queuedMessages === queue && state.overlayOwner === interaction && state.overlayOpen && !isArchiveSecretPromptActive();
 	const syncToolAccess = () => {
 		state.runtime?.setToolAccessEnabled(state.allowSideTools);
+		state.bridge.refresh();
 	};
 
 	return {
 		isReady: () => state.runtime?.isReady() ?? false,
 		isStreaming: () => state.runtime?.isStreaming() ?? false,
 		getQueuedMessageCount: () => state.queuedMessages === queue ? queue.length : 0,
-		getIsProcessing: () => state.queuedMessages === queue && Boolean(state.bootPromise || state.flushPromise),
+		getIsProcessing: () => state.queuedMessages === queue && Boolean(state.bootPromise || state.flushPromise || state.stopPromise),
 		getModelLabel: () => state.runtime?.getModelLabel() ?? formatModelLabel(getDesiredJarvisModel(state)),
 		getModelModeLabel: () => getJarvisModelModeLabel(state.jarvisModelSelection),
+		getThinkingLabel: () => describeJarvisThinkingSelection(state),
+		getModelChoices: async () => {
+			const models = await getAvailableJarvisModels(ctx.modelRegistry);
+			if (!ownsPresentation()) return [];
+			return [
+				{ value: "follow-main", label: "Follow main model" },
+				{ value: "clear", label: "Clear project override" },
+				...models.map(model => ({ value: formatModelLabel(model), label: formatModelLabel(model) })),
+			];
+		},
+		configureModel: async request => { if (ownsPresentation()) await configureModel(request, ctx, true); },
+		configureThinking: async request => { if (ownsPresentation()) await configureThinking(request, ctx, true); },
+		cancelWork: async () => { if (state.queuedMessages === queue) await dispatchLocalControl(state, "stop", ctx, true); },
 		getMainStatusLabel: () => state.mainContext.summary.mainStatus,
 		getMainModelLabel: () => state.mainContext.summary.mainModelLabel,
 		getMainFocusLabel: () => state.mainContext.summary.workState.currentAction,
@@ -1284,10 +1540,12 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 		isFollowUpToMainEnabled: () => state.allowFollowUpToMain,
 		isSteerToMainEnabled: () => state.allowSteerToMain,
 		toggleToolAccess: () => {
+			if (!ownsPresentation() || !checkTransientTrust(state)) return;
 			state.allowSideTools = !state.allowSideTools;
 			syncToolAccess();
 		},
 		toggleFollowUpToMain: () => {
+			if (!ownsPresentation() || !checkTransientTrust(state)) return;
 			if (!isModelBridgeCompatible(getDesiredJarvisModel(state))) {
 				state.bridge.notify("Follow-up is not supported by the current /jarvis model.", "warning");
 				return;
@@ -1296,6 +1554,7 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 			syncToolAccess();
 		},
 		toggleSteerToMain: () => {
+			if (!ownsPresentation() || !checkTransientTrust(state)) return;
 			if (!isModelBridgeCompatible(getDesiredJarvisModel(state))) {
 				state.bridge.notify("Steer is not supported by the current /jarvis model.", "warning");
 				return;
@@ -1305,7 +1564,9 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 		},
 		getDisplayEntries: () => getOverlayEntries(state),
 		sendMessage: async (text: string) => {
-			if (state.queuedMessages !== queue) return;
+			if (state.queuedMessages !== queue || isArchiveSecretPromptActive()) return;
+			const localControl = parseLocalControl(text);
+			if (localControl) { await dispatchLocalControl(state, localControl, ctx, true); return; }
 			const archiveCommand = parseArchiveCommand(text);
 			if (archiveCommand !== undefined) {
 				await dispatchArchiveCommand(state, archiveCommand, ctx, true);
@@ -1315,6 +1576,11 @@ function createOverlayView(pi: ExtensionAPI, state: MainState, ctx: ExtensionCom
 			const memoryCommand = parseMemoryCommand(text);
 			if (memoryCommand !== undefined) {
 				dispatchMemoryCommand(state, memoryCommand, ctx, true);
+				return;
+			}
+			if (state.queuedMessages !== queue) return;
+			if (state.stopPromise || state.configuring) {
+				state.bridge.notify("Wait for /jarvis stop/configuration to finish, then submit again. Input was not queued.", "warning");
 				return;
 			}
 			queueMessage(state, text);
@@ -1387,7 +1653,8 @@ async function flushQueuedMessages(pi: ExtensionAPI, state: MainState, ctx: Exte
 	// Queue identity survives a side /new, but not a main-session replacement.
 	// A stale completion must never consume or unlock a replacement queue.
 	const queue = state.queuedMessages;
-	const isCurrent = () => state.queuedMessages === queue;
+	const workGeneration = state.workGeneration;
+	const isCurrent = () => state.queuedMessages === queue && state.workGeneration === workGeneration;
 	let flushPromise: Promise<void>;
 	// Publish ownership before any refresh or asynchronous work can reenter.
 	flushPromise = Promise.resolve().then(async () => {
@@ -1476,13 +1743,13 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 			sessionFile,
 			systemPromptProvider: () => state.systemPrompt,
 			mainContextProvider: () => state.mainContext,
-			toolAccessProvider: () => isCurrentBoot() && state.allowSideTools,
-			communicationPermissionsProvider: () => ({
-				allowFollowUpToMain: isCurrentBoot() && state.allowFollowUpToMain,
-				allowSteerToMain: isCurrentBoot() && state.allowSteerToMain,
-			}),
+			toolAccessProvider: () => isCurrentBoot() && checkTransientTrust(state) && state.allowSideTools,
+			communicationPermissionsProvider: () => {
+				const permitted = isCurrentBoot() && checkTransientTrust(state);
+				return { allowFollowUpToMain: permitted && state.allowFollowUpToMain, allowSteerToMain: permitted && state.allowSteerToMain };
+			},
 			sendFollowUpToMain: (message: string) => {
-				if (!isCurrentBoot() || !state.allowFollowUpToMain) throw new Error("/jarvis follow-up permission expired.");
+				if (!isCurrentBoot() || !checkTransientTrust(state) || !state.allowFollowUpToMain) throw new Error("/jarvis follow-up permission expired.");
 				pi.sendUserMessage(message, { deliverAs: "followUp" });
 			},
 			// Route the confirmation through the /jarvis overlay itself via the
@@ -1497,7 +1764,7 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 					signal,
 				),
 			sendSteerToMain: (message: string) => {
-				if (!isCurrentBoot() || !state.allowSteerToMain) throw new Error("/jarvis redirect permission expired.");
+				if (!isCurrentBoot() || !checkTransientTrust(state) || !state.overlayOpen || isArchiveSecretPromptActive() || !state.allowSteerToMain) throw new Error("/jarvis redirect permission expired.");
 				pi.sendUserMessage(message, { deliverAs: "steer" });
 			},
 			themeProvider: state.themeProvider,

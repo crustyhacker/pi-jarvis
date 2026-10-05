@@ -33,6 +33,8 @@ class FakeRuntime {
 	readonly promptGates: Deferred[] = [];
 	readonly toolAccess: boolean[] = [];
 	disposed = false;
+	aborts = 0;
+	activePrompt?: Deferred;
 	streaming = false;
 	syncCalls = 0;
 	syncGate?: Deferred;
@@ -48,7 +50,7 @@ class FakeRuntime {
 	getRepoToolsDetailLabel() { return "repo tools off"; }
 	// Deliberately return the same array: view rendering must never mutate it.
 	getDisplayEntries() { return this.entries; }
-	setToolAccessEnabled(enabled: boolean) { this.toolAccess.push(enabled); }
+	setToolAccessEnabled(enabled: boolean) { this.toolAccess.push(enabled); this.options.bridge.refresh(); }
 	addSystemMessage(text: string) { this.entries.push({ kind: "system", text }); this.options.bridge.refresh(); }
 	describeSessionTree() { return "Side tree only"; }
 	async navigateSessionTree() {
@@ -64,12 +66,15 @@ class FakeRuntime {
 		this.entries.push({ kind: "user", text });
 		this.streaming = true;
 		this.options.bridge.setWorkingMessage("Thinking…");
-		try { await this.promptGates.shift()?.promise; }
+		this.activePrompt = this.promptGates.shift();
+		try { await this.activePrompt?.promise; }
 		finally {
+			this.activePrompt = undefined;
 			this.streaming = false;
 			if (!this.disposed) this.options.bridge.setWorkingMessage(undefined);
 		}
 	}
+	async cancelWork() { this.aborts++; this.activePrompt?.resolve(); }
 	// A low-level agent_end is not final settlement of the deferred prompt.
 	endAgentRun() { this.streaming = false; this.options.bridge.refresh(); }
 	dispose() { this.disposed = true; this.streaming = false; }
@@ -82,6 +87,7 @@ function harness(root: string, id: number) {
 	const hostNotices: string[] = [];
 	const feedback: Feedback[] = [];
 	const boots: Deferred[] = [];
+	const statuses = new Map<string, string | undefined>();
 	let branch: any[] = [];
 	let overlay: any;
 	let opened: Promise<void> | undefined;
@@ -95,6 +101,7 @@ function harness(root: string, id: number) {
 		modelRegistry: { find: () => model },
 		ui: {
 			theme, notify: (text: string) => hostNotices.push(text),
+			setStatus: (key: string, text: string | undefined) => statuses.set(key, text),
 			custom: (factory: any) => new Promise<void>((resolve) => {
 				overlay = factory({ terminal: { rows: 50, columns: 120 }, requestRender() {
 					if (overlay) feedback.push(snapshot(overlay.view));
@@ -125,7 +132,8 @@ function harness(root: string, id: number) {
 	}) as any;
 	jarvisExtension(pi);
 	return {
-		ctx, runtimes, hostNotices, feedback,
+		ctx, runtimes, hostNotices, feedback, statuses,
+		command: (args: string) => commands.get("jarvis").handler(args, ctx),
 		get view(): StatusView { return overlay.view; },
 		get bridge(): JarvisOverlayBridge { return overlay.bridge; },
 		get overlay() { return overlay; },
@@ -158,6 +166,106 @@ test("truthful /jarvis queue and processing feedback", async (t) => {
 	let id = 0;
 	const make = () => harness(root, id++);
 	try {
+
+		await t.test("local controls never boot and footer survives ordinary close through boot/queued work", async () => {
+			const h = make();
+			try {
+				await h.event("session_start");
+				for (const control of ["status", "stop", "access off", "/status", "/jarvis stop"]) await h.command(control);
+				assert.equal(h.runtimes.length, 0, "local controls never start the SDK/model or overlay");
+				h.ctx.isProjectTrusted = () => true;
+				const boot = h.holdNextBoot(), opening = h.start("assigned before close");
+				await until(() => h.runtimes.length === 1);
+				const runtime = h.runtimes[0]!, first = deferred(), second = deferred();
+				runtime.promptGates.push(first, second);
+				const view = h.view;
+				view.toggleToolAccess(); view.toggleFollowUpToMain(); view.toggleSteerToMain();
+				const waiting = view.sendMessage("queued before close");
+				const confirmation = runtime.options.confirmSteerToMain("foreground review");
+				assert.equal(h.bridge.hasPendingConfirmation(), true);
+				h.overlay.handleInput("\x1b"); // Pending review Escape cancels it, not access.
+				assert.equal(await confirmation, false);
+				h.overlay.handleInput("\x1b"); await opening;
+				assert.equal(view.isToolAccessEnabled(), true);
+				assert.equal(view.isFollowUpToMainEnabled(), true); assert.equal(view.isSteerToMainEnabled(), true);
+				assert.equal(runtime.disposed, false);
+				assert.match(h.statuses.get("jarvis-background")!, /bg.*starting.*q2.*repo ON.*note ON.*redirect ASK/);
+				assert.ok(h.statuses.get("jarvis-background")!.length <= 80, "all three grants precede hints in a compact 80-column main footer");
+				assert.equal(await runtime.options.confirmSteerToMain("must not prompt invisibly"), false);
+				assert.equal(await h.bridge.requestConfirmation("Forget memory", "closed human review"), false);
+				boot.resolve(); await until(() => runtime.sent.length === 1);
+				assert.match(h.statuses.get("jarvis-background")!, /bg.*working.*q1/);
+				runtime.endAgentRun(); assert.match(h.statuses.get("jarvis-background")!, /working/);
+				h.start(); assert.equal(h.runtimes.length, 1, "reopen reuses the same owner during active work");
+				assert.equal(h.view.isToolAccessEnabled(), true);
+				first.resolve(); await until(() => runtime.sent.length === 2);
+				second.resolve(); await waiting;
+				assert.deepEqual(runtime.sent, ["assigned before close", "queued before close"]);
+				assert.match(h.statuses.get("jarvis-background")!, /idle.*repo ON/);
+				await h.view.sendMessage("/access off");
+				assert.equal(h.view.isToolAccessEnabled(), false); assert.equal(h.view.isFollowUpToMainEnabled(), false); assert.equal(h.view.isSteerToMainEnabled(), false);
+				assert.equal(runtime.disposed, false);
+			} finally { await h.stop(); }
+			assert.equal(h.statuses.get("jarvis-background"), undefined, "shutdown clears the owned footer");
+		});
+
+		for (const boundary of ["boot", "sync", "prompt"] as const) {
+			await t.test(`explicit stop during ${boundary} discards queued/dequeued work without disposal or replay`, async () => {
+				const h = make();
+				try {
+					await h.event("session_start"); h.ctx.isProjectTrusted = () => true;
+					const boot = boundary === "boot" ? h.holdNextBoot() : undefined;
+					h.start(boundary === "boot" ? "cancel boot input" : "");
+					await until(() => h.runtimes.length === 1);
+					const runtime = h.runtimes[0]!;
+					if (!boot) await until(() => h.view.isReady() && !h.view.getIsProcessing());
+					h.view.toggleToolAccess(); h.view.toggleFollowUpToMain(); h.view.toggleSteerToMain();
+					const sync = boundary === "sync" ? deferred() : undefined; runtime.syncGate = sync;
+					if (boundary === "prompt") runtime.promptGates.push(deferred());
+					const cancelled = h.view.sendMessage("cancel active input");
+					if (boundary === "sync") await until(() => runtime.syncCalls === 1);
+					if (boundary === "prompt") await until(() => runtime.sent.length === 1);
+					const waiting = h.view.sendMessage("cancel waiting input");
+					const stopping = h.command("stop");
+					assert.equal(h.view.getQueuedMessageCount(), 0);
+					await h.view.sendMessage("explicit while stopping");
+					assert.ok(h.bridge.snapshot().notifications.some(item => /not queued/.test(item.message)), "new input during stop is explicitly refused, never stranded");
+					boot?.resolve(); sync?.resolve();
+					await stopping; await Promise.all([cancelled, waiting]);
+					assertFeedback(h.view, 0, false);
+					assert.deepEqual(runtime.sent, boundary === "prompt" ? ["cancel active input"] : []);
+					assert.equal(runtime.aborts, 1); assert.equal(runtime.disposed, false);
+					assert.equal(h.view.isToolAccessEnabled(), true); assert.equal(h.view.isFollowUpToMainEnabled(), true); assert.equal(h.view.isSteerToMainEnabled(), true);
+					runtime.syncGate = undefined;
+					await h.view.sendMessage("fresh explicit after stop");
+					assert.equal(runtime.sent.at(-1), "fresh explicit after stop");
+					assert.equal(h.runtimes.length, 1); assertFeedback(h.view, 0, false);
+				} finally { await h.stop(); }
+			});
+		}
+
+		await t.test("live trust denial/throw clears grants and review; restoration never revives them", async () => {
+			const h = make();
+			try {
+				await h.event("session_start"); h.ctx.isProjectTrusted = () => true; h.start();
+				await until(() => h.view.isReady() && !h.view.getIsProcessing());
+				const runtime = h.runtimes[0]!;
+				for (const denied of [() => false, () => { throw new Error("trust observation failed"); }]) {
+					h.view.toggleToolAccess(); h.view.toggleFollowUpToMain(); h.view.toggleSteerToMain();
+					const review = runtime.options.confirmSteerToMain("pending review");
+					h.ctx.isProjectTrusted = denied;
+					assert.deepEqual(runtime.options.communicationPermissionsProvider(), { allowFollowUpToMain: false, allowSteerToMain: false });
+					assert.equal(await review, false);
+					assert.equal(runtime.options.toolAccessProvider(), false);
+					assert.equal(h.view.isToolAccessEnabled(), false); assert.equal(h.view.isFollowUpToMainEnabled(), false); assert.equal(h.view.isSteerToMainEnabled(), false);
+					h.ctx.isProjectTrusted = () => true;
+					assert.equal(runtime.options.toolAccessProvider(), false);
+					assert.deepEqual(runtime.options.communicationPermissionsProvider(), { allowFollowUpToMain: false, allowSteerToMain: false });
+				}
+				assert.equal(runtime.disposed, false);
+			} finally { await h.stop(); }
+		});
+
 		await t.test("empty boot is processing; idle renders do not append status chatter", async () => {
 			const h = make();
 			try {
@@ -304,6 +412,7 @@ test("truthful /jarvis queue and processing feedback", async (t) => {
 				compact.resolve(); await compacting; assertFeedback(view, 0, false);
 				await view.sendMessage("/tree missing-entry");
 				assert.match(h.bridge.snapshot().notifications.at(-1)!.message, /Unknown side tree entry.*not retried/);
+				h.ctx.isProjectTrusted = () => true;
 				view.toggleToolAccess(); view.toggleFollowUpToMain(); view.toggleSteerToMain();
 				const oldPermissions = oldRuntime.options.communicationPermissionsProvider;
 				assert.deepEqual(oldPermissions(), { allowFollowUpToMain: true, allowSteerToMain: true });
@@ -327,7 +436,7 @@ test("truthful /jarvis queue and processing feedback", async (t) => {
 				assert.deepEqual(oldRuntime.sent, []);
 				assert.deepEqual(nextRuntime.sent, ["after side reset"]);
 				assert.equal(h.runtimes.length, 2, "a side /new is never duplicated");
-				assert.equal(nextRuntime.options.projectTrusted, false);
+				assert.equal(nextRuntime.options.projectTrusted, true);
 			} finally { await h.stop(); }
 		});
 

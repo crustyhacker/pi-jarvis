@@ -28,7 +28,7 @@ These controls are explicit human choices, not authorization for an agent/extens
 
 ## Password input and ownership
 
-Use public `ctx.ui.custom` in the main editor area, not a nested overlay. Passwords never enter command arguments, environment variables, ordinary editors/history, model tools, session entries, notifications or logs. The public Input component sees masks, not secret undo/history. Password entry closes Jarvis and revokes its transient overlay permissions before using the main editor area.
+Use public `ctx.ui.custom` in the main editor area, not a nested overlay. Passwords never enter command arguments, environment variables, ordinary editors/history, model tools, session entries, notifications or logs. The public Input component sees masks, not secret undo/history. Password entry explicitly revokes Jarvis's transient permissions before closing/yielding to the main editor area. This is separate from ordinary overlay close, which preserves same-owner background work and grants; the private-input boundary never inherits those grants.
 
 **Only Pi regular TUI is supported:** the user explicitly starts `pi --tui-mode regular`. Non-TUI, fullscreen, missing and unknown renderer modes refuse password entry. There is no ordinary-editor/RPC/CLI/environment fallback and no automatic renderer-setting change. Stock fullscreen can process its search shortcut before a focused component and cannot provide this boundary.
 

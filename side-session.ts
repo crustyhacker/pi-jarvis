@@ -1,7 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { AssistantMessage, Model, Provider, ModelsApiStreamOptions } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model, Provider, ModelsApiStreamOptions, ModelsRequestTransforms } from "@earendil-works/pi-ai";
 import type { MainSessionContextPayload } from "./main-context.js";
 import { InMemoryCredentialStore, Type } from "@earendil-works/pi-ai";
 import {
@@ -89,7 +90,38 @@ type SideRuntimeCreateOptions = {
  * transforms are assembled exactly once, by the host, not by two runtimes.
  * Pi's registry does not expose virtual router definitions or resolveModel().
  */
-export async function createSideModelRuntime(host: ExtensionContext["modelRegistry"]) {
+export async function createSideModelRuntime(
+	host: ExtensionContext["modelRegistry"],
+	getRequestSignal?: () => AbortSignal,
+) {
+	// Capture the send's permit now, not inside a later auth/header callback:
+	// a new send must never authorize an old SDK preflight or lazy request.
+	const guardRequest = <T extends ModelsRequestTransforms & { signal?: AbortSignal }>(options?: T): T | undefined => {
+		const permit = getRequestSignal?.();
+		if (!permit) return options;
+		const signal = options?.signal ? AbortSignal.any([permit, options.signal]) : permit;
+		signal.throwIfAborted();
+		return {
+			...options,
+			signal,
+			transformHeaders: async (headers) => {
+				signal.throwIfAborted();
+				const transformed = options?.transformHeaders ? await options.transformHeaders(headers) : headers;
+				// Host auth and extension header transforms can both yield. This
+				// public request hook rejects before the host invokes its provider.
+				signal.throwIfAborted();
+				return transformed;
+			},
+		} as T;
+	};
+	const stream: ModelRuntime["stream"] = (model, context, options) => {
+		assertSupportedSideModel(model);
+		return host.stream(model, context, guardRequest(options));
+	};
+	const streamSimple: ModelRuntime["streamSimple"] = (model, context, options) => {
+		assertSupportedSideModel(model);
+		return host.streamSimple(model, context, guardRequest(options));
+	};
 	const modelRuntime = await ModelRuntime.create({
 		credentials: new InMemoryCredentialStore(),
 		modelsPath: null,
@@ -122,8 +154,8 @@ export async function createSideModelRuntime(host: ExtensionContext["modelRegist
 						return auth;
 					},
 				} },
-				stream: (model, context, options) => host.stream<typeof model.api>(model, context, options as ModelsApiStreamOptions<typeof model.api> | undefined),
-				streamSimple: (model, context, options) => host.streamSimple(model, context, options),
+				stream: (model, context, options) => stream(model, context, options as ModelsApiStreamOptions<typeof model.api> | undefined),
+				streamSimple,
 			};
 			modelRuntime.registerNativeProvider(provider);
 			registered.add(id);
@@ -132,14 +164,8 @@ export async function createSideModelRuntime(host: ExtensionContext["modelRegist
 	};
 	// Public request methods, intentionally delegated ahead of side preparation:
 	// otherwise host auth/header transforms would run after side transforms.
-	modelRuntime.stream = (model, context, options) => {
-		assertSupportedSideModel(model);
-		return host.stream(model, context, options);
-	};
-	modelRuntime.streamSimple = (model, context, options) => {
-		assertSupportedSideModel(model);
-		return host.streamSimple(model, context, options);
-	};
+	modelRuntime.stream = stream;
+	modelRuntime.streamSimple = streamSimple;
 	await sync();
 	return { modelRuntime, sync };
 }
@@ -185,6 +211,8 @@ export class JarvisSideSessionRuntime {
 	private toolAccessEnabled = false;
 	private syncHostModels?: (model?: Model<any>) => Promise<void>;
 	private readonly lifetime = new AbortController();
+	private readonly requestPermit = new AsyncLocalStorage<AbortSignal>();
+	private workCancellation = new AbortController();
 	private syncActiveTools?: () => void;
 	private archiveFinalSnapshot?: () => void;
 	private nativeMcp?: NativeMcpController;
@@ -218,6 +246,11 @@ export class JarvisSideSessionRuntime {
 
 	getModelLabel(): string {
 		return this.modelLabel;
+	}
+
+	/** Actual SDK level after model-supported clamping. */
+	getThinkingLevel(): string | undefined {
+		return this.session?.thinkingLevel;
 	}
 
 	getRepoToolsDetailLabel(): string {
@@ -282,19 +315,48 @@ export class JarvisSideSessionRuntime {
 	}
 
 	async sendMessage(text: string): Promise<void> {
-		if (!this.session) {
+		if (!this.session || !this.ready || this.lifetime.signal.aborted) {
 			throw new Error("/jarvis session is not ready.");
 		}
 		const session = this.session;
-		this.pendingUserMessage = text;
-		this.bridge.refresh();
+		// Snapshot this work generation per send. Async SDK preflight (and
+		// request callbacks) retains it even when a later send gets a new one.
+		const permit = AbortSignal.any([this.workCancellation.signal, this.lifetime.signal]);
 		try {
-			await session.prompt(text, session.isStreaming ? { streamingBehavior: "steer" } : undefined);
+			this.pendingUserMessage = text;
+			this.bridge.refresh();
+			await this.requestPermit.run(permit, async () => {
+				permit.throwIfAborted();
+				await session.prompt(text, session.isStreaming ? { streamingBehavior: "steer" } : undefined);
+			});
 		} catch (error) {
 			if (this.pendingUserMessage === text) this.pendingUserMessage = undefined;
 			if (this.session === session) this.bridge.refresh();
 			throw error;
 		}
+	}
+
+	private revokePendingSends(): void {
+		const revoked = this.workCancellation;
+		this.workCancellation = new AbortController();
+		revoked.abort();
+	}
+
+	/** Cancel work without ending this side owner or revoking its access grants. */
+	async cancelWork(): Promise<void> {
+		// SDK prompt preflight has no public abort signal and can outlive an
+		// idle abort(). Revoke synchronously, before any SDK/UI callback yields.
+		this.revokePendingSends();
+		const session = this.session;
+		if (!session || this.lifetime.signal.aborted) return;
+		session.clearQueue();
+		await session.abort();
+		if (this.session !== session) return;
+		this.pendingUserMessage = undefined;
+		this.streamingAssistant = undefined;
+		this.pendingToolCalls.clear();
+		this.bridge.setWorkingMessage(undefined);
+		this.refreshHistory();
 	}
 
 	addSystemMessage(text: string): void {
@@ -358,7 +420,7 @@ export class JarvisSideSessionRuntime {
 		await this.syncHostModels?.(model);
 		if (this.session !== session || this.lifetime.signal.aborted) return;
 		if (model) {
-			const current = this.session.model;
+			const current = session.model;
 			const differs = !current || current.provider !== model.provider || current.id !== model.id;
 			if (differs) {
 				await session.setModel(model);
@@ -367,10 +429,10 @@ export class JarvisSideSessionRuntime {
 		}
 
 		if (thinkingLevel) {
-			this.session.setThinkingLevel(thinkingLevel as any);
+			session.setThinkingLevel(thinkingLevel as any);
 		}
 
-		this.modelLabel = formatModelLabel(this.session.model);
+		this.modelLabel = formatModelLabel(session.model);
 	}
 
 	/** Flush already-finalized archive entries while the old context is still live. */
@@ -383,6 +445,8 @@ export class JarvisSideSessionRuntime {
 	}
 
 	dispose(): void {
+		this.ready = false;
+		this.revokePendingSends();
 		// Retained public native shutdown handlers run BEFORE SDK ctx invalidation.
 		// AgentSession.dispose() does not emit session_shutdown on Pi 1.0.
 		this.disposal = this.nativeMcp?.dispose() ?? this.disposal;
@@ -390,7 +454,6 @@ export class JarvisSideSessionRuntime {
 		this.flushArchive();
 		this.archiveFinalSnapshot = undefined;
 		this.lifetime.abort();
-		this.ready = false;
 		this.toolAccessEnabled = false;
 		this.syncActiveTools = undefined;
 		this.syncHostModels = undefined;
@@ -416,7 +479,9 @@ export class JarvisSideSessionRuntime {
 		if (!options.model && persistedContext.model) {
 			assertSupportedSideModel(options.modelRegistry.find(persistedContext.model.provider, persistedContext.model.modelId));
 		}
-		const { modelRuntime, sync } = await createSideModelRuntime(options.modelRegistry);
+		const getRequestSignal = () => this.requestPermit.getStore()
+			?? AbortSignal.any([this.workCancellation.signal, this.lifetime.signal]);
+		const { modelRuntime, sync } = await createSideModelRuntime(options.modelRegistry, getRequestSignal);
 		assertInitializing();
 		this.syncHostModels = sync;
 		const settingsManager = SettingsManager.create(options.cwd, getAgentDir(), {
@@ -470,6 +535,16 @@ export class JarvisSideSessionRuntime {
 				})] : []),
 				// Permission preflight is registered BEFORE native await/connect hooks.
 				this.nativeMcp.extensionFactory,
+				(pi) => {
+					// Last input hook: discard a revoked send after earlier async
+					// input handlers, including a delayed steer into a fresh run.
+					pi.on("input", async () => {
+						await Promise.resolve();
+						if (getRequestSignal().aborted) {
+							return { action: "handled" };
+						}
+					});
+				},
 			],
 		});
 		await resourceLoader.reload();

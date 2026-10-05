@@ -34,10 +34,13 @@ class FakeRuntime {
 	disposed = false;
 	syncs: { model: any; thinking: string | undefined }[] = [];
 	gate?: ReturnType<typeof deferred<void>>;
+	syncGate?: ReturnType<typeof deferred<void>>;
+	aborts = 0;
 	constructor(readonly options: any) {}
 	isReady() { return true; }
 	isStreaming() { return !!this.gate; }
 	getModelLabel() { return "test/runtime"; }
+	getThinkingLevel() { return "low"; }
 	getRepoToolsDetailLabel() { return "local tools only"; }
 	getDisplayEntries() { return []; }
 	setToolAccessEnabled() {}
@@ -45,12 +48,13 @@ class FakeRuntime {
 	describeSessionTree() { return "tree"; }
 	async compactJarvisContext() {}
 	async navigateSessionTree() { throw new Error("invalid tree target"); }
-	async syncModel(selected: any, thinking: string | undefined) { this.syncs.push({ model: selected, thinking }); }
+	async syncModel(selected: any, thinking: string | undefined) { this.syncs.push({ model: selected, thinking }); await this.syncGate?.promise; }
 	async sendMessage(text: string) {
 		assert.equal(this.disposed, false, "disposed runtime must never receive replacement input");
 		this.sent.push(text);
 		await this.gate?.promise;
 	}
+	async cancelWork() { this.aborts++; this.gate?.resolve(); }
 	dispose() { this.disposed = true; }
 }
 function harness(mode = "tui") {
@@ -232,6 +236,105 @@ try {
 		assert.equal(h.runtimes[0]!.options.thinkingLevel, "high");
 		await h.event("session_shutdown"); await opened;
 	}
+
+	{
+		const h = harness(); await h.event("session_start");
+		h.models.push({ ...model("virtual"), api: "pi-virtual" });
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		const view = h.overlay.view, runtime = h.runtimes[0]!;
+		const choices = await view.getModelChoices();
+		assert.deepEqual(choices.map((choice: any) => choice.value), ["follow-main", "clear", "test/main", "test/project", "test/global"]);
+		assert.equal(h.customCalls, 1, "embedded choices use the public registry, never a host dialog");
+		await view.configureModel("test/project");
+		await view.configureThinking("max");
+		const projectPath = getJarvisConfigPath(h.ctx.cwd, "project");
+		assert.equal(JSON.parse(fs.readFileSync(projectPath, "utf8")).modelSelection.modelId, "project");
+		assert.match(view.getThinkingLabel(), /max.*effective low/, "label reports configured and SDK-clamped actual levels");
+		assert.equal(h.ctx.model.id, "main", "Jarvis config never mutates the main model");
+		const before = fs.readFileSync(projectPath, "utf8");
+		const gate = deferred(); runtime.gate = gate;
+		const sending = view.sendMessage("busy turn"); await until(() => runtime.sent.length === 1);
+		for (const request of ["test/global", "follow-main", "clear"]) await view.configureModel(request);
+		for (const request of ["off", "clear"]) await view.configureThinking(request);
+		await h.command("jarvis-model", "--global follow-main"); await h.command("jarvis-thinking", "--global low");
+		assert.equal(fs.readFileSync(projectPath, "utf8"), before, "busy choices are rejected BEFORE persistence");
+		assert.ok(runtime.options.bridge.snapshot().notifications.some((notice: any) => /busy/.test(notice.message)));
+		gate.resolve(); await sending; runtime.gate = undefined;
+		await view.configureModel("test/disappeared");
+		assert.equal(h.customCalls, 1, "stale/unknown embedded choices cannot fall back to nested host custom UI");
+		await view.configureModel("clear");
+		assert.ok(!JSON.parse(fs.readFileSync(projectPath, "utf8")).modelSelection, "same existing clear handler is reused");
+		await h.event("session_shutdown"); await opened;
+	}
+	{
+		// Registry refresh is an async boundary: an old embedded choice cannot
+		// persist after close/reopen, even when the main/side owner is unchanged.
+		const h = harness(); await h.event("session_start");
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		const view = h.overlay.view, refresh = deferred(); h.setRefresh(() => refresh.promise);
+		const choosing = view.configureModel("test/project");
+		h.overlay.handleInput("\x1b"); await opened;
+		const reopened = h.command("jarvis"); refresh.resolve(); await choosing;
+		assert.equal(fs.existsSync(getJarvisConfigPath(h.ctx.cwd, "project")), false, "closed picker choice never persists after reopen");
+		await view.configureThinking("high");
+		assert.equal(fs.existsSync(getJarvisConfigPath(h.ctx.cwd, "project")), false, "stale view cannot configure the reopened presentation");
+		await h.event("session_shutdown"); await reopened;
+	}
+	for (const kind of ["Model", "Thinking"] as const) {
+		const h = harness(); await h.event("session_start");
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		const oldRuntime = h.runtimes[0]!, sync = deferred(); oldRuntime.syncGate = sync;
+		const selecting = h.overlay.view[`configure${kind}`](kind === "Model" ? "test/project" : "high");
+		await until(() => oldRuntime.syncs.length === 1);
+		h.clearBranch(); await h.event("session_start"); await opened;
+		const reopened = h.command("jarvis"); await until(() => h.runtimes.length === 2);
+		sync.resolve(); await selecting;
+		assert.equal(fs.existsSync(getJarvisConfigPath(h.ctx.cwd, "project")), false, "replaced owner must never write stale config after model sync");
+		const current = h.runtimes[1]!;
+		assert.equal(current.syncs.length, 0, "stale rollback must not configure the new runtime");
+		await h.event("session_shutdown"); await reopened;
+	}
+
+	{
+		const h = harness(); await h.event("session_start");
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		const refresh = deferred(); let loads = 0;
+		h.setRefresh(() => ++loads === 1 ? refresh.promise : Promise.resolve());
+		const older = h.overlay.view.configureModel("test/project");
+		await tick();
+		await h.overlay.view.configureModel("test/global");
+		refresh.resolve(); await older;
+		assert.equal(JSON.parse(fs.readFileSync(getJarvisConfigPath(h.ctx.cwd, "project"), "utf8")).modelSelection.modelId,
+			"global", "late configuration must not overwrite a newer accepted choice in the same window");
+		await h.event("session_shutdown"); await opened;
+	}
+	{
+		const h = harness(); await h.event("session_start");
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		const refresh = deferred(); let loads = 0;
+		h.setRefresh(() => ++loads === 1 ? refresh.promise : Promise.resolve());
+		const older = h.overlay.view.configureModel("test/project"); await tick();
+		await h.overlay.view.sendMessage("/new");
+		refresh.resolve(); await older;
+		assert.equal(fs.existsSync(getJarvisConfigPath(h.ctx.cwd, "project")), false,
+			"a same-main side reset must reject the old thread's uncommitted configuration");
+		await h.overlay.view.configureModel("test/global");
+		assert.equal(JSON.parse(fs.readFileSync(getJarvisConfigPath(h.ctx.cwd, "project"), "utf8")).modelSelection.modelId, "global");
+		await h.event("session_shutdown"); await opened;
+	}
+	for (const kind of ["Model", "Thinking"] as const) {
+		const h = harness(); await h.event("session_start");
+		const opened = h.command("jarvis"); await until(() => h.runtimes.length === 1);
+		const runtime = h.runtimes[0]!, sync = deferred(); runtime.syncGate = sync;
+		const first = h.overlay.view[`configure${kind}`](kind === "Model" ? "test/project" : "high");
+		await until(() => runtime.syncs.length === 1);
+		await h.overlay.view[`configure${kind}`](kind === "Model" ? "test/global" : "low");
+		sync.resolve(); await first;
+		const saved = JSON.parse(fs.readFileSync(getJarvisConfigPath(h.ctx.cwd, "project"), "utf8"));
+		assert.equal(kind === "Model" ? saved.modelSelection.modelId : saved.thinkingSelection.thinkingLevel,
+			kind === "Model" ? "project" : "high", "busy rejection must not supersede a valid admitted configuration");
+		await h.event("session_shutdown"); await opened;
+	}
 	{
 		const h = harness("print"); await h.event("session_start");
 		const refresh = deferred(); h.setRefresh(() => refresh.promise);
@@ -253,10 +356,11 @@ try {
 		const paging = new JarvisModelPicker({ terminal: { rows: 12 }, requestRender() {} } as any,
 			theme, getKeybindings() as any, Array.from({ length: 20 }, (_, i) => model(`item-${i}`)),
 			(value) => { selected = value.id; }, () => {});
+		paging.focused = true; paging.render(60); // Selection requires a measured visible picker.
 		paging.handleInput("\x1b[6~"); paging.handleInput("\r");
-		assert.equal(selected, "item-8", "PageDown advances one visible page");
+		assert.equal(selected, "item-9", "PageDown advances one visible page");
 		paging.handleInput("\x1b[B"); paging.handleInput("\x1b[D"); paging.handleInput("\r");
-		assert.equal(selected, "item-9", "cursor-only search keys must preserve model selection");
+		assert.equal(selected, "item-10", "cursor-only search keys must preserve model selection");
 		paging.handleInput("\x1b[5~"); paging.handleInput("\r");
 		assert.equal(selected, "item-1", "PageUp moves back one visible page");
 	}

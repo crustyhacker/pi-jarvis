@@ -10,6 +10,7 @@ const fgNames = "accent border borderAccent borderMuted success error warning mu
 const fg = Object.fromEntries(fgNames.map((name) => [name, "#dcd9ef"]));
 Object.assign(fg, { accent: "#5de2ff", borderAccent: "#ff70cd", borderMuted: "#77659a", muted: "#aaa0c3", dim: "#8f83a7", success: "#70e2bc", warning: "#ffb97e" });
 const bg = Object.fromEntries("selectedBg searchMatchBg userMessageBg customMessageBg toolPendingBg toolSuccessBg toolErrorBg".split(" ").map((name) => [name, "#171127"]));
+bg.userMessageBg = "#241a38";
 const theme = new Theme(fg, bg, "truecolor", { name: "Jarvis demo", appearance: "dark" });
 const escape = (text) => text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
@@ -66,6 +67,11 @@ const bridge = new JarvisOverlayBridge();
 const view = {
 	isReady: () => true, isStreaming: () => false,
 	getModelLabel: () => "demo/side", getModelModeLabel: () => "follow main",
+	getThinkingLabel: () => "auto (effective medium)",
+	getModelChoices: async () => [{ value: "follow-main", label: "Follow main" }, { value: "demo/side", label: "demo/side" }],
+	async configureModel() { throw new Error("Documentation fixture must never configure models"); },
+	async configureThinking() { throw new Error("Documentation fixture must never configure thinking"); },
+	async cancelWork() { throw new Error("Documentation fixture must never cancel work"); },
 	getMainStatusLabel: () => "working", getMainModelLabel: () => "demo/main",
 	getMainFocusLabel: () => "Reviewing the current change", getMainDeltaLabel: () => "",
 	getRepoToolsDetailLabel: () => "repo tools off",

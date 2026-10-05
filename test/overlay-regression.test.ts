@@ -36,7 +36,6 @@ function fixture(bridge = new JarvisOverlayBridge(), keybindings = getKeybinding
 	};
 	const overlay = attachOverlayBridge(new JarvisOverlayComponent(host, theme, bridge, view, () => {
 		closes++;
-		state.tools = state.followUp = state.steer = false;
 	}, keybindings), bridge, host);
 	overlay.focused = true;
 	return { overlay, bridge, host, terminal, view, state, sent, renders: () => renders, closes: () => closes };
@@ -185,7 +184,7 @@ test("all key paths request redraw, invalidate input, and honor remapped actions
 	}
 });
 
-test("disposal cancels confirmation, revokes permissions, and is identity-safe and idempotent", async () => {
+test("disposal cancels confirmation, preserves view-owned grants, and is identity-safe and idempotent", async () => {
 	const bridge = new JarvisOverlayBridge();
 	const first = fixture(bridge);
 	const second = fixture(bridge);
@@ -200,7 +199,7 @@ test("disposal cancels confirmation, revokes permissions, and is identity-safe a
 	second.overlay.dispose();
 	assert.equal(await pending, false);
 	assert.equal(second.closes(), 1);
-	assert.equal(second.state.tools || second.state.followUp || second.state.steer, false);
+	assert.ok(second.state.tools && second.state.followUp && second.state.steer);
 	second.overlay.dispose();
 	second.overlay.handleInput("x");
 	assert.equal(second.closes(), 1);
@@ -362,3 +361,55 @@ test("Kitty key releases do not toggle or approve; submit failures are reported"
 	assert.ok(f.bridge.snapshot().notifications.some((notice) => notice.message.includes("send threw")));
 	f.overlay.dispose();
 });
+
+test("bridge confirmation admission fails closed; footer observers survive detach/reset and cannot break settlement", async () => {
+	let open = false, changes = 0;
+	const bridge = new JarvisOverlayBridge(() => open);
+	const detachThrow = bridge.onChange(() => { throw new Error("observer failed"); });
+	const detachFooter = bridge.onChange(() => { changes++; });
+	assert.equal(await bridge.requestConfirmation("invisible", "reject"), false);
+	assert.equal(bridge.hasPendingConfirmation(), false);
+	const controller = new AbortController(); controller.abort();
+	open = true;
+	assert.equal(await bridge.requestConfirmation("aborted", "reject", controller.signal), false);
+	const pending = bridge.requestConfirmation("visible", "review");
+	bridge.detach(); bridge.setStatus("work", "background work"); bridge.notify("background update");
+	assert.ok(changes >= 3);
+	bridge.reset(); assert.equal(await pending, false);
+	const before = changes;
+	detachFooter(); detachFooter(); detachThrow(); bridge.refresh(); assert.equal(changes, before);
+	assert.equal(await new JarvisOverlayBridge(() => { throw new Error("admission failed"); }).requestConfirmation("title", "body"), false);
+	const standalone = new JarvisOverlayBridge(); const defaultPending = standalone.requestConfirmation("default", "body");
+	assert.ok(standalone.hasPendingConfirmation()); standalone.resolveConfirmation(true); assert.equal(await defaultPending, true);
+});
+
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	test(`${Renderer.name}: actual public host wheel ownership and keyboard line scrolling`, () => {
+		const terminal = new MemoryTerminal();
+		const host = new Renderer(terminal);
+		const f = fixture(undefined, undefined, Array.from({ length: 100 }, (_, i) => ({ kind: "assistant", text: `record-${i}` })));
+		const bridge = new JarvisOverlayBridge();
+		const component = attachOverlayBridge(new JarvisOverlayComponent(host, theme, bridge, f.view, () => {}), bridge, host);
+		host.addChild({ render: () => ["base"], invalidate() {}, handleInput() {} });
+		host.start();
+		let handle: ReturnType<TUI["showOverlay"]> | undefined;
+		try {
+			handle = host.showOverlay(component, { width: 68, maxHeight: "82%" }); host.renderNow(true);
+			const bounds = handle.getBounds()!;
+			const wheel = (code: number) => terminal.input?.(`\x1b[<${code};${bounds.col + 2};${bounds.row + 2}M`);
+			const before = plain(component.render(68));
+			wheel(64); host.renderNow();
+			if (Renderer === TuiAltScreen) {
+				assert.match(plain(component.render(68)), /History ·/);
+				assert.doesNotMatch(plain(component.render(68)), /record-99/);
+				wheel(65); host.renderNow(); assert.match(plain(component.render(68)), /Conversation · live/);
+			} else assert.equal(plain(component.render(68)), before, "regular mode leaves wheel to terminal scrollback");
+			terminal.input?.("draft");
+			terminal.input?.("\x1b[1;3A"); host.renderNow();
+			assert.match(plain(component.render(68)), /History ·/);
+			assert.equal(bridge.getDraft(), "draft");
+			terminal.input?.("\x1b[1;3B"); host.renderNow();
+			assert.match(plain(component.render(68)), /Conversation · live/);
+		} finally { component.dispose(); handle?.hide(); host.stop(); f.overlay.dispose(); }
+	});
+}

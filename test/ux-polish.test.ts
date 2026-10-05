@@ -28,7 +28,6 @@ function fixture(bridge = new JarvisOverlayBridge(), entries: JarvisDisplayEntry
 	};
 	const overlay = attachOverlayBridge(new JarvisOverlayComponent(host, theme, bridge, view, () => {
 		closes++;
-		state.tools = state.note = state.redirect = false;
 	}), bridge, host);
 	overlay.focused = true;
 	return { overlay, bridge, state, terminal, sent, view, closes: () => closes };
@@ -43,7 +42,7 @@ function transcript(lines: string[]): string[] {
 	return text.slice(start + 1, end);
 }
 
-test("multiline drafts survive close/reopen, but permission grants do not", () => {
+test("multiline drafts survive close/reopen and presentation close does not revoke view-owned grants", () => {
 	const f = fixture();
 	f.overlay.handleInput("  first");
 	f.overlay.handleInput("\n");
@@ -54,7 +53,7 @@ test("multiline drafts survive close/reopen, but permission grants do not", () =
 	f.state.tools = f.state.note = f.state.redirect = true;
 	f.overlay.handleInput("\x1b");
 	assert.equal(f.closes(), 1);
-	assert.equal(f.state.tools || f.state.note || f.state.redirect, false);
+	assert.ok(f.state.tools && f.state.note && f.state.redirect);
 	const reopened = fixture(f.bridge);
 	try {
 		assert.ok(plain(reopened.overlay.render(80)).includes("second"));
@@ -256,4 +255,271 @@ test("multiline input keeps a cursor and terminal-column bounds through tiny res
 		}
 		assert.equal(f.bridge.getDraft(), "中文🙂\n  indented\nlast");
 	} finally { f.overlay.dispose(); }
+});
+
+const tick = async () => { await Promise.resolve(); await Promise.resolve(); };
+const F2 = "\x1bOQ", F3 = "\x1bOR";
+
+function selectable(f: ReturnType<typeof fixture>) {
+	const models: string[] = [], thinking: string[] = [];
+	f.view.getThinkingLabel = () => "auto → high";
+	f.view.getModelChoices = async () => [
+		{ value: "follow-main", label: "Follow main model" },
+		{ value: "clear", label: "Clear project override" },
+		...Array.from({ length: 40 }, (_, i) => ({ value: `fixture/model-${i}`, label: `fixture/model-${i}` })),
+	];
+	f.view.configureModel = async request => { models.push(request); };
+	f.view.configureThinking = async request => { thinking.push(request); };
+	return { models, thinking };
+}
+
+test("F2/F3 configure inside the overlay; physical, follow-main/clear and every thinking choice preserve drafts", async () => {
+	const f = fixture();
+	const configured = selectable(f);
+	try {
+		f.overlay.handleInput("  unsent\n    message");
+		for (const search of ["Follow main", "Clear project", "fixture/model-39"]) {
+			f.overlay.handleInput(F2);
+			assert.match(plain(f.overlay.render(64)), /Loading host model/);
+			await tick();
+			f.overlay.handleInput(search);
+			assert.match(plain(f.overlay.render(64)), /project override \(main unchanged\)/);
+			f.overlay.handleInput("\r"); await tick();
+			assert.equal(f.bridge.getDraft(), "  unsent\n    message");
+		}
+		assert.deepEqual(configured.models, ["follow-main", "clear", "fixture/model-39"]);
+		for (const [search, expected] of [["auto", "auto"], ["follow-main", "follow-main"], ["off", "off"],
+			["minimal", "minimal"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"], ["clear", "clear"]]) {
+			f.overlay.handleInput(F3);
+			f.overlay.handleInput(search);
+			f.overlay.render(64); f.overlay.handleInput("\r"); await tick();
+			assert.equal(configured.thinking.at(-1), expected);
+		}
+		assert.deepEqual(f.sent, []);
+		assert.equal(f.closes(), 0);
+	} finally { f.overlay.dispose(); }
+});
+
+test("selector failures and busy rejection stay visible without replacing the prompt", async () => {
+	const f = fixture(); selectable(f);
+	try {
+		f.overlay.handleInput("  preserve draft");
+		f.view.configureModel = async () => { throw new Error("Busy: wait or stop, then retry"); };
+		f.overlay.handleInput(F2); await tick(); f.overlay.render(64);
+		f.overlay.handleInput("\r"); await tick();
+		assert.match(plain(f.overlay.render(64)), /Busy: wait or stop/);
+		assert.equal(f.bridge.getDraft(), "  preserve draft");
+		f.overlay.handleInput("\x1b");
+		assert.match(plain(f.overlay.render(64)), /preserve draft/);
+		f.view.configureThinking = async () => { f.bridge.notify("Busy: wait or stop", "warning"); };
+		f.overlay.handleInput(F3); f.overlay.render(64); f.overlay.handleInput("\r"); await tick();
+		assert.match(plain(f.overlay.render(64)), /Busy: wait or stop/);
+		assert.equal(f.bridge.getDraft(), "  preserve draft");
+		f.view.getModelChoices = async () => { throw new Error("Registry unavailable"); };
+		f.overlay.handleInput(F2); await tick();
+		assert.match(plain(f.overlay.render(64)), /Registry unavailable/);
+	} finally { f.overlay.dispose(); }
+});
+
+test("async choices/configuration cannot resurrect a dismissed, reset or confirmation-preempted selector", async () => {
+	for (const end of ["back", "close", "reset", "branch", "confirm"]) {
+		const f = fixture(); const configured = selectable(f);
+		let resolve!: (value: { value: string; label: string }[]) => void;
+		f.view.getModelChoices = () => new Promise(done => { resolve = done; });
+		try {
+			f.overlay.handleInput("draft"); f.overlay.handleInput(F2);
+			if (end === "back") f.overlay.handleInput("\x1b");
+			if (end === "close") f.overlay.dispose();
+			if (end === "reset") f.bridge.reset();
+			if (end === "branch") f.bridge.resetTranscript();
+			if (end === "confirm") {
+				const review = f.bridge.requestConfirmation("Foreground review", "body");
+				// Preemption is synchronous on bridge emission, without an input gap.
+				f.bridge.resolveConfirmation(false); assert.equal(await review, false);
+			}
+			resolve([{ value: "fixture/late", label: "SHOULD NEVER APPEAR" }]); await tick();
+			assert.doesNotMatch(plain(f.overlay.render(64)), /SHOULD NEVER APPEAR|Loading host model/);
+			assert.deepEqual(configured.models, []);
+		} finally { f.overlay.dispose(); }
+	}
+	for (const end of ["back", "close", "reset", "confirm"]) {
+		const f = fixture(); selectable(f);
+		let reject!: (error: Error) => void;
+		f.view.configureThinking = () => new Promise((_, fail) => { reject = fail; });
+		try {
+			f.overlay.handleInput("draft"); f.overlay.handleInput(F3); f.overlay.render(64); f.overlay.handleInput("\r");
+			if (end === "back") f.overlay.handleInput("\x1b");
+			if (end === "close") f.overlay.dispose();
+			if (end === "reset") f.bridge.reset();
+			if (end === "confirm") { void f.bridge.requestConfirmation("Preempt", "body"); f.bridge.resolveConfirmation(false); }
+			reject(new Error("STALE CONFIGURATION ERROR")); await tick();
+			assert.doesNotMatch(plain(f.overlay.render(64)), /STALE CONFIGURATION ERROR|Applying project/);
+			assert.equal(f.bridge.snapshot().notifications.length, 0);
+		} finally { f.overlay.dispose(); }
+	}
+});
+
+test("paste framing precedes F2/F3/stop and selector paste never selects, cancels, submits or toggles", async () => {
+	const f = fixture(); const configured = selectable(f); let stopped = 0;
+	f.view.cancelWork = async () => { stopped++; };
+	try {
+		f.overlay.handleInput("draft");
+		f.overlay.handleInput("\x1b[20"); f.overlay.handleInput("0~");
+		for (const key of [F2, F3, "\x03", "\x1b", "\t", "\r"]) f.overlay.handleInput(key);
+		f.overlay.handleInput("\x1b[201~\r");
+		assert.equal(stopped, 0); assert.equal(f.closes(), 0); assert.equal(f.bridge.getDraft(), "draft");
+		for (const shortcut of [F2, F3]) {
+			f.overlay.handleInput(shortcut); await tick(); f.overlay.render(64);
+			f.overlay.handleInput("\x1b[20"); f.overlay.handleInput("0~");
+			for (const key of ["y", "n", F2, F3, "\x03", "\x1b", "\t", "\r", " "]) f.overlay.handleInput(key);
+			f.overlay.handleInput("\x1b[20"); f.overlay.handleInput("1~\r");
+			assert.match(plain(f.overlay.render(64)), /project override/);
+			assert.equal(stopped, 0); assert.equal(f.bridge.getDraft(), "draft");
+			f.overlay.handleInput("\x1b");
+		}
+		assert.deepEqual(configured.models, []); assert.deepEqual(configured.thinking, []);
+		assert.deepEqual(f.sent, []); assert.equal(f.state.tools || f.state.note || f.state.redirect, false);
+		assert.equal(f.closes(), 0);
+	} finally { f.overlay.dispose(); }
+});
+
+test("confirmation preempts picker and owns paste even across external cancellation", async () => {
+	const f = fixture(); const configured = selectable(f);
+	try {
+		f.overlay.handleInput("draft"); f.overlay.handleInput(F3); f.overlay.render(64);
+		f.overlay.handleInput("\x1b[200~ignored");
+		const review = f.bridge.requestConfirmation("Redirect review", "Main stays unchanged unless confirmed");
+		f.overlay.render(64); f.overlay.handleInput("y");
+		assert.ok(f.bridge.hasPendingConfirmation());
+		f.bridge.resolveConfirmation(false); assert.equal(await review, false);
+		f.overlay.handleInput("\x1b[201~\r");
+		assert.equal(f.bridge.getDraft(), "draft"); assert.deepEqual(f.sent, []);
+		assert.deepEqual(configured.thinking, []);
+		assert.doesNotMatch(plain(f.overlay.render(64)), /project override/);
+	} finally { f.overlay.dispose(); }
+});
+
+test("Ctrl+C stops only outside review; Escape closes; errors preserve draft and paste never stops", async () => {
+	const f = fixture(); selectable(f); let stopped = 0;
+	f.view.cancelWork = async () => { stopped++; throw new Error("Stop failed"); };
+	try {
+		f.overlay.handleInput("draft"); f.overlay.handleInput("\x03"); await tick();
+		assert.equal(stopped, 1); assert.equal(f.closes(), 0);
+		assert.match(plain(f.overlay.render(64)), /Stop failed/); assert.equal(f.bridge.getDraft(), "draft");
+		f.overlay.handleInput(F3); f.overlay.render(64); f.overlay.handleInput("\x03");
+		assert.equal(stopped, 1); assert.doesNotMatch(plain(f.overlay.render(64)), /project override/);
+		const review = f.bridge.requestConfirmation("Review", "body"); f.overlay.render(64); f.overlay.handleInput("\x03");
+		assert.equal(await review, false); assert.equal(stopped, 1);
+		f.overlay.handleInput("\x1b[200~\x03\x1b[201~"); assert.equal(stopped, 1);
+		f.overlay.handleInput("\x1b"); assert.equal(f.closes(), 1);
+	} finally { f.overlay.dispose(); }
+});
+
+test("Tab discovers Model/Thinking/History controls and focused arrows scroll without editing or recall", async () => {
+	const f = fixture(undefined, history(100)); selectable(f);
+	try {
+		f.overlay.handleInput("draft");
+		for (let i = 0; i < 4; i++) f.overlay.handleInput("\t");
+		assert.match(plain(f.overlay.render(50)), /\[F2 Model/);
+		f.overlay.handleInput("\r"); await tick(); assert.match(plain(f.overlay.render(50)), /project override/);
+		f.overlay.handleInput("\x1b");
+		for (let i = 0; i < 5; i++) f.overlay.handleInput("\t");
+		assert.match(plain(f.overlay.render(50)), /\[F3 Thinking/);
+		f.overlay.handleInput(" "); assert.match(plain(f.overlay.render(50)), /project override/);
+		f.overlay.handleInput("\x1b");
+		for (let i = 0; i < 6; i++) f.overlay.handleInput("\t");
+		assert.match(plain(f.overlay.render(50)), /\[History ↑\/↓\]/);
+		f.overlay.handleInput("\x1b[A");
+		const reading = transcript(f.overlay.render(50));
+		assert.ok(!reading.join("\n").includes("record-99"));
+		f.state.entries.push({ kind: "assistant", text: "record-100" });
+		assert.deepEqual(transcript(f.overlay.render(50)), reading);
+		f.overlay.handleInput("\x1b[B"); f.overlay.render(50);
+		f.overlay.handleInput("\x1b[1;5F"); assert.match(plain(f.overlay.render(50)), /record-100/);
+		assert.equal(f.bridge.getDraft(), "draft");
+	} finally { f.overlay.dispose(); }
+});
+
+test("80x24 compact UI exposes terminal-style Message prompt, all shortcuts and at least three transcript rows", () => {
+	const f = fixture(undefined, history(100)); selectable(f);
+	try {
+		f.terminal.rows = 24;
+		for (const text of ["", "one\n  two\n    three\nfour"]) {
+			f.bridge.setDraft(text); // A fresh mount reflects bridge restore.
+			const component = new JarvisOverlayComponent({ terminal: f.terminal, requestRender() {} } as unknown as TUI, theme, f.bridge, f.view, () => {});
+			component.focused = true;
+			try {
+				const lines = component.render(54); const output = plain(lines);
+				for (const hint of ["F2 Model", "F3 Thinking", "ctrl+c stop", "esc close", "pageUp/pageDown", "alt+↑/↓ history", "ctrl+end live", "tab controls", "jarvis >", "Prompt · Message"]) assert.ok(output.includes(hint), hint);
+				assert.ok(transcript(lines).length >= 3);
+				assert.ok(lines.some(line => line.includes(CURSOR_MARKER)));
+				assert.ok(lines.every(line => visibleWidth(line) <= 54));
+				if (text) assert.match(output, /\.\.\./);
+			} finally { component.dispose(); }
+		}
+	} finally { f.overlay.dispose(); }
+});
+
+test("embedded picker selection stays visible after PageDown and tiny resize preserves IME cursor and draft", async () => {
+	const f = fixture(); const configured = selectable(f);
+	try {
+		f.overlay.handleInput("中文👨‍👩‍👧‍👦\n  draft"); f.overlay.handleInput(F2); await tick();
+		f.terminal.rows = 12;
+		f.overlay.render(40);
+		for (let i = 0; i < 7; i++) {
+			f.overlay.handleInput("\x1b[6~");
+			const output = plain(f.overlay.render(40));
+			assert.match(output, /→ .*fixture\/model/);
+		}
+		for (const width of [1, 2, 3, 4, 8, 40]) {
+			const lines = f.overlay.render(width);
+			assert.ok(lines.length <= f.terminal.rows);
+			assert.ok(lines.every(line => visibleWidth(line) <= width));
+		}
+		f.terminal.rows = 40; f.overlay.render(40); f.overlay.handleInput("\r"); await tick();
+		assert.equal(configured.models.length, 1);
+		assert.equal(f.bridge.getDraft(), "中文👨‍👩‍👧‍👦\n  draft");
+	} finally { f.overlay.dispose(); }
+});
+
+test("prompt panel uses public semantic light/dark colors, a Message label and no OS-shell glyph", () => {
+	const f = fixture();
+	try {
+		for (const appearance of ["light", "dark"]) {
+			const bgRoles: string[] = [];
+			const palette = {
+				appearance,
+				fg: (role: string, text: string) => `\x1b[${role === "accent" ? 36 : role === "text" ? 37 : 90}m${text}\x1b[39m`,
+				bg: (role: string, text: string) => { bgRoles.push(role); return `\x1b[${role === "userMessageBg" ? appearance === "light" ? 47 : 40 : 49}m${text}\x1b[49m`; },
+				bold: (text: string) => text,
+			} as unknown as Theme;
+			const overlay = new JarvisOverlayComponent({ terminal: f.terminal, requestRender() {} } as unknown as TUI, palette, f.bridge, f.view, () => {});
+			overlay.focused = true;
+			try {
+				overlay.handleInput("one\n  two"); const lines = overlay.render(54); const output = plain(lines);
+				assert.match(output, /Prompt · Message/); assert.match(output, /jarvis > one/); assert.match(output, /\.\.\.   two/);
+				assert.ok(bgRoles.includes("userMessageBg") && bgRoles.includes("customMessageBg"));
+				assert.ok(lines.some(line => line.includes(CURSOR_MARKER)));
+				assert.ok(lines.every(line => visibleWidth(line) <= 54)); assert.ok(!output.includes("$"));
+			} finally { overlay.dispose(); f.bridge.setDraft(""); }
+		}
+	} finally { f.overlay.dispose(); }
+});
+
+test("tiny redraw, invalidation, unfocus and resize-before-redraw cannot apply an invisible picker choice", async () => {
+	for (const change of ["tiny", "zero", "invalidate", "resize", "unfocus"]) {
+		const f = fixture(); const configured = selectable(f);
+		try {
+			f.overlay.handleInput("draft"); f.overlay.handleInput(F3); f.overlay.render(80); f.overlay.handleInput("\x1b[B");
+			if (change === "tiny") { f.terminal.rows = 2; f.terminal.columns = 2; f.overlay.render(2); }
+			if (change === "zero") f.overlay.render(0);
+			if (change === "invalidate") f.overlay.invalidate();
+			if (change === "resize") { f.terminal.rows = 2; f.terminal.columns = 2; }
+			if (change === "unfocus") f.overlay.focused = false;
+			f.overlay.handleInput("\r"); await tick(); assert.deepEqual(configured.thinking, [], change);
+			f.terminal.rows = 40; f.terminal.columns = 100; f.overlay.focused = true; f.overlay.render(80);
+			f.overlay.handleInput("\r"); await tick(); assert.deepEqual(configured.thinking, ["follow-main"], "fresh visible selection works");
+			assert.equal(f.bridge.getDraft(), "draft");
+		} finally { f.overlay.dispose(); }
+	}
 });

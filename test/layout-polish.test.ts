@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { renderJarvisActivity, renderJarvisHeader, type JarvisHeaderOptions } from "../overlay-layout.js";
+import { renderJarvisActivity, renderJarvisHeader, renderJarvisControls, type JarvisHeaderOptions } from "../overlay-layout.js";
 import type { JarvisOverlaySnapshot, JarvisOverlayView } from "../overlay.js";
 
 const plainTheme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -300,4 +300,22 @@ test("activity is a sanitized bounded row, ignoring notices, status and transcri
 	assert.equal(stripTerminalSequences(row), "Working… · 中文👨‍👩‍👧‍👦 label end");
 	const emptyView = new Proxy({} as JarvisOverlayView, { get: forbidden });
 	assert.equal(renderJarvisActivity(plainTheme, snapshot, emptyView, 0), "");
+});
+
+test("picker/history controls retain discoverable shortcuts and focused target across widths/themes", () => {
+	const view = fixture({ getThinkingLabel: () => "auto → high" });
+	for (const theme of [plainTheme, recordingTheme().theme]) {
+		for (const focusTarget of ["input", "model", "thinking", "history"] as const) {
+			for (let width = 0; width <= 100; width++) {
+				const row = renderJarvisControls(theme, view, width, { ...collapsed, focusTarget });
+				assertBounds([row], width);
+				if (width >= 48) {
+					assert.ok(stripTerminalSequences(row).includes("F2 Model"));
+					assert.ok(stripTerminalSequences(row).includes("F3 Thinking"));
+				}
+			}
+		}
+	}
+	assert.match(renderJarvisControls(plainTheme, view, 80, collapsed), /auto → high/);
+	assert.match(renderJarvisControls(plainTheme, view, 20, { ...collapsed, focusTarget: "history" }), /^\[History ↑\/↓\]/);
 });

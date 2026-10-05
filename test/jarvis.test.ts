@@ -220,34 +220,68 @@ function getOverlayInputValue(lines: readonly string[]): string {
 
 function createOverlayCaptureHarness(harness: JarvisExtensionHarness): {
 	getCapturedOverlay: () => JarvisOverlayComponent | undefined;
-	restore: () => void;
+	sendMessage: (text: string) => Promise<void>;
+	restore: () => Promise<void>;
 } {
 	type OverlayFactory = (
-		host: { requestRender: () => void; terminal: { rows: number } },
+		host: TuiMainScreen,
 		overlayTheme: typeof theme,
-		state: unknown,
-		onClose: () => void,
+		keybindings: KeybindingsManager,
+		done: () => void,
 	) => JarvisOverlayComponent;
 
 	const originalCustom = harness.ctx.ui.custom;
 	let capturedOverlay: JarvisOverlayComponent | undefined;
+	let closeHost: (() => void) | undefined;
 	harness.ctx.ui.custom = async (...args: unknown[]) => {
-		const [factory] = args;
-		if (typeof factory === "function") {
-			capturedOverlay = (factory as OverlayFactory)(
-				{ requestRender: () => {}, terminal: { rows: 40 } },
-				harness.ctx.ui.theme,
-				new KeybindingsManager(TUI_KEYBINDINGS),
-				() => {},
-			);
+		const [factory, options] = args;
+		if (typeof factory !== "function" || !(options as { overlay?: boolean } | undefined)?.overlay) {
+			return originalCustom.call(harness.ctx.ui, ...args);
 		}
-		return originalCustom.call(harness.ctx.ui, ...args);
+		assert.equal(closeHost, undefined, "only one captured overlay host may be mounted");
+		// A real custom host stays pending while its component owns presentation.
+		// Resolving here would leave a captured ghost whose owner-bound controls refuse input.
+		return new Promise<void>((resolve, reject) => {
+			const tui = new TuiMainScreen(new FakeTerminal());
+			let component: JarvisOverlayComponent | undefined;
+			let mount: ReturnType<TuiMainScreen["showOverlay"]> | undefined;
+			let closed = false;
+			const done = (error?: unknown) => {
+				if (closed) return;
+				closed = true;
+				closeHost = undefined;
+				mount?.hide();
+				component?.dispose();
+				tui.stop();
+				if (error) reject(error);
+				else resolve();
+			};
+			closeHost = done;
+			try {
+				component = (factory as OverlayFactory)(tui, harness.ctx.ui.theme, new KeybindingsManager(TUI_KEYBINDINGS), done);
+				capturedOverlay = component;
+				mount = tui.showOverlay(component, { width: 80 });
+				component.render(80);
+			} catch (error) {
+				done(error);
+			}
+		});
 	};
 
 	return {
 		getCapturedOverlay: () => capturedOverlay,
-		restore: () => {
+		sendMessage: async (text) => {
+			assert.ok(capturedOverlay && closeHost, "sending requires a live captured overlay");
+			// Public bracketed paste focuses the editor even after a permission toggle.
+			capturedOverlay.handleInput(`\x1b[200~${text}\x1b[201~`);
+			capturedOverlay.render(80);
+			capturedOverlay.handleInput("\r");
+			await waitForAsyncWork();
+		},
+		restore: async () => {
+			closeHost?.();
 			harness.ctx.ui.custom = originalCustom;
+			await waitForAsyncWork();
 		},
 	};
 }
@@ -664,7 +698,18 @@ async function testOverlayForwardingToggleControls(): Promise<void> {
 	overlay.handleInput("\t");
 	overlay.handleInput("\t");
 	lines = overlay.render(80);
-	assert.equal(cursorMarkerPresent(lines), true, "tab should wrap focus back to the message input");
+	assert.equal(cursorMarkerPresent(lines), false, "model controls must not edit the draft");
+	assert.ok(lines.some((line) => line.includes("[F2 Model:")), "tab should expose the in-window model control");
+	overlay.handleInput("\t");
+	lines = overlay.render(80);
+	assert.ok(lines.some((line) => line.includes("[F3 Thinking")), "tab should expose the in-window thinking control");
+	overlay.handleInput("\t");
+	lines = overlay.render(80);
+	assert.ok(lines.some((line) => line.includes("[History ↑/↓]")), "tab should expose keyboard history navigation");
+	overlay.handleInput("\t");
+	lines = overlay.render(80);
+	assert.equal(cursorMarkerPresent(lines), true, "tab should wrap back to the message input after all seven focus targets");
+	assert.deepEqual(state.sentMessages, [], "focus navigation must not send or configure anything");
 }
 
 async function testJarvisOverlayInputHistoryNavigatesUserMessages(): Promise<void> {
@@ -1802,11 +1847,12 @@ async function testOverlayInputSwallowedOnToggleFocus(): Promise<void> {
 	assert.equal(state.toolsEnabled, false, "text keys should not toggle the focused control");
 	assert.deepEqual(state.sentMessages, [], "text keys must not be queued as messages while a toggle has focus");
 
-	overlay.handleInput("\t");
-	overlay.handleInput("\t");
-	overlay.handleInput("\t");
-	lines = overlay.render(80);
-	assert.equal(cursorMarkerPresent(lines), true, "focus should wrap back to the message input");
+	for (let remaining = 6; remaining > 0; remaining--) {
+		overlay.handleInput("\t");
+		lines = overlay.render(80);
+		assert.equal(cursorMarkerPresent(lines), remaining === 1, "only the input target should own the text cursor");
+	}
+	assert.equal(cursorMarkerPresent(lines), true, "focus should wrap back after access, model, thinking and history controls");
 
 	overlay.handleInput("\r");
 	assert.deepEqual(state.sentMessages, [], "empty input should not submit a message after returning to the input field");
@@ -2374,6 +2420,7 @@ type JarvisExtensionHarness = {
 	pinnedModel: TestModel;
 	nextMainModel: TestModel;
 	getRuntime(): FakeJarvisRuntime | undefined;
+	openOverlay(args?: string): Promise<void>;
 };
 
 function createTestExtensionCommandContext(
@@ -2525,6 +2572,7 @@ async function withJarvisExtensionHarness(run: (harness: JarvisExtensionHarness)
 	const ctx = createTestExtensionCommandContext(cwd, modelRegistry, modelRuntime, mainModel);
 	api.attachBranch(ctx.branchEntries);
 	let runtime: FakeJarvisRuntime | undefined;
+	const overlayCommands: Promise<void>[] = [];
 
 	const originalCreate = JarvisSideSessionRuntime.create;
 	const replacement: typeof JarvisSideSessionRuntime.create = async (options) => {
@@ -2543,20 +2591,31 @@ async function withJarvisExtensionHarness(run: (harness: JarvisExtensionHarness)
 			pinnedModel,
 			nextMainModel,
 			getRuntime: () => runtime,
+			openOverlay: async (args = "") => {
+				const command = api.runCommand("jarvis", args, ctx);
+				overlayCommands.push(command);
+				// Await launch/boot work, not the lifetime of an open custom modal.
+				await Promise.race([command, waitForAsyncWork()]);
+			},
 		});
 	} finally {
-		(JarvisSideSessionRuntime as { create: typeof JarvisSideSessionRuntime.create }).create = originalCreate;
-		if (originalAgentDir === undefined) {
-			delete process.env.PI_CODING_AGENT_DIR;
-		} else {
-			process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		try {
+			await api.emit("session_shutdown", {}, ctx);
+			await Promise.all(overlayCommands);
+		} finally {
+			(JarvisSideSessionRuntime as { create: typeof JarvisSideSessionRuntime.create }).create = originalCreate;
+			if (originalAgentDir === undefined) {
+				delete process.env.PI_CODING_AGENT_DIR;
+			} else {
+				process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+			}
+			rmSync(tempRoot, { recursive: true, force: true });
 		}
-		rmSync(tempRoot, { recursive: true, force: true });
 	}
 }
 
 async function openJarvisRuntime(harness: JarvisExtensionHarness): Promise<FakeJarvisRuntime> {
-	await harness.api.runCommand("jarvis", "", harness.ctx);
+	await harness.openOverlay();
 	await waitForAsyncWork();
 	const runtime = harness.getRuntime();
 	assert.ok(runtime, "/jarvis should boot a side-session runtime");
@@ -2608,12 +2667,18 @@ async function testJarvisModelOpensModelMenuWhenNoArgs(): Promise<void> {
 			const tui = new TuiMainScreen(new FakeTerminal());
 			const picker = (factory as (tui: TuiMainScreen, pickerTheme: typeof theme, kb: KeybindingsManager,
 				done: (model: TestModel | undefined) => void) => Component)(tui, theme, new KeybindingsManager(TUI_KEYBINDINGS), done);
-			assert.ok(picker.handleInput, "actual public picker must accept input");
-			for (const character of "side-beta") picker.handleInput(character);
-			const lines = picker.render(80);
-			assert.ok(lines.some((line) => line.includes("test-provider/side-beta")), "real picker filters the host registry models");
-			assert.ok(!lines.some((line) => line.includes("test-provider/main-alpha")), "filtered picker excludes unrelated models");
-			picker.handleInput("\r");
+			tui.setFocus(picker);
+			try {
+				assert.ok(picker.handleInput, "actual public picker must accept input");
+				for (const character of "side-beta") picker.handleInput(character);
+				const lines = picker.render(80);
+				assert.ok(lines.some((line) => line.includes("test-provider/side-beta")), "real picker filters the host registry models");
+				assert.ok(!lines.some((line) => line.includes("test-provider/main-alpha")), "filtered picker excludes unrelated models");
+				picker.handleInput("\r");
+			} finally {
+				tui.setFocus(null);
+				tui.stop();
+			}
 		});
 		try { await harness.api.runCommand("jarvis-model", "", harness.ctx); }
 		finally { harness.ctx.ui.custom = originalCustom; }
@@ -2856,13 +2921,14 @@ async function testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline(): Promi
 	await withJarvisExtensionHarness(async (harness) => {
 		const overlayCapture = createOverlayCaptureHarness(harness);
 		try {
-			await openJarvisRuntime(harness);
-			await harness.api.runCommand("jarvis", "establish baseline", harness.ctx);
-			await waitForAsyncWork();
+			const runtime = await openJarvisRuntime(harness);
+			await overlayCapture.sendMessage("establish baseline");
+			assert.deepEqual(runtime.sendMessageCalls, ["establish baseline"], "the baseline must be an actual side-model turn");
 			appendMainMessage(harness.ctx, "user", "NEW_MAIN_REQUEST_AFTER_BASELINE");
 
-			await harness.api.runCommand("jarvis", "/tree", harness.ctx);
-			await waitForAsyncWork();
+			await overlayCapture.sendMessage("/tree");
+			assert.deepEqual(runtime.systemMessages, [runtime.treeDescription], "the local tree command must actually run");
+			assert.deepEqual(runtime.sendMessageCalls, ["establish baseline"], "/tree must not become a model turn");
 
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
@@ -2873,7 +2939,7 @@ async function testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline(): Promi
 				"local /jarvis commands like /tree should not mark fresh main context as consumed by a /jarvis model turn",
 			);
 		} finally {
-			overlayCapture.restore();
+			await overlayCapture.restore();
 		}
 	});
 }
@@ -2882,13 +2948,11 @@ async function testJarvisOverlayReportsAssistantOnlyMainDelta(): Promise<void> {
 	await withJarvisExtensionHarness(async (harness) => {
 		const overlayCapture = createOverlayCaptureHarness(harness);
 		try {
-			await openJarvisRuntime(harness);
-			await harness.api.runCommand("jarvis", "establish baseline", harness.ctx);
-			await waitForAsyncWork();
+			const runtime = await openJarvisRuntime(harness);
+			await overlayCapture.sendMessage("establish baseline");
+			assert.deepEqual(runtime.sendMessageCalls, ["establish baseline"], "the baseline must be an actual side-model turn");
 			appendMainMessage(harness.ctx, "assistant", "Assistant-only main update");
-
-			await harness.api.runCommand("jarvis", "", harness.ctx);
-			await waitForAsyncWork();
+			await harness.api.emit("message_end", { message: { role: "assistant", content: "Assistant-only main update" } }, harness.ctx);
 
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
@@ -2899,7 +2963,7 @@ async function testJarvisOverlayReportsAssistantOnlyMainDelta(): Promise<void> {
 				"overlay delta should report assistant-only main-session updates",
 			);
 		} finally {
-			overlayCapture.restore();
+			await overlayCapture.restore();
 		}
 	});
 }
@@ -2923,19 +2987,19 @@ async function testJarvisOverlayToolToggleSyncsRuntime(): Promise<void> {
 			lines = capturedOverlay.render(80) as string[];
 			assert.ok(lines.some((line) => line.includes("Access: local tools only")), "overlay header should surface repo tool availability when tools are enabled");
 		} finally {
-			overlayCapture.restore();
+			await overlayCapture.restore();
 		}
 	});
 }
 
-async function testJarvisAccessControlsResetOnOverlayCloseAndNewSession(): Promise<void> {
+async function testJarvisAccessControlsPreservedOnOverlayCloseAndResetOnNewSession(): Promise<void> {
 	await withJarvisExtensionHarness(async (harness) => {
 		const overlayCapture = createOverlayCaptureHarness(harness);
+		let finishAssignedTask: (() => void) | undefined;
 		try {
 			const firstRuntime = await openJarvisRuntime(harness);
 			let capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture overlay component");
-			capturedOverlay.focused = true;
 			capturedOverlay.handleInput("\t");
 			capturedOverlay.handleInput(" " );
 			capturedOverlay.handleInput("\t");
@@ -2946,30 +3010,60 @@ async function testJarvisAccessControlsResetOnOverlayCloseAndNewSession(): Promi
 			assert.ok(lines.some((line) => line.includes("Repo tools: on")));
 			assert.ok(lines.some((line) => line.includes("Note main: on")));
 			assert.ok(lines.some((line) => line.includes("Redirect: on")));
+			let taskCompleted = false;
+			const assignedTask = new Promise<void>((resolve) => { finishAssignedTask = resolve; });
+			const originalSend = firstRuntime.sendMessage;
+			firstRuntime.sendMessage = async (message) => {
+				await originalSend.call(firstRuntime, message);
+				await assignedTask;
+				taskCompleted = true;
+			};
+			await overlayCapture.sendMessage("assigned task before close");
+			assert.deepEqual(firstRuntime.sendMessageCalls, ["assigned task before close"]);
+			assert.equal(taskCompleted, false, "the assigned task must still be active before closing");
+			const beforeCloseToolCalls = [...firstRuntime.toolAccessCalls];
+			const beforeCloseSyncCalls = [...firstRuntime.syncModelCalls];
 
+			const closedOverlay = capturedOverlay;
 			capturedOverlay.handleInput("\x1b");
-			assert.equal(firstRuntime.toolAccessEnabled, false, "closing the overlay should disable repo tools in the live runtime");
-
-			await harness.api.runCommand("jarvis", "", harness.ctx);
 			await waitForAsyncWork();
+			assert.equal(firstRuntime.toolAccessEnabled, true, "ordinary close should preserve repo tools for the current side owner");
+			assert.equal(firstRuntime.disposed, false, "ordinary close must not retire the side task owner");
+			assert.equal(taskCompleted, false, "ordinary close must not settle the active task");
+			assert.deepEqual(firstRuntime.toolAccessCalls, beforeCloseToolCalls, "ordinary close must not revoke or resync tool access");
+			assert.deepEqual(firstRuntime.syncModelCalls, beforeCloseSyncCalls, "ordinary close must not sync the model");
+
+			assert.equal(await openJarvisRuntime(harness), firstRuntime, "reopen must reuse the side runtime, without another boot");
 			capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "reopening creates a fresh overlay instance");
+			assert.notEqual(capturedOverlay, closedOverlay);
+			capturedOverlay.handleInput("\x1b[1;5F");
 			lines = capturedOverlay.render(80) as string[];
-			assert.ok(lines.some((line) => line.includes("Repo tools: off")), "repo tools should be off when /jarvis is reopened");
-			assert.ok(lines.some((line) => line.includes("Note main: off")), "Note main should be off when /jarvis is reopened");
-			assert.ok(lines.some((line) => line.includes("Redirect: off")), "Redirect should be off when /jarvis is reopened");
-
-			capturedOverlay.focused = true;
-			capturedOverlay.handleInput("\t");
-			capturedOverlay.handleInput(" " );
-			await harness.api.runCommand("jarvis", "/new", harness.ctx);
+			assert.ok(lines.some((line) => line.includes("Repo tools: on")), "repo tools should remain on when /jarvis is reopened");
+			assert.ok(lines.some((line) => line.includes("Note main: on")), "Note main should remain on when /jarvis is reopened");
+			assert.ok(lines.some((line) => line.includes("Redirect: on")), "Redirect should remain on when /jarvis is reopened");
+			assert.deepEqual(firstRuntime.toolAccessCalls, beforeCloseToolCalls, "reopen must not change tool access");
+			assert.deepEqual(firstRuntime.syncModelCalls, beforeCloseSyncCalls, "reopen must not sync the model");
+			assert.deepEqual(firstRuntime.sendMessageCalls, ["assigned task before close"], "reopen must not replay the assigned task");
+			assert.equal(taskCompleted, false, "reopen must not settle the active task");
+			finishAssignedTask!();
 			await waitForAsyncWork();
+			assert.equal(taskCompleted, true, "the original assigned task must finish after close/reopen");
+
+			await overlayCapture.sendMessage("/new");
 			const nextRuntime = harness.getRuntime();
 			assert.ok(nextRuntime);
 			assert.notEqual(nextRuntime, firstRuntime);
-			assert.equal(nextRuntime!.toolAccessEnabled, false, "/new should start with repo tools disabled");
+			assert.equal(firstRuntime.disposed, true, "/new must retire the old side owner");
+			assert.equal(nextRuntime.toolAccessEnabled, false, "/new should start with repo tools disabled");
+			lines = capturedOverlay.render(80) as string[];
+			assert.ok(lines.some((line) => line.includes("Repo tools: off")), "side /new should revoke repo tools");
+			assert.ok(lines.some((line) => line.includes("Note main: off")), "side /new should revoke Note main");
+			assert.ok(lines.some((line) => line.includes("Redirect: off")), "side /new should revoke Redirect");
+			assert.deepEqual(nextRuntime.systemMessages, ["Started a new /jarvis side session."]);
 		} finally {
-			overlayCapture.restore();
+			finishAssignedTask?.();
+			await overlayCapture.restore();
 		}
 	});
 }
@@ -2997,7 +3091,7 @@ async function testJarvisOverlaySkipsReconnectTextForMissingSessionRef(): Promis
 		};
 
 		try {
-			await harness.api.runCommand("jarvis", "", harness.ctx);
+			await harness.openOverlay();
 			const capturedOverlay = overlayCapture.getCapturedOverlay();
 			assert.ok(capturedOverlay, "should capture the overlay while the runtime is still booting");
 			capturedOverlay.handleInput("\x1b[1;5F"); // Dismiss first-open decoration to inspect startup transcript.
@@ -3005,7 +3099,7 @@ async function testJarvisOverlaySkipsReconnectTextForMissingSessionRef(): Promis
 			assert.ok(lines.some((line) => line.includes("Starting /jarvis side conversation…")), "missing side-session files should fall back to a fresh startup label");
 			assert.ok(!lines.some((line) => line.includes("Connecting to your prior /jarvis conversation…")), "missing side-session files should not claim the old conversation will be restored");
 		} finally {
-			overlayCapture.restore();
+			await overlayCapture.restore();
 			(JarvisSideSessionRuntime as { create: typeof JarvisSideSessionRuntime.create }).create = previousCreate;
 			if (pendingRuntime && resolveCreate) {
 				resolveCreate(pendingRuntime as unknown as JarvisSideSessionRuntime);
@@ -3106,7 +3200,7 @@ async function testJarvisModelIncompatibleGuardBlocksTogglesAndShowsWarning(): P
 				"/jarvis should refresh the live runtime tool set after compatibility changes revoke bridge permissions",
 			);
 		} finally {
-			overlayCapture.restore();
+			await overlayCapture.restore();
 		}
 	});
 }
@@ -4086,7 +4180,7 @@ const REGISTERED_TESTS: readonly RegisteredTestCase[] = [
 	["testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline", testJarvisLocalSideCommandsDoNotAdvanceMainDeltaBaseline],
 	["testJarvisOverlayReportsAssistantOnlyMainDelta", testJarvisOverlayReportsAssistantOnlyMainDelta],
 	["testJarvisOverlayToolToggleSyncsRuntime", testJarvisOverlayToolToggleSyncsRuntime],
-	["testJarvisAccessControlsResetOnOverlayCloseAndNewSession", testJarvisAccessControlsResetOnOverlayCloseAndNewSession],
+	["testJarvisAccessControlsPreservedOnOverlayCloseAndResetOnNewSession", testJarvisAccessControlsPreservedOnOverlayCloseAndResetOnNewSession],
 	["testJarvisOverlaySkipsReconnectTextForMissingSessionRef", testJarvisOverlaySkipsReconnectTextForMissingSessionRef],
 	["testJarvisBootInvalidatedBySessionRestartDoesNotReuseStaleRuntime", testJarvisBootInvalidatedBySessionRestartDoesNotReuseStaleRuntime],
 	["testJarvisModelIncompatibleGuardBlocksTogglesAndShowsWarning", testJarvisModelIncompatibleGuardBlocksTogglesAndShowsWarning],

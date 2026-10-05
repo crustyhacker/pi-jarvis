@@ -22,12 +22,14 @@
 - `Note main` and `Redirect` stay disabled when the active `/jarvis` model is incompatible with bridge tools.
 - Published packages keep Pi runtime packages as optional peers, not bundled dependencies. Never load the legacy MCP adapter. Version 1.6.0 adds native MCP to Repo tools opt-in alongside read/bash/edit/write.
 - Physical models delegate to the host's public registry for auth and dispatch. Virtual/router models explicitly reject; do not access the registry's private backing runtime.
-- Side resources/settings honor `ctx.isProjectTrusted()`. Local tool execution and bridge delivery recheck live permissions; closing the overlay revokes them and cancels pending confirmations.
+- Side resources/settings honor `ctx.isProjectTrusted()`. Local tool execution and bridge delivery recheck live permissions. Ordinary overlay close hides presentation without stopping assigned work or clearing its three grants; cancel pending confirmations and refuse new invisible reviews. Grants are in-memory, scoped to the current main/side owner, not saved across restart/reload. Explicit access-off, observed trust denial, side `/new`, reference/main replacement and teardown revoke them. Archive private-input preparation explicitly revokes transient grants before closing/yielding.
 - Use `agent_settled`, not `agent_end`, for final idle state. Main context must honor Pi context-edit/compaction projection.
 - Runtime disposal must not detach the overlay's bridge subscription. Queue ownership must survive side `/new` but not main-session replacement; failed/uncertain sends are not auto-retried.
 
-## Overlay UX (1.5.0)
-- Compact header by default; Ctrl+O expands diagnostics, PageUp/PageDown scroll transcript, Ctrl+End follows live, Ctrl+L dismisses notices.
+## Overlay UX
+- Closing presentation is distinct from stopping work. Keep background activity and enabled grants visible in main Pi; local `/jarvis status`, `/jarvis stop` and `/jarvis access off` require no hidden side boot/model work. Stop cancels active work and clears waiting input, without replay/rollback promises. Main/side replacement and reload/quit still end background work; this is not a detached daemon.
+- Compact header by default; Ctrl+O expands diagnostics, PageUp/PageDown scroll transcript, Ctrl+End follows live, Ctrl+L dismisses notices. Keep history navigation discoverable; regular-mode mouse scrolling belongs to the terminal, while supported fullscreen wheel events use the public component API.
+- Model/thinking pickers stay inside the overlay, use the public physical-model registry and existing scoped config rules, and preserve draft state. Reject changes during active work before persistence; do not silently stop a turn or change the main model/thinking. Async picker results and configuration completions must be owner-bound and private-input-safe.
 - Use Pi's public multiline Editor. Enter sends; Shift+Enter/Ctrl+J inserts newline. Preserve indentation and reject unsafe/oversized drafts (64 KiB) explicitly.
 - Bridge-owned in-memory drafts survive close/reopen. Bridge reset clears draft/recall on side `/new` or main/side-reference replacement; side-tree navigation only resets scroll.
 - Consume bracketed paste before global shortcuts and confirmation keys; pasted content must not toggle permissions or approve a redirect.

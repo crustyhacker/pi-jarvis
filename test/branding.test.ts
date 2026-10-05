@@ -188,3 +188,17 @@ test("resize never exceeds terminal bounds and a tiny terminal cancels decoratio
 		assert.doesNotMatch(plain(f.overlay.render(80)), /A SECOND LANE/);
 	} finally { f.dispose(); }
 });
+
+test("first PageUp or Alt+Up dismisses intro and scrolls instead of swallowing navigation", () => {
+	for (const key of ["\x1b[5~", "\x1b[1;3A"]) {
+		const f = fixture();
+		try {
+			assert.match(plain(f.overlay.render(80)), /A SECOND LANE/);
+			f.overlay.handleInput(key);
+			const output = plain(f.overlay.render(80));
+			assert.doesNotMatch(output, /A SECOND LANE/);
+			assert.match(output, /History ·/);
+			assert.equal(f.bridge.getDraft(), "");
+		} finally { f.dispose(); }
+	}
+});

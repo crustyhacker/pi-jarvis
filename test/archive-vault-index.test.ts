@@ -354,6 +354,25 @@ test("actual index exposes encryption controls but archive OFF never boots, read
 	});
 });
 
+
+test("ordinary index close preserves all three grants and reusable side owner, unlike private password preparation", bounded, async t => {
+	await isolated(t, async f => {
+		const h = f.mount(); await h.start();
+		const { opened, component, runtime } = await open(f, h), view = viewOf(component);
+		view.toggleToolAccess(); view.toggleFollowUpToMain(); view.toggleSteerToMain();
+		component.handleInput("\x1b"); await opened; await until(() => f.activeDialog === undefined);
+		assert.equal(runtime.disposed, false); assert.equal(runtime.access.at(-1), true);
+		assert.equal(view.isToolAccessEnabled(), true); assert.equal(view.isFollowUpToMainEnabled(), true); assert.equal(view.isSteerToMainEnabled(), true);
+		assert.equal(await runtime.options.confirmSteerToMain("background must not ask invisibly"), false);
+		const reopening = h.command("jarvis"); await until(() => f.activeDialog?.component instanceof JarvisOverlayComponent);
+		const reopenedView = viewOf(f.activeDialog!.component as JarvisOverlayComponent);
+		assert.equal(f.runtimes.length, 1, "reopen does not create another side runtime");
+		assert.equal(reopenedView.isToolAccessEnabled(), true); assert.equal(reopenedView.isFollowUpToMainEnabled(), true); assert.equal(reopenedView.isSteerToMainEnabled(), true);
+		await h.shutdown(); await reopening;
+		assert.equal(reopenedView.isToolAccessEnabled(), false); assert.equal(reopenedView.isFollowUpToMainEnabled(), false); assert.equal(reopenedView.isSteerToMainEnabled(), false);
+	});
+});
+
 test("index local encryption closes/disposes Jarvis and revokes transient Repo tools before both real masked editor prompts", bounded, async t => {
 	if (!nativeAvailable(t)) return;
 	await isolated(t, async f => {
@@ -361,11 +380,15 @@ test("index local encryption closes/disposes Jarvis and revokes transient Repo t
 		const { opened, component, runtime } = await open(f, h), overlay = f.activeDialog!;
 		const view = viewOf(component);
 		component.handleInput("\t"); component.handleInput(" "); // Public overlay control keys: Repo tools ON.
+		view.toggleFollowUpToMain(); view.toggleSteerToMain();
 		assert.equal(view.isToolAccessEnabled(), true); assert.equal(runtime.access.at(-1), true);
 		const bootCount = f.runtimes.length;
 		f.onSecret = () => {
 			assert.equal(overlay.closed, true); assert.equal(overlay.disposed, true);
 			assert.equal(view.isToolAccessEnabled(), false); assert.equal(runtime.access.at(-1), false);
+			assert.equal(view.isFollowUpToMainEnabled(), false); assert.equal(view.isSteerToMainEnabled(), false);
+			const enabled = f.order.indexOf("repo:true"), revoked = f.order.indexOf("repo:false", enabled + 1);
+			assert.ok(revoked < f.order.indexOf("overlay:done"), "private preparation explicitly revokes access BEFORE ordinary close/yield");
 			assert.ok(f.order.indexOf("overlay:done") < f.order.indexOf("overlay:dispose"));
 			assert.ok(f.order.indexOf("overlay:dispose") < f.order.indexOf("secret:custom"));
 		};
@@ -381,7 +404,7 @@ test("index local encryption closes/disposes Jarvis and revokes transient Repo t
 		assert.equal(view.getQueuedMessageCount(), 0); assert.equal(view.getIsProcessing(), false);
 		assert.match(runtime.transcript.at(-1)!.text, /encryption enabled; unlocked/);
 		assert.equal(f.service.policy(h.ctx).enabled, true);
-		assert.equal(runtime.disposed, false, "closing UI revokes tools, but keeps the reusable side session");
+		assert.equal(runtime.disposed, false, "private preparation revokes tools, but keeps the reusable side session");
 		await h.shutdown(); assert.equal(runtime.disposed, true);
 	});
 });

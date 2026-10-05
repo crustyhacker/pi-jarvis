@@ -249,3 +249,27 @@ test("all history is reachable and ordinary rendering reads only visible source 
 	viewport.toLatest();
 	assert.equal(viewport.getStatus().startLine, count - 4);
 });
+
+test("logical line/wheel navigation pauses and resumes without invalid-delta movement", () => {
+	const viewport = new TranscriptViewport(); const lines = rows(20);
+	viewport.render(lines, 5, 30); viewport.scrollLines(-2);
+	assert.deepEqual(viewport.render(lines, 5, 30), lines.slice(13, 18));
+	for (const delta of [NaN, Infinity, -Infinity, 0]) viewport.scrollLines(delta);
+	assert.equal(viewport.getStatus().startLine, 13);
+	viewport.scrollLines(1); assert.equal(viewport.getStatus().following, false);
+	viewport.scrollLines(1); assert.equal(viewport.getStatus().following, true);
+	viewport.scrollLines(-100); assert.equal(viewport.getStatus().startLine, 0);
+});
+
+test("bounded source anchors retain the read character through simultaneous large append and reflow", () => {
+	const viewport = new TranscriptViewport();
+	const lines = rows(100);
+	const anchors = lines.map((_, i) => ({ key: `entry-${i}`, offset: 0 }));
+	viewport.render(lines, 4, 40, anchors); viewport.pageUp();
+	viewport.render(lines, 4, 40, anchors);
+	const expanded = Array.from({ length: 500 }, (_, i) => `text ${i}`);
+	const reflowed = [...lines.slice(0, 92).flatMap(line => [line, "continuation"]), ...lines.slice(92), ...expanded];
+	const newAnchors = [...anchors.slice(0, 92).flatMap(anchor => [anchor, { ...anchor, offset: 10 }]), ...anchors.slice(92), ...expanded.map((_, i) => ({ key: `new-${i}`, offset: 0 }))];
+	assert.equal(viewport.render(reflowed, 4, 20, newAnchors)[0], "Jarvis: row 92");
+	assert.equal(viewport.getStatus().following, false);
+});
