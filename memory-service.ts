@@ -5,7 +5,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { clearMemoryPolicy, hasMemoryDisclosure, markMemoryDisclosure, resolveMemoryPolicy, saveMemoryPolicy } from "./memory-config.js";
 import { extractMemoryText, sanitizeMemoryText } from "./memory-content.js";
 import { MemoryStore } from "./memory-store.js";
-import type { MemoryCategory, MemoryLane, MemoryPolicy, MemoryQuery, MemoryRecord, MemoryScope, MemorySource } from "./memory-types.js";
+import type { MemoryEditorPage, MemoryEditorQuery, MemoryEditorScope, MemoryEditorService, MemoryNoteDraft } from "./memory-editor-types.js";
+import { MemoryEditorDataError, type MemoryCategory, type MemoryLane, type MemoryPolicy, type MemoryQuery, type MemoryRecord, type MemoryScope, type MemorySource } from "./memory-types.js";
 
 export type MemoryContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted" | "sessionManager" | "ui" | "hasUI" | "mode">;
 export const MEMORY_TOOL_NAMES = ["jarvis_memory_search", "jarvis_memory_remember", "jarvis_memory_forget"] as const;
@@ -28,6 +29,7 @@ const HELP = `Shared main Pi / Jarvis memory commands:
 /jarvis-memory status
 /jarvis-memory [--global|--project] on|off|clear
 /jarvis-memory [--global|--project] capture|recall on|off
+/jarvis-memory editor (TUI; curated notes only)
 /jarvis-memory list [--all|--global]
 /jarvis-memory search [--all|--global] <words>
 /jarvis-memory show [--all] <id>
@@ -38,10 +40,11 @@ const HELP = `Shared main Pi / Jarvis memory commands:
 Controls default to global; global off is a master switch. Notes and bulk-forget default to this project. clear removes settings, NOT memories. Full disable retains data but blocks even inspection until re-enabled. No historical import or background model calls.`;
 
 /** One service per loaded extension; the main and side SDK runtimes share it. */
-export class SharedMemoryService {
+export class SharedMemoryService implements MemoryEditorService {
 	readonly store: MemoryStore;
 	private generation = 0;
 	private readonly changes = new Set<() => void>();
+	private readonly noteChanges = new Set<() => void>();
 	private readonly policyKeys = new Map<string, string>();
 	private readonly warned = new Set<string>();
 	private disclosed = false;
@@ -51,6 +54,12 @@ export class SharedMemoryService {
 	constructor(readonly agentDir: string) { this.store = new MemoryStore(agentDir); }
 	get epoch(): number { return this.generation; }
 	onChange(listener: () => void): () => void { this.changes.add(listener); return () => this.changes.delete(listener); }
+	onNotesChange(listener: () => void): () => void { this.noteChanges.add(listener); return () => this.noteChanges.delete(listener); }
+	private notesChanged(): void {
+		// COMMIT has already been acknowledged. A broken UI subscriber must not
+		// misreport a successful mutation or cause an uncertain write to be replayed.
+		for (const listener of [...this.noteChanges]) { try { listener(); } catch { /* Observation is best effort. */ } }
+	}
 	invalidate(): void {
 		this.generation++;
 		this.notifyAgain = true;
@@ -73,8 +82,10 @@ export class SharedMemoryService {
 	close(): void { try { this.store.close(); } finally { this.generation++; } }
 
 	policy(ctx: MemoryContext): MemoryPolicy {
-		const resolution = resolveMemoryPolicy(ctx.cwd, this.agentDir, ctx.isProjectTrusted());
-		const policy = ctx.isProjectTrusted() ? resolution.policy : OFF;
+		let trusted = false;
+		try { trusted = ctx.isProjectTrusted() === true; } catch { /* Throwing trust is denial, never a stale grant. */ }
+		const resolution = resolveMemoryPolicy(ctx.cwd, this.agentDir, trusted);
+		const policy = trusted ? resolution.policy : OFF;
 		const key = JSON.stringify(policy);
 		// Trust can differ between main and an expiring side runtime. Track each
 		// session separately so refreshing both cannot oscillate one cwd's cache.
@@ -169,6 +180,7 @@ export class SharedMemoryService {
 		if ([...title].length > 160) throw new Error("Memory titles must be at most 160 characters.");
 		const result = this.store.save({ kind: "note", category: input.category ?? "project", scope: input.scope ?? "project",
 			project: this.project(ctx), title, text, source: this.source(ctx, lane, eventId) }, { explicit });
+		if (result.outcome === "saved" || result.outcome === "updated") this.notesChanged();
 		return result.outcome === "forgotten" ? "Not saved: this memory was previously forgotten. Only an explicit /jarvis-memory remember command can restore it." :
 			`${result.outcome}: ${result.record?.id ?? "memory"} (${input.scope ?? "project"})`;
 	}
@@ -179,7 +191,61 @@ export class SharedMemoryService {
 	}
 	forget(id: string, ctx: MemoryContext, all = false, expected?: MemoryRecord): string {
 		this.require(ctx);
-		return this.store.forget(id, this.project(ctx), all, expected) ? "Forgotten record. Other mentions, existing Pi transcripts, already-sent model context and backups are not erased." : "No matching accessible memory.";
+		const project = this.project(ctx);
+		const wasNote = expected?.kind === "note" || this.store.editorGet(id, project, all ? "all" : "current") !== undefined;
+		const forgotten = this.store.forget(id, project, all, expected);
+		if (forgotten && wasNote) this.notesChanged();
+		return forgotten ? "Forgotten record. Other mentions, existing Pi transcripts, already-sent model context and backups are not erased." : "No matching accessible memory.";
+	}
+
+	/** Human administration needs enabled/trusted/disclosed memory, not capture/recall. */
+	editorAccess(ctx: MemoryContext): MemoryPolicy { return this.prepare(ctx); }
+
+	private editorData<T>(ctx: MemoryContext, check: (() => void) | undefined, action: (guard: () => void) => T): T {
+		const guard = () => {
+			// Cancellation/owner expiry is NOT a synthetic trust denial: keep other
+			// mounted lanes, policy epochs and pending capture anchors independent.
+			try { check?.(); } catch { throw new MemoryEditorDataError("access", "Curated-memory editor ownership expired or the operation was cancelled. No automatic retry."); }
+			if (!this.editorAccess(ctx).enabled) throw new MemoryEditorDataError("access", "Shared memory access is paused or the project is untrusted. Use /jarvis-memory status.");
+			try { check?.(); } catch { throw new MemoryEditorDataError("access", "Curated-memory editor ownership expired or the operation was cancelled. No automatic retry."); }
+		};
+		try { guard(); return action(guard); } catch (error) {
+			if (error instanceof MemoryEditorDataError) throw error;
+			// Never echo SQLite, parser, filesystem or raw-input diagnostics.
+			throw new MemoryEditorDataError("storage", "Curated-memory operation failed safely and was not retried. Refresh and review before trying again; an uncertain write may already have committed.");
+		}
+	}
+
+	editorList(query: MemoryEditorQuery, ctx: MemoryContext, check?: () => void): MemoryEditorPage {
+		return this.editorData(ctx, check, guard => {
+			if (query?.query !== undefined && query.query.trim()) {
+				const clean = sanitizeMemoryText(query.query, 2048);
+				if (clean.omitted || clean.redacted || clean.text !== query.query.replace(/\r\n?/g, "\n")) throw new MemoryEditorDataError("invalid", "Use a non-sensitive, safe literal search query (maximum 512 characters / 2048 bytes).");
+			}
+			return this.store.editorList(query, this.project(ctx), guard);
+		});
+	}
+	editorGet(id: string, ctx: MemoryContext, scope: MemoryEditorScope, check?: () => void): MemoryRecord | undefined {
+		return this.editorData(ctx, check, guard => this.store.editorGet(id, this.project(ctx), scope, guard));
+	}
+	editorCreate(draft: MemoryNoteDraft, ctx: MemoryContext, check?: () => void): MemoryRecord {
+		const record = this.editorData(ctx, check, guard => {
+			if (!draft || typeof draft !== "object") throw new MemoryEditorDataError("invalid", "Use a valid curated-note draft.");
+			return this.store.editorCreate({ kind: "note", title: draft.title, text: draft.text, category: draft.category,
+				scope: draft.scope, project: this.project(ctx), source: this.source(ctx, "manual", randomUUID()) }, guard);
+		});
+		this.notesChanged();
+		return record;
+	}
+	editorUpdate(expected: MemoryRecord, draft: MemoryNoteDraft, ctx: MemoryContext, scope: MemoryEditorScope, check?: () => void): MemoryRecord {
+		const record = this.editorData(ctx, check, guard => this.store.editorUpdate(expected, draft, this.project(ctx), scope, guard));
+		this.notesChanged();
+		return record;
+	}
+	editorForget(expected: MemoryRecord[], ctx: MemoryContext, scope: MemoryEditorScope, check?: () => void): number {
+		const count = this.editorData(ctx, check, guard => this.store.editorForget(expected, this.project(ctx), scope, guard));
+		this.notesChanged();
+		return count;
 	}
 
 	/** User-issued commands only. Models receive narrower dedicated tools. */
@@ -253,6 +319,7 @@ export class SharedMemoryService {
 			const id = tokens.shift();
 			if (!id || !tokens.length || all) throw new Error(HELP);
 			const record = this.store.update(id, project, this.cleanFact(remainingText()));
+			if (record?.kind === "note") this.notesChanged();
 			return record ? `Updated ${record.id}.` : "No matching accessible memory.";
 		}
 		if (action === "forget") {
@@ -261,7 +328,10 @@ export class SharedMemoryService {
 		}
 		if (action === "forget-all") {
 			if (!confirm || tokens.length) throw new Error("Use forget-all --confirm [--global|--all]. Default deletes only this project's memories; --all deletes every scope. Existing transcripts/backups remain.");
-			const count = this.store.forgetAll(project, all ? "all" : noteScope);
+			const dataScope = all ? "all" : noteScope;
+			const hadNotes = this.store.editorList({ scope: dataScope }, project).total > 0;
+			const count = this.store.forgetAll(project, dataScope);
+			if (count && hadNotes) this.notesChanged();
 			return `Forgot ${count} memories. Existing Pi transcripts, model context and backups remain; deletion is not forensic erasure.`;
 		}
 		throw new Error(HELP);

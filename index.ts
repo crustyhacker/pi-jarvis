@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import type { Component, Focusable, OverlayHandle } from "@earendil-works/pi-tui";
 import type { Model } from "@earendil-works/pi-ai";
 import {
 	getAgentDir,
@@ -27,6 +28,7 @@ import {
 import { JarvisSideSessionRuntime, createSideSessionFile } from "./side-session.js";
 import { SharedMemoryService } from "./memory-service.js";
 import { createMemoryExtensionFactory } from "./memory-extension.js";
+import { invalidateMemoryEditor, openMemoryEditor } from "./memory-editor-controller.js";
 import { SharedArchiveService } from "./archive-service.js";
 import { createArchiveExtensionFactory } from "./archive-extension.js";
 import { abandonArchiveSecretPrompt, isArchiveSecretPromptActive, revokeArchiveSecretPrompt } from "./archive-secret-input.js";
@@ -90,10 +92,15 @@ type MainState = {
 	statusContext?: ExtensionContext;
 	trustProvider?: () => boolean;
 	overlayOwner?: object;
-	closeOverlay?: () => void;
+	closeOverlay?: (forced?: boolean, handoff?: object, privatePreparation?: boolean) => void;
+	waitOverlayClosed?: () => Promise<void>;
+	cancelOverlayHandoff?: (owner: object) => void;
 	overlayOpen?: boolean;
 	modelPickerOpen?: boolean;
 	memoryReviewOpen?: boolean;
+	memoryEditorOwner?: object;
+	closeMemoryEditor?: (forced?: boolean) => void;
+	memoryEditorDirty?: () => boolean;
 	queuedMessages: string[];
 	model?: Model<any>;
 	jarvisModelSelection: JarvisModelSelection;
@@ -129,17 +136,17 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	let embeddedThinkingRequest: object | undefined;
 	const mainSession = new MainSessionTracker();
 	const state: MainState = {
-		bridge: new JarvisOverlayBridge(() => Boolean(state.overlayOpen) && !isArchiveSecretPromptActive()),
+		bridge: new JarvisOverlayBridge(() => Boolean(state.overlayOpen) && !state.memoryEditorOwner && !isArchiveSecretPromptActive()),
 		memory: new SharedMemoryService(getAgentDir()),
 		archive: new SharedArchiveService(getAgentDir(), {
 			beforeSecretPrompt: async () => {
-				if (state.modelPickerOpen || state.memoryReviewOpen) {
-					throw new Error("Finish the current Jarvis picker or memory review before entering an archive password.");
+				if (state.modelPickerOpen || state.memoryReviewOpen || state.memoryEditorOwner) {
+					throw new Error("Finish the current Jarvis picker, memory review or editor before entering an archive password.");
 				}
 				// Password preparation explicitly revokes access BEFORE closing/yielding.
 				// Ordinary presentation close deliberately preserves these grants.
 				resetTransientAccessControls(state);
-				state.closeOverlay?.();
+				state.closeOverlay?.(false, undefined, true);
 				await Promise.resolve();
 			},
 		}),
@@ -184,7 +191,11 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			}
 			const memoryRequest = parseMemoryCommand(args);
 			if (memoryRequest !== undefined) {
-				dispatchMemoryCommand(state, memoryRequest, ctx, Boolean(state.overlayOpen));
+				await dispatchMemoryCommand(state, memoryRequest, ctx, Boolean(state.overlayOpen));
+				return;
+			}
+			if (state.memoryEditorOwner || state.modelPickerOpen || state.memoryReviewOpen) {
+				ctx.ui.notify("Finish the current Jarvis picker, memory review or editor before opening Jarvis.", "warning");
 				return;
 			}
 			if (state.overlayOpen) {
@@ -196,6 +207,9 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			updateContextState(pi, state, ctx);
+			// A presentation can be closed while its public factory is still pending.
+			// Retire that request without invoking its topmost-pop completion.
+			state.closeOverlay?.(true);
 			const overlayOwner = {};
 			state.overlayOwner = overlayOwner;
 			state.overlayOpen = true;
@@ -215,28 +229,93 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			}
 
 			const overlayView = createOverlayView(pi, state, ctx, configureModel, configureThinking);
+			const queue = state.queuedMessages, boot = state.bootGeneration;
+			const manager = ctx.sessionManager, sessionId = manager.getSessionId();
 			let terminalColumns: (() => number) | undefined;
+			let closed = false, abandoned = false, finished = false, factoryUsed = false;
+			let handoff: object | undefined;
+			let component: JarvisOverlayComponent | undefined, handle: OverlayHandle | undefined;
+			let finishOverlay: (() => void) | undefined;
+			let resolveOverlayClosed!: () => void;
+			const overlayClosed = new Promise<void>(resolve => { resolveOverlayClosed = resolve; });
+			const waitOverlayClosed = () => overlayClosed;
+			const current = () => state.overlayOwner === overlayOwner && state.queuedMessages === queue &&
+				state.bootGeneration === boot && ctx.sessionManager === manager && manager.getSessionId() === sessionId;
+			const admitted = () => current() && !abandoned && !isArchiveSecretPromptActive() &&
+				!state.modelPickerOpen && !state.memoryReviewOpen &&
+				(handoff ? state.memoryEditorOwner === handoff : !state.memoryEditorOwner);
+			const settle = () => {
+				resolveOverlayClosed();
+				if (state.waitOverlayClosed === waitOverlayClosed) state.waitOverlayClosed = undefined;
+				if (state.cancelOverlayHandoff === cancelHandoff) state.cancelOverlayHandoff = undefined;
+				if (state.closeOverlay === closeOverlay) state.closeOverlay = undefined;
+				if (state.overlayOwner === overlayOwner) {
+					state.overlayOwner = undefined;
+					state.overlayOpen = false;
+					state.bridge.resolveConfirmation(false);
+					state.bridge.refresh();
+				}
+			};
+			const abandon = () => {
+				abandoned = closed = true;
+				finishOverlay = undefined;
+				try { component?.dispose(); } catch { /* Retired UI must not block settlement. */ }
+				component = undefined;
+				// Exact visibility only: public custom done() pops the TOPMOST
+				// overlay, not necessarily this interaction's overlay.
+				try { handle?.setHidden(true); } catch { /* Host may already have ended. */ }
+				handle = undefined;
+				settle();
+			};
+			const complete = (privatePreparation = false) => {
+				if (!closed || finished || abandoned) return;
+				// A private prompt reserves its gate BEFORE closing the current
+				// mounted Jarvis window. This synchronous close capability is not
+				// retained by deferred factories/onHandle callbacks.
+				const canComplete = () => admitted() || (privatePreparation && current() && !abandoned
+					&& !state.modelPickerOpen && !state.memoryReviewOpen && !state.memoryEditorOwner);
+				if (!canComplete()) { abandon(); return; }
+				if (!handle) {
+					// Private preparation cannot wait for an obsolete deferred
+					// presentation; retire it without ever retaining this capability.
+					if (privatePreparation) abandon();
+					return;
+				}
+				let foreground = false;
+				try { foreground = !handle.isHidden() && handle.isFocused(); } catch { /* Host ended. */ }
+				if (!foreground || !canComplete()) { abandon(); return; }
+				finished = true;
+				const done = finishOverlay; finishOverlay = undefined;
+				done?.();
+			};
+			const closeOverlay = (forced = false, modalOwner?: object, privatePreparation = false) => {
+				if (forced) { abandon(); return; }
+				if (closed) return;
+				handoff = modalOwner;
+				closed = true;
+				if (state.overlayOwner === overlayOwner) {
+					state.overlayOpen = false;
+					state.bridge.resolveConfirmation(false);
+					state.bridge.refresh();
+				}
+				complete(privatePreparation);
+			};
+			const cancelHandoff = (owner: object) => { if (handoff === owner) abandon(); };
+			state.closeOverlay = closeOverlay;
+			state.waitOverlayClosed = waitOverlayClosed;
+			state.cancelOverlayHandoff = cancelHandoff;
 			try {
-				await ctx.ui.custom<void>(
+				const custom = ctx.ui.custom<void>(
 					(tui, theme, keybindings, done) => {
+						const inert = (): Component & Focusable => ({ focused: false, render: () => [], handleInput() {}, invalidate() {} });
+						if (!admitted() || factoryUsed) { abandon(); return inert(); }
+						factoryUsed = true;
+						finishOverlay = () => done(undefined);
+						if (closed) return inert();
 						terminalColumns = () => tui.terminal.columns;
 						state.themeProvider = () => theme;
-						let closed = false;
-						const closeOverlay = () => {
-							if (closed) return;
-							closed = true;
-							if (state.overlayOwner === overlayOwner) {
-								state.overlayOpen = false;
-								state.closeOverlay = undefined;
-								state.bridge.resolveConfirmation(false);
-								state.bridge.refresh();
-							}
-							done(undefined);
-							queueMicrotask(() => tui.requestRender());
-						};
-						state.closeOverlay = closeOverlay;
 						const sessionId = ctx.sessionManager.getSessionId();
-						const component = attachOverlayBridge(
+						component = attachOverlayBridge(
 							new JarvisOverlayComponent(tui, theme, state.bridge, overlayView, closeOverlay, keybindings,
 								{ showIntro: !introSeenSessions.has(sessionId) }),
 							state.bridge,
@@ -260,16 +339,20 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 								anchor: "center",
 							};
 						},
+						onHandle: mounted => {
+							if (!admitted() || handle) {
+								try { mounted.setHidden(true); } finally { abandon(); }
+								return;
+							}
+							handle = mounted;
+							complete();
+						},
 					},
 				);
-			} finally {
-				if (state.overlayOwner === overlayOwner) {
-					state.overlayOpen = false;
-					state.closeOverlay = undefined;
-					state.bridge.resolveConfirmation(false);
-					state.bridge.refresh();
-				}
-			}
+				// Forced replacement can abandon the public promise indefinitely.
+				// Our request and handoff wait still settle; late mounts remain inert.
+				await Promise.race([custom, overlayClosed]);
+			} finally { abandon(); }
 		},
 	});
 
@@ -283,13 +366,13 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			if (embedded) state.bridge.notify(message, type); else ctx.ui.notify(message, type);
 		};
 		const assertOwner = () => {
-			if (state.queuedMessages !== owner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen || isArchiveSecretPromptActive()))) {
+			if (state.queuedMessages !== owner || isArchiveSecretPromptActive() || state.memoryEditorOwner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen))) {
 				throw new Error("/jarvis configuration owner changed; submit again in the current session.");
 			}
 		};
 		updateContextState(pi, state, ctx);
-		if (isArchiveSecretPromptActive()) {
-			notify("Finish the private archive password/exit verification before configuring Jarvis.", "warning");
+		if (isArchiveSecretPromptActive() || state.memoryEditorOwner) {
+			notify("Finish the private archive password/exit verification or memory editor before configuring Jarvis.", "warning");
 			return;
 		}
 
@@ -328,7 +411,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				notify("No /jarvis models are currently available from the main model registry.", "warning");
 				return undefined;
 			}
-			if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen) {
+			if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen || state.memoryEditorOwner || state.overlayOpen) {
 				notify("Finish the current private archive prompt or Jarvis dialog before opening the model picker.", "warning");
 				return undefined;
 			}
@@ -505,13 +588,13 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			if (embedded) state.bridge.notify(message, type); else ctx.ui.notify(message, type);
 		};
 		const assertOwner = () => {
-			if (state.queuedMessages !== owner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen || isArchiveSecretPromptActive()))) {
+			if (state.queuedMessages !== owner || isArchiveSecretPromptActive() || state.memoryEditorOwner || (embedded && (superseded() || state.overlayOwner !== interaction || !state.overlayOpen))) {
 				throw new Error("/jarvis configuration owner changed; submit again in the current session.");
 			}
 		};
 		updateContextState(pi, state, ctx);
-		if (isArchiveSecretPromptActive()) {
-			notify("Finish the private archive password/exit verification before configuring Jarvis.", "warning");
+		if (isArchiveSecretPromptActive() || state.memoryEditorOwner) {
+			notify("Finish the private archive password/exit verification or memory editor before configuring Jarvis.", "warning");
 			return;
 		}
 
@@ -638,8 +721,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("jarvis-memory", {
-		description: "Shared main Pi/Jarvis memory: status, on/off, capture/recall, search, remember, edit, forget (help for syntax)",
-		handler: async (args, ctx) => { dispatchMemoryCommand(state, args, ctx, false); },
+		description: "Shared main Pi/Jarvis memory: editor, status, on/off, capture/recall, search, remember, edit, forget (help for syntax)",
+		handler: async (args, ctx) => { await dispatchMemoryCommand(state, args, ctx, false); },
 	});
 
 	const beforeMainNavigation = (_event: unknown, ctx: ExtensionContext) => {
@@ -650,6 +733,13 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("Archive password entry cancelled. Complete its private exit verification, then retry session navigation.", "warning");
 			return { cancel: true as const };
 		}
+		if (state.memoryEditorOwner) {
+			if (state.memoryEditorDirty?.()) {
+				ctx.ui.notify("Save or explicitly discard the memory editor draft before session navigation.", "warning");
+				return { cancel: true as const };
+			}
+			invalidateMemoryEditor(state, false);
+		}
 		state.runtime?.flushArchive?.();
 		state.archive.cancelImports();
 	};
@@ -657,10 +747,11 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	pi.on("session_before_fork", beforeMainNavigation);
 	pi.on("session_before_tree", beforeMainNavigation);
 	pi.on("session_start", async (_event, ctx) => {
+		invalidateMemoryEditor(state);
 		clearMainStatus(state);
 		state.runtime?.flushArchive?.();
 		state.archive.cancelImports();
-		state.closeOverlay?.();
+		state.closeOverlay?.(true);
 		try { state.runtime?.dispose(); }
 		finally { state.bootGeneration += 1; }
 		state.runtime = undefined;
@@ -728,11 +819,12 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		invalidateMemoryEditor(state);
 		const sessionRef = readJarvisSessionRef(ctx.sessionManager.getBranch());
 		if (sessionRef?.file !== state.sessionRef?.file) {
 			state.archive.cancelImports();
 			state.runtime?.flushArchive?.();
-			state.closeOverlay?.();
+			state.closeOverlay?.(true);
 			try { state.runtime?.dispose(); }
 			finally { state.bootGeneration += 1; }
 			state.runtime = undefined;
@@ -814,9 +906,10 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		// revoke without a stale done() restoring an editor; no tail quarantine
 		// across host-forced replacement/process exit is claimed.
 		abandonArchiveSecretPrompt();
+		invalidateMemoryEditor(state);
 		state.runtime?.flushArchive?.();
 		state.mainArchiveSnapshot?.();
-		state.closeOverlay?.();
+		state.closeOverlay?.(true);
 		// Dispose performs a final side snapshot too. Its lifetime must end
 		// before the supplemental boot guard changes, or a retiring side lane
 		// would revoke the shared process lease as apparent trust loss.
@@ -849,7 +942,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	createMemoryExtensionFactory(state.memory, "main", {
 		confirmForget: async (review, signal, ctx) => {
 			// A background main turn must not replace the private password sink.
-			if (!ctx.hasUI || signal?.aborted || isArchiveSecretPromptActive() || state.memoryReviewOpen || state.modelPickerOpen) return false;
+			if (!ctx.hasUI || signal?.aborted || isArchiveSecretPromptActive() || state.memoryReviewOpen || state.modelPickerOpen || state.memoryEditorOwner || state.overlayOpen) return false;
 			state.memoryReviewOpen = true;
 			try { return await ctx.ui.confirm("Forget this shared memory?", review, { signal }); }
 			finally { state.memoryReviewOpen = false; }
@@ -1389,6 +1482,7 @@ async function executeJarvisSideCommand(
 			runtime.addSystemMessage(runtime.describeSessionTree());
 			return runtime;
 		}
+		invalidateMemoryEditor(state, false);
 		const generation = state.bootGeneration;
 		await runtime.navigateSessionTree(command.targetId, {
 			summarize: command.summarize,
@@ -1400,6 +1494,7 @@ async function executeJarvisSideCommand(
 		return runtime;
 	}
 
+	invalidateMemoryEditor(state, false);
 	state.archive.cancelImports();
 	state.runtime?.flushArchive?.();
 	let generation: number;
@@ -1459,7 +1554,15 @@ function parseMemoryCommand(message: string): string | undefined {
 	return match ? match[1] ?? "" : undefined;
 }
 
-function dispatchMemoryCommand(state: MainState, args: string, ctx: ExtensionContext, overlay: boolean): void {
+async function dispatchMemoryCommand(state: MainState, args: string, ctx: ExtensionContext, overlay: boolean): Promise<void> {
+	if (/^editor(?:\s|$)/.test(args.trim())) {
+		if (args.trim() !== "editor") {
+			ctx.ui.notify("Use /jarvis-memory editor without arguments; choose search and scope inside the editor.", "warning");
+			return;
+		}
+		await openMemoryEditor(state, ctx);
+		return;
+	}
 	try {
 		const text = state.memory.command(args, ctx);
 		if (overlay && state.runtime) state.runtime.addSystemMessage(text);
@@ -1514,7 +1617,7 @@ function createOverlayView(
 	configureThinking: (request: string, ctx: ExtensionCommandContext, embedded?: boolean) => Promise<void>,
 ): JarvisOverlayView {
 	const queue = state.queuedMessages, interaction = state.overlayOwner;
-	const ownsPresentation = () => state.queuedMessages === queue && state.overlayOwner === interaction && state.overlayOpen && !isArchiveSecretPromptActive();
+	const ownsPresentation = () => state.queuedMessages === queue && state.overlayOwner === interaction && state.overlayOpen && !state.memoryEditorOwner && !isArchiveSecretPromptActive();
 	const syncToolAccess = () => {
 		state.runtime?.setToolAccessEnabled(state.allowSideTools);
 		state.bridge.refresh();
@@ -1584,7 +1687,7 @@ function createOverlayView(
 			// Memory controls must work immediately, even while a side turn is busy.
 			const memoryCommand = parseMemoryCommand(text);
 			if (memoryCommand !== undefined) {
-				dispatchMemoryCommand(state, memoryCommand, ctx, true);
+				await dispatchMemoryCommand(state, memoryCommand, ctx, true);
 				return;
 			}
 			if (state.queuedMessages !== queue) return;
@@ -1773,7 +1876,7 @@ async function ensureRuntime(pi: ExtensionAPI, state: MainState, ctx: ExtensionC
 					signal,
 				),
 			sendSteerToMain: (message: string) => {
-				if (!isCurrentBoot() || !checkTransientTrust(state) || !state.overlayOpen || isArchiveSecretPromptActive() || !state.allowSteerToMain) throw new Error("/jarvis redirect permission expired.");
+				if (!isCurrentBoot() || !checkTransientTrust(state) || !state.overlayOpen || state.memoryEditorOwner || isArchiveSecretPromptActive() || !state.allowSteerToMain) throw new Error("/jarvis redirect permission expired.");
 				pi.sendUserMessage(message, { deliverAs: "steer" });
 			},
 			themeProvider: state.themeProvider,

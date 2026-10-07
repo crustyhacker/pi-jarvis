@@ -39,3 +39,11 @@ export interface MemoryQuery {
 	limit?: number;
 }
 export interface MemorySaveResult { record?: MemoryRecord; outcome: "saved" | "updated" | "duplicate" | "forgotten" }
+
+/** Safe, input-free diagnostics for explicit human curated-note administration. */
+export class MemoryEditorDataError extends Error {
+	constructor(readonly code: "invalid" | "conflict" | "collision" | "forgotten" | "limit" | "access" | "storage", message: string) {
+		super(message);
+		this.name = "MemoryEditorDataError";
+	}
+}

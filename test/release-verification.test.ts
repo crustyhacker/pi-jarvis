@@ -95,6 +95,7 @@ function main(): void {
 		"index", "jarvis-config", "main-context", "main-session-state", "model-picker", "overlay", "session-ref", "side-session",
 		"draft-editor", "overlay-layout", "transcript-viewport", "native-mcp", "jarvis-branding",
 		"memory-types", "memory-config", "memory-content", "memory-store", "memory-service", "memory-extension",
+		"memory-editor-types", "memory-editor", "memory-editor-controller",
 		"archive-types", "archive-config", "archive-store", "archive-service", "archive-extension", "archive-import",
 		"archive-crypto", "archive-keychain", "archive-secret-input", "archive-unlock", "archive-sqlite",
 		"archive-migration", "archive-vault-files", "archive-vault",

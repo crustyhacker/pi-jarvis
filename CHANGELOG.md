@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.12.0] - 2026-10-07
+
+### Curated memory editor
+- Add a human-only `/jarvis-memory editor` TUI overlay, also available through `/memory editor` inside Jarvis without model/boot/queue work. Manage curated notes only, not automatic conversation captures or the full-session archive.
+- Browse/search/filter/sort bounded note summaries, inspect full text/provenance, create/duplicate notes, edit title/body/category/scope, and review saves and selected-note deletions.
+- Preserve live memory policy and owner checks, dirty-draft protection, transactionally compared versions, deterministic title/scope identities, FTS consistency and tombstones. No silent collision overwrite, forgotten-title resurrection or uncertain-write replay.
+- Coordinate modal admission with Jarvis, model pickers, memory reviews and private archive input. Capture/recall-only pauses permit human management; full-off/untrusted/config-error states do not. No archive behavior or user privacy-control changes.
+
 ## [1.11.4] - 2026-10-05
 
 ### Documentation and showcase

@@ -102,11 +102,19 @@ function harness(root: string, id: number) {
 		ui: {
 			theme, notify: (text: string) => hostNotices.push(text),
 			setStatus: (key: string, text: string | undefined) => statuses.set(key, text),
-			custom: (factory: any) => new Promise<void>((resolve) => {
-				overlay = factory({ terminal: { rows: 50, columns: 120 }, requestRender() {
+			custom: (factory: any, options: any) => new Promise<void>((resolve) => {
+				let closed = false, hidden = false;
+				const component = factory({ terminal: { rows: 50, columns: 120 }, requestRender() {
 					if (overlay) feedback.push(snapshot(overlay.view));
 					onRender?.();
-				} }, theme, getKeybindings(), () => { overlay?.dispose(); resolve(); });
+				} }, theme, getKeybindings(), () => { if (closed) return; closed = true; overlay?.dispose(); resolve(); });
+				overlay = component; component.focused = true;
+				options?.onHandle?.({
+					isFocused: () => !closed && !hidden && overlay === component,
+					isHidden: () => hidden, setHidden: (value: boolean) => { hidden = value; },
+					focus() { hidden = false; }, unfocus() { hidden = true; }, hide() { hidden = true; },
+					getBounds: () => undefined,
+				});
 			}),
 		},
 	};

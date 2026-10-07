@@ -7,7 +7,9 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { DatabaseSync, SQLInputValue, StatementSync } from "node:sqlite";
-import type { MemoryInput, MemoryQuery, MemoryRecord, MemorySaveResult } from "./memory-types.js";
+import { sanitizeMemoryText } from "./memory-content.js";
+import type { MemoryEditorPage, MemoryEditorQuery, MemoryEditorScope, MemoryNoteDraft, MemoryNoteSummary } from "./memory-editor-types.js";
+import { MemoryEditorDataError, type MemoryInput, type MemoryQuery, type MemoryRecord, type MemorySaveResult } from "./memory-types.js";
 
 // Importing/constructing a disabled store must not even load SQLite. Node 22/24 may
 // emit its experimental warning on the first actual access, not at extension load.
@@ -113,6 +115,66 @@ function decode(row: Record<string, unknown>): MemoryRecord {
 	if (record.updatedAt < record.createdAt || identity(record) !== record.id) failure("record identity");
 	return record;
 }
+function editorError(code: MemoryEditorDataError["code"], message: string): never {
+	throw new MemoryEditorDataError(code, message);
+}
+function editorScope(value: unknown): asserts value is MemoryEditorScope {
+	if (!["current", "project", "global", "all"].includes(value as string)) editorError("invalid", "Choose a valid curated-note access scope.");
+}
+function editorInput(input: MemoryInput): MemoryInput {
+	try { validateInput(input); } catch { editorError("invalid", "Invalid curated note: check title, body, category, scope and source limits."); }
+	if (input.kind !== "note") editorError("invalid", "The curated-note editor cannot change conversation captures.");
+	if (/[\r\n\t\u2028\u2029]/u.test(input.title)) editorError("invalid", "Curated-note titles must be a single line (at most 160 characters).");
+	const cleanTitle = sanitizeMemoryText(input.title, MAX_TITLE_CHARS * 4);
+	const cleanText = sanitizeMemoryText(input.text, MAX_TEXT_BYTES);
+	// Preserve whitespace/indentation. CRLF/CR normalization is the existing
+	// memory contract; stripping other unsafe controls is not a silent edit.
+	if (cleanTitle.omitted || cleanTitle.redacted || cleanTitle.text !== input.title ||
+		cleanText.omitted || cleanText.redacted || cleanText.text !== input.text.replace(/\r\n?/g, "\n")) {
+		editorError("invalid", "Curated note is empty, oversized, unsafe, or contains a possible secret. Remove sensitive material before saving.");
+	}
+	return { ...input, text: cleanText.text, source: { ...input.source } };
+}
+function expectedNote(value: MemoryRecord): MemoryRecord {
+	try {
+		validateInput(value); validId(value.id); timestamp(value.createdAt); timestamp(value.updatedAt);
+		if (value.kind !== "note" || value.updatedAt < value.createdAt || identity(value) !== value.id) failure("expected curated note");
+	} catch { editorError("invalid", "Review a valid complete curated note before changing or deleting it."); }
+	// Pin every known field before operation-local callbacks can run. Equality
+	// is field-based, not dependent on the caller's property insertion order.
+	return { id: value.id, kind: value.kind, category: value.category, scope: value.scope, project: value.project,
+		title: value.title, text: value.text, source: { lane: value.source.lane, sessionId: value.source.sessionId,
+			eventId: value.source.eventId, ...(value.source.role === undefined ? {} : { role: value.source.role }) },
+		createdAt: value.createdAt, updatedAt: value.updatedAt };
+}
+function sameRecord(a: MemoryRecord | undefined, b: MemoryRecord): boolean {
+	return !!a && a.id === b.id && a.kind === b.kind && a.category === b.category && a.scope === b.scope &&
+		a.project === b.project && a.title === b.title && a.text === b.text && a.createdAt === b.createdAt &&
+		a.updatedAt === b.updatedAt && a.source.lane === b.source.lane && a.source.sessionId === b.source.sessionId &&
+		a.source.eventId === b.source.eventId && a.source.role === b.source.role;
+}
+function editorFilter(scope: MemoryEditorScope, currentProject: string): { sql: string; args: SQLInputValue[] } {
+	if (scope === "current") return { sql: "(r.scope='global' OR (r.scope='project' AND r.project=?))", args: [currentProject] };
+	if (scope === "project") return { sql: "r.scope='project' AND r.project=?", args: [currentProject] };
+	return { sql: scope === "global" ? "r.scope='global'" : "1", args: [] };
+}
+function accessibleNote(record: MemoryRecord, currentProject: string, scope: MemoryEditorScope): boolean {
+	return record.kind === "note" && (scope === "all" || (scope === "global" ? record.scope === "global" :
+		scope === "project" ? record.scope === "project" && record.project === currentProject :
+		record.scope === "global" || record.project === currentProject));
+}
+function summary(row: Record<string, unknown>): MemoryNoteSummary {
+	const result: MemoryNoteSummary = { id: row.id as string, title: row.title as string,
+		category: row.category as MemoryNoteSummary["category"], scope: row.scope as MemoryNoteSummary["scope"],
+		project: row.project as string, lane: row.lane as MemoryNoteSummary["lane"],
+		createdAt: row.created_at as number, updatedAt: row.updated_at as number, textBytes: row.text_bytes as number };
+	validId(result.id); project(result.project); title(result.title, "note"); timestamp(result.createdAt); timestamp(result.updatedAt);
+	if (!["user", "feedback", "project", "reference"].includes(result.category) || !["global", "project"].includes(result.scope) ||
+		!["main", "jarvis", "manual"].includes(result.lane) || result.updatedAt < result.createdAt ||
+		!Number.isSafeInteger(result.textBytes) || result.textBytes < 1 || result.textBytes > MAX_TEXT_BYTES ||
+		identity({ kind: "note", scope: result.scope, project: result.project, title: result.title } as MemoryInput) !== result.id) failure("note summary");
+	return result;
+}
 function absent(error: unknown): boolean { return (error as NodeJS.ErrnoException)?.code === "ENOENT"; }
 function stat(path: string): Stats | undefined {
 	try { return lstatSync(path); } catch (error) { if (absent(error)) return undefined; throw error; }
@@ -171,6 +233,8 @@ export class MemoryStore {
 	private root?: string;
 	private canonicalPath?: string;
 	private readonly statements = new Map<string, StatementSync>();
+	private editorTransactionActive = false;
+	private editorCloseRequested = false;
 
 	constructor(agentDir: string) {
 		string(agentDir, "agent directory", 4096);
@@ -245,12 +309,13 @@ export class MemoryStore {
 		return statement;
 	}
 
-	private open(): DatabaseSync {
+	private open(check?: () => void): DatabaseSync {
 		if (this.db) {
 			try {
 				if (!this.checkDirectories(false)) failure("missing storage directory");
 				this.checkFiles();
 				if (this.prepare("PRAGMA user_version").get()?.user_version !== VERSION) failure("database version");
+				check?.();
 				return this.db;
 			} catch (error) { this.close(); throw error; }
 		}
@@ -278,8 +343,10 @@ export class MemoryStore {
 			this.db = new DatabaseSync(this.databasePath, { enableDoubleQuotedStringLiterals: false, allowExtension: false });
 			const db = this.db;
 			db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY`);
+			check?.();
 			db.exec("BEGIN IMMEDIATE");
 			try {
+				check?.(); // BEGIN may have waited on a cooperating writer.
 				const version = db.prepare("PRAGMA user_version").get()?.user_version;
 				const schema = db.prepare(`SELECT sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name LIMIT ${SCHEMA_LIMIT}`).all();
 				if (version === 0 && schema.length === 0) {
@@ -287,21 +354,23 @@ export class MemoryStore {
 					db.exec(`PRAGMA user_version=${VERSION}`);
 				} else if (version !== VERSION) failure("database version");
 				this.validateDatabase();
+				check?.();
 				db.exec("COMMIT");
 			} catch (error) { db.exec("ROLLBACK"); throw error; }
 			initializeWal(db);
 			const pageSize = Number(db.prepare("PRAGMA page_size").get()?.page_size);
 			db.exec(`PRAGMA max_page_count=${Math.floor(MAX_DATABASE_BYTES / pageSize)}; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=1000; PRAGMA journal_size_limit=16777216`);
 			this.checkFiles();
+			check?.();
 			return db;
 		} catch (error) { this.close(); throw error; }
 	}
 
-	private existing(): DatabaseSync | undefined {
-		if (this.db) return this.open();
+	private existing(check?: () => void): DatabaseSync | undefined {
+		if (this.db) return this.open(check);
 		if (!this.checkDirectories(false)) return undefined;
 		this.checkFiles();
-		return stat(this.databasePath) ? this.open() : undefined;
+		return stat(this.databasePath) ? this.open(check) : undefined;
 	}
 
 	private count(table: "records" | "tombstones", kind?: "note" | "conversation"): number {
@@ -348,6 +417,41 @@ export class MemoryStore {
 		db.exec("BEGIN IMMEDIATE");
 		try { const result = action(); db.exec("COMMIT"); return result; }
 		catch (error) { db.exec("ROLLBACK"); throw error; }
+	}
+
+	/** Editor-only snapshot/write boundary. Never replay writes or uncertain COMMITs.
+	 * Policy revocation can request close from inside the guard; defer that close
+	 * just long enough to roll back, without making any subsequent work admissible. */
+	private editorRun<T>(mode: "create" | "write" | "read", missing: () => T, action: () => T, check?: () => void): T {
+		check?.();
+		if (this.editorTransactionActive) editorError("access", "Another curated-note operation is already active.");
+		this.editorTransactionActive = true;
+		let db: DatabaseSync | undefined;
+		let began = false;
+		let failed = false;
+		try {
+			db = mode === "create" ? this.open(check) : this.existing(check);
+			check?.();
+			if (!db) return missing();
+			db.exec(mode === "read" ? "BEGIN" : "BEGIN IMMEDIATE");
+			began = true;
+			check?.(); // Recheck after any SQLite lock wait, before transaction work.
+			const result = action();
+			check?.(); // Last admission/policy check, inside the same transaction.
+			db.exec("COMMIT");
+			began = false;
+			return result;
+		} catch (error) {
+			failed = true;
+			if (began) { try { db!.exec("ROLLBACK"); } catch { /* Unknown COMMIT outcome: no retry. */ } }
+			throw error;
+		} finally {
+			this.editorTransactionActive = false;
+			if (this.editorCloseRequested) {
+				this.editorCloseRequested = false;
+				try { this.close(); } catch (error) { if (!failed) throw error; }
+			}
+		}
 	}
 
 	private row(id: string): MemoryRecord | undefined {
@@ -523,6 +627,123 @@ export class MemoryStore {
 		});
 	}
 
+	/** Bounded metadata-only human browser; conversation bodies never reach JS. */
+	editorList(query: MemoryEditorQuery, currentProject: string, check?: () => void): MemoryEditorPage {
+		project(currentProject);
+		if (!query || typeof query !== "object") editorError("invalid", "Use a valid curated-note query.");
+		editorScope(query.scope);
+		if (query.category !== undefined && !["user", "feedback", "project", "reference"].includes(query.category)) editorError("invalid", "Choose a valid curated-note category.");
+		if (query.lane !== undefined && !["main", "jarvis", "manual"].includes(query.lane)) editorError("invalid", "Choose a valid curated-note source lane.");
+		const sort = query.sort ?? "updated";
+		if (!["updated", "created", "title"].includes(sort)) editorError("invalid", "Choose a valid curated-note sort.");
+		if (query.offset !== undefined && (!Number.isSafeInteger(query.offset) || query.offset < 0)) editorError("invalid", "Use a nonnegative integer page offset.");
+		if (query.limit !== undefined && !Number.isSafeInteger(query.limit)) editorError("invalid", "Use an integer page size (maximum 50).");
+		if (query.query !== undefined) {
+			try { string(query.query, "search query", 2048, false); } catch { editorError("invalid", "Use a non-sensitive search query of at most 512 characters / 2048 bytes."); }
+		}
+		const words = [...new Set(normalize(query.query ?? "").split(" ").filter(Boolean))];
+		if (words.length > 128 || [...(query.query ?? "")].length > 512) editorError("invalid", "Use a search query of at most 512 characters and 128 literal terms.");
+		const offset = query.offset ?? 0, limit = Math.max(1, Math.min(50, query.limit ?? 50));
+		const filter = editorFilter(query.scope, currentProject);
+		const where = ["r.kind='note'", filter.sql], args = [...filter.args];
+		if (words.length) { where.push("records_fts MATCH ?"); args.push(words.map(word => `"${word.replace(/"/g, '""')}"`).join(" OR ")); }
+		if (query.category !== undefined) { where.push("r.category=?"); args.push(query.category); }
+		if (query.lane !== undefined) { where.push("r.lane=?"); args.push(query.lane); }
+		const from = words.length ? "records_fts CROSS JOIN records r ON r.rowid=records_fts.rowid" : "records r";
+		const order = sort === "title" ? "r.search_title ASC, r.id ASC" : sort === "created" ?
+			"r.created_at DESC, r.updated_at DESC, r.id ASC" : "r.updated_at DESC, r.created_at DESC, r.id ASC";
+		return this.editorRun("read", () => ({ records: [], total: 0, offset, nextOffset: null }), () => {
+			const total = Number(this.prepare(`SELECT count(*) AS count FROM ${from} WHERE ${where.join(" AND ")}`).get(...args)!.count);
+			if (total > MEMORY_STORE_LIMITS.notes) failure("note retention");
+			check?.();
+			const records = this.prepare(`SELECT r.id, r.title, r.category, r.scope, r.project, r.lane,
+				r.created_at, r.updated_at, length(CAST(r.text AS BLOB)) AS text_bytes
+				FROM ${from} WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ? OFFSET ?`)
+				.all(...args, limit, offset).map(summary);
+			return { records, total, offset, nextOffset: offset + records.length < total ? offset + records.length : null };
+		}, check);
+	}
+
+	editorGet(id: string, currentProject: string, scope: MemoryEditorScope, check?: () => void): MemoryRecord | undefined {
+		validId(id); project(currentProject); editorScope(scope);
+		const filter = editorFilter(scope, currentProject);
+		return this.editorRun("read", () => undefined, () => {
+			const row = this.prepare(`SELECT r.* FROM records r WHERE r.id=? AND r.kind='note' AND ${filter.sql}`).get(id, ...filter.args);
+			return row ? decode(row) : undefined;
+		}, check);
+	}
+
+	/** Create ONLY: a normalized scoped title collision/forgotten identity rejects. */
+	editorCreate(input: MemoryInput, check?: () => void): MemoryRecord {
+		const note = editorInput(input), id = identity(note);
+		return this.editorRun("create", () => editorError("storage", "Curated-note storage is unavailable."), () => {
+			if (this.prepare("SELECT 1 FROM records WHERE id=?").get(id)) editorError("collision", "Curated-note title already exists in the destination. Review it instead of overwriting.");
+			if (this.prepare("SELECT 1 FROM tombstones WHERE id=?").get(id)) editorError("forgotten", "Curated-note title was forgotten; use explicit /jarvis-memory remember to restore it.");
+			if (this.count("records", "note") >= MEMORY_STORE_LIMITS.notes) editorError("limit", "Memory note limit reached (1000); no notes were automatically deleted.");
+			this.editorReserveIdentity();
+			const now = Date.now();
+			const inserted = this.prepare(`INSERT INTO records(id,kind,category,scope,project,title,text,search_title,search_text,lane,session_id,event_id,role,created_at,updated_at)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, note.kind, note.category, note.scope, note.project, note.title, note.text,
+				normalize(note.title), normalize(note.text), note.source.lane, note.source.sessionId, note.source.eventId, note.source.role ?? null, now, now);
+			this.insertIndex(inserted.lastInsertRowid, note.title, note.text);
+			return this.row(id)!;
+		}, check);
+	}
+
+	private editorReserveIdentity(): void {
+		if (this.count("records") + this.count("tombstones") >= MEMORY_STORE_LIMITS.identities) {
+			editorError("limit", "Memory identity budget exhausted; new identities are paused, forgetting remains available.");
+		}
+	}
+
+	/** Compare the complete reviewed version, including provenance, within the write transaction. */
+	editorUpdate(expected: MemoryRecord, draft: MemoryNoteDraft, currentProject: string, scope: MemoryEditorScope, check?: () => void): MemoryRecord {
+		project(currentProject); editorScope(scope);
+		const reviewed = expectedNote(expected);
+		if (!draft || typeof draft !== "object") editorError("invalid", "Use a valid curated-note draft.");
+		const targetProject = reviewed.scope === "global" && draft.scope === "project" ? currentProject : reviewed.project;
+		const note = editorInput({ ...reviewed, title: draft.title, text: draft.text, category: draft.category, scope: draft.scope, project: targetProject });
+		const id = identity(note);
+		return this.editorRun("write", () => editorError("conflict", "Curated note changed or is no longer accessible. Reload and review; your draft was not saved."), () => {
+			const existing = this.row(reviewed.id);
+			if (!sameRecord(existing, reviewed) || !accessibleNote(existing!, currentProject, scope)) editorError("conflict", "Curated note changed or is no longer accessible. Reload and review; your draft was not saved.");
+			if (id !== reviewed.id) {
+				if (this.prepare("SELECT 1 FROM records WHERE id=?").get(id)) editorError("collision", "Curated-note title already exists in the destination. No changes were saved.");
+				if (this.prepare("SELECT 1 FROM tombstones WHERE id=?").get(id)) editorError("forgotten", "Curated-note destination was forgotten; use explicit /jarvis-memory remember to restore it.");
+				this.editorReserveIdentity();
+				this.addTombstone(reviewed.id);
+			}
+			const updatedAt = Math.max(Date.now(), reviewed.updatedAt + 1);
+			if (!Number.isSafeInteger(updatedAt)) editorError("invalid", "Curated-note timestamp limit reached; no changes were saved.");
+			const indexed = this.prepare("SELECT rowid, search_title, search_text FROM records WHERE id=?").get(reviewed.id)!;
+			this.deleteIndex(indexed.rowid, String(indexed.search_title), String(indexed.search_text));
+			this.prepare(`UPDATE records SET id=?, title=?, text=?, category=?, scope=?, project=?, search_title=?, search_text=?, updated_at=? WHERE id=?`)
+				.run(id, note.title, note.text, note.category, note.scope, note.project, normalize(note.title), normalize(note.text), updatedAt, reviewed.id);
+			this.insertIndex(indexed.rowid, note.title, note.text);
+			return this.row(id)!;
+		}, check);
+	}
+
+	/** 1..50 complete reviewed versions, compared ALL before deleting ANY. */
+	editorForget(expected: MemoryRecord[], currentProject: string, scope: MemoryEditorScope, check?: () => void): number {
+		project(currentProject); editorScope(scope);
+		if (!Array.isArray(expected) || expected.length < 1 || expected.length > 50) editorError("invalid", "Review between 1 and 50 curated notes for deletion.");
+		const reviewed = expected.map(expectedNote);
+		if (new Set(reviewed.map(record => record.id)).size !== reviewed.length) editorError("invalid", "Each reviewed curated note may appear only once.");
+		return this.editorRun("write", () => editorError("conflict", "Curated notes changed or are no longer accessible. Nothing was deleted; reload and review."), () => {
+			for (const note of reviewed) {
+				const record = this.row(note.id);
+				if (!sameRecord(record, note) || !accessibleNote(record!, currentProject, scope)) editorError("conflict", "Curated notes changed or are no longer accessible. Nothing was deleted; reload and review.");
+			}
+			check?.();
+			for (const note of reviewed) {
+				this.addTombstone(note.id);
+				this.deleteRecords("id=?", [note.id]);
+			}
+			return reviewed.length;
+		}, check);
+	}
+
 	/** Human-only privacy operation; never expose this method as a model tool. */
 	forgetAll(currentProject: string, scope: "project" | "global" | "all" = "project"): number {
 		project(currentProject);
@@ -541,6 +762,7 @@ export class MemoryStore {
 	}
 
 	close(): void {
+		if (this.editorTransactionActive) { this.editorCloseRequested = true; return; }
 		const db = this.db;
 		this.db = undefined;
 		this.file = undefined;

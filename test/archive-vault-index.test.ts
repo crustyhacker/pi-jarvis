@@ -204,6 +204,15 @@ class Fixture {
 						assert.ok(!(component instanceof Promise), "these index factories are synchronous");
 						record = { component, overlay, closed: false, disposed: false, owner };
 						this.dialogs.push(record); this.activeDialog = record; record.component.focused = true;
+						if (overlay) {
+							let hidden = false;
+							options?.onHandle?.({
+								isFocused: () => !record!.closed && !hidden && this.activeDialog === record,
+								isHidden: () => hidden, setHidden: value => { hidden = value; },
+								focus() { hidden = false; }, unfocus() { hidden = true; }, hide() { hidden = true; },
+								getBounds: () => undefined,
+							});
+						}
 						if (!overlay) { assert.ok(component instanceof ArchiveSecretInput); this.onSecret?.(record); }
 					} catch (error) { reject(error); }
 				});
@@ -225,11 +234,22 @@ class Fixture {
 		jarvisExtension(lane.api);
 		const mount: Mount = {
 			ctx, manager, lane,
-			start: async (reason = "startup") => { await lane.emit({ type: "session_start", reason } satisfies SessionStartEvent, ctx); },
-			shutdown: async (reason = "quit") => { await lane.emit({ type: "session_shutdown", reason } satisfies SessionShutdownEvent, ctx); },
+			start: async (reason = "startup") => { this.retireHostUi(); await lane.emit({ type: "session_start", reason } satisfies SessionStartEvent, ctx); },
+			shutdown: async (reason = "quit") => { this.retireHostUi(); await lane.emit({ type: "session_shutdown", reason } satisfies SessionShutdownEvent, ctx); },
 			command: (name, args = "") => { const command = lane.commands.get(name); assert.ok(command); return command.handler(args, ctx); },
 		};
 		this.mounts.push(mount); return mount;
+	}
+	private retireHostUi(): void {
+		// Forced public host replacement removes focus before retiring the old
+		// component. Never require an extension to call a stale custom done().
+		const dialog = this.activeDialog;
+		this.activeDialog = undefined;
+		if (dialog && !dialog.disposed) {
+			dialog.component.focused = false;
+			dialog.component.dispose?.(); dialog.disposed = true;
+			this.order.push(dialog.overlay ? "overlay:dispose" : "secret:dispose");
+		}
 	}
 	routeInput(data: string): void {
 		if (this.activeDialog && !this.activeDialog.disposed) this.activeDialog.component.handleInput?.(data);
@@ -650,8 +670,10 @@ function publicIndexHost(f: Fixture, h: Mount, options: { deferSecretFactory?: b
 					f.dialogs.push(record);
 					if (closed) return;
 					f.activeDialog = record;
-					if (overlay) overlayHandle = host.showOverlay(component);
-					else { host.clear(); host.addChild(component); host.setFocus(component); }
+					if (overlay) {
+						overlayHandle = host.showOverlay(component);
+						opts?.onHandle?.(overlayHandle);
+					} else { host.clear(); host.addChild(component); host.setFocus(component); }
 				}, reject);
 			} catch (error) { reject(error); }
 		};

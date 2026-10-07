@@ -261,6 +261,7 @@ function createOverlayCaptureHarness(harness: JarvisExtensionHarness): {
 				component = (factory as OverlayFactory)(tui, harness.ctx.ui.theme, new KeybindingsManager(TUI_KEYBINDINGS), done);
 				capturedOverlay = component;
 				mount = tui.showOverlay(component, { width: 80 });
+				(options as { onHandle?: (handle: typeof mount) => void }).onHandle?.(mount);
 				component.render(80);
 			} catch (error) {
 				done(error);

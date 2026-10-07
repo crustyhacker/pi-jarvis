@@ -81,8 +81,19 @@ function harness(mode = "tui") {
 				customCalls++;
 				customOptions = options;
 				return new Promise((resolve) => {
-					overlay = factory({ terminal, requestRender() {} }, theme, getKeybindings(), (value: unknown) => {
+					let closed = false, hidden = false;
+					const component = factory({ terminal, requestRender() {} }, theme, getKeybindings(), (value: unknown) => {
+						if (closed) return; closed = true;
 						overlay?.dispose?.(); resolve(value);
+					});
+					overlay = component; component.focused = true;
+					// Model the public post-mount handle boundary; this unit fixture
+					// must not encourage completion before an overlay is mounted.
+					options?.onHandle?.({
+						isFocused: () => !closed && !hidden && overlay === component,
+						isHidden: () => hidden, setHidden: (value: boolean) => { hidden = value; },
+						focus() { hidden = false; }, unfocus() { hidden = true; }, hide() { hidden = true; },
+						getBounds: () => undefined,
 					});
 				});
 			},
