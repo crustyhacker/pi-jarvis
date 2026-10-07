@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.12.1] - 2026-10-07
+
+### Documentation
+- Put the curated memory editor near the top of the GitHub/npm landing page with a prominent launch command, actual-renderer preview, benefit-led workflow table and quick controls.
+- Highlight the editor alongside shared memory and the existing toolkit while keeping curated notes distinct from conversation captures and the optional archive. Preserve plaintext/provider, access-control, review/conflict and deletion-limit disclosures.
+- Documentation/metadata only; runtime and installed settings are unchanged from 1.12.0. npm publication remains manual.
+
 ## [1.12.0] - 2026-10-07
 
 ### Curated memory editor
