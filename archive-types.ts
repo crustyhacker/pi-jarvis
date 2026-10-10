@@ -1,7 +1,7 @@
 /** Optional, unredacted finalized-session archive. Separate from curated memory. */
 export type ArchiveScope = "global" | "project";
 export type ArchiveLane = "main" | "jarvis" | "import";
-export interface ArchivePolicy { enabled: boolean; capture: boolean; modelAccess: boolean }
+export interface ArchivePolicy { enabled: boolean; capture: boolean; modelAccess: boolean; modelWideSearch: boolean }
 export interface ArchiveInput {
 	project: string;
 	sessionId: string;
