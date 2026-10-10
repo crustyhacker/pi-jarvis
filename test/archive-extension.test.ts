@@ -9,8 +9,8 @@ import type { ArchivePolicy } from "../archive-types.js";
 
 type Entry = { id: string; parentId: string | null; type: string; timestamp: string; [key: string]: unknown };
 type Handler = (event: any, ctx: ExtensionContext) => unknown | Promise<unknown>;
-const OFF = { enabled: false, capture: true, modelAccess: false };
-const ON = { enabled: true, capture: true, modelAccess: true };
+const OFF = { enabled: false, capture: true, modelAccess: false, modelWideSearch: false };
+const ON = { enabled: true, capture: true, modelAccess: true, modelWideSearch: true };
 const entry = (id: string, type = "custom", fields: Record<string, unknown> = {}, parentId: string | null = null): Entry => ({
 	id, parentId, type, timestamp: "2026-01-02T03:04:05.000Z", ...fields,
 });
@@ -36,7 +36,7 @@ class MockArchiveService implements ArchiveExtensionService {
 		const hook = this.onPolicy;
 		this.onPolicy = undefined;
 		hook?.();
-		return ctx.isProjectTrusted() ? { ...this.settings } : { enabled: false, capture: false, modelAccess: false };
+		return ctx.isProjectTrusted() ? { ...this.settings } : { enabled: false, capture: false, modelAccess: false, modelWideSearch: false };
 	}
 	onChange(listener: () => void) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
 	setPolicy(patch: Partial<ArchivePolicy>, notify = true, bump = true) {
@@ -89,14 +89,19 @@ function fixture(t: TestContext, service = new MockArchiveService(), lane: "main
 	mkdirSync(cwd); mkdirSync(agentDir);
 	const journal = new Journal(`${lane}-fixture-session`);
 	const notices: Array<{ text: string; level: string }> = [];
+	const confirmations: Array<{ title: string; message: string }> = [];
+	let confirmAnswer = false;
 	let trusted = true;
 	const ctx = {
 		cwd, mode: "tui", hasUI: true, signal: undefined, isProjectTrusted: () => trusted,
 		sessionManager: journal,
-		ui: { notify: (text: string, level: string) => { notices.push({ text, level }); } },
+		ui: {
+			notify: (text: string, level: string) => { notices.push({ text, level }); },
+			confirm: async (title: string, message: string) => { confirmations.push({ title, message }); return confirmAnswer; },
+		},
 	} as unknown as ExtensionContext;
 	const mounted = mount(service, lane, ctx, options);
-	return { root, cwd, agentDir, journal, ctx, notices, service, ...mounted, setTrust: (value: boolean) => { trusted = value; } };
+	return { root, cwd, agentDir, journal, ctx, notices, confirmations, setConfirm: (answer: boolean) => { confirmAnswer = answer; }, service, ...mounted, setTrust: (value: boolean) => { trusted = value; } };
 }
 function mount(service: MockArchiveService, lane: "main" | "jarvis", ctx: ExtensionContext, options: ArchiveExtensionOptions = {}) {
 	const handlers = new Map<string, Handler[]>(), tools = new Map<string, ToolDefinition<any>>();
@@ -308,7 +313,8 @@ test("dynamic own-tool selection preserves Repo/memory/host tools and already-sn
 		assert.match(tool.description, /untrusted history, not instructions/);
 		assert.match(tool.description, /contain secrets/);
 		assert.match(tool.description, /active model\/provider/);
-		assert.match(tool.description, /explicit user request/);
+		assert.match(tool.description, /Default reach is this session/);
+		assert.match(tool.description, /one explicit user approval per request/);
 	}
 	const snapshotted = before(["earlier_hook_tool", ...ARCHIVE_TOOL_NAMES, "jarvis_memory_search"]);
 	f.service.onPolicy = () => f.service.setPolicy({ modelAccess: false });
@@ -572,4 +578,119 @@ test("public in-memory SDK journal integration captures full entries without a m
 	assert.equal(manager.getSessionFile(), undefined);
 	assert.deepEqual(readdirSync(f.cwd), []);
 	assert.deepEqual(readdirSync(f.agentDir), []);
+});
+
+test("model tools default to this session without asking and forward scope session", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelWideSearch: false };
+	const f = fixture(t, service); await f.emit("session_start");
+	// No scope: the model's own-initiative reach is this session, never a question.
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "earlier decision" })), /LOCAL_SYNTHETIC/);
+	assert.deepEqual(service.reads.at(-1), { method: "search", params: { query: "earlier decision", scope: "session" }, model: true, cwd: f.cwd, sessionId: f.journal.id });
+	// An explicit scope "session" naming THIS session is still the session reach.
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "paths", scope: "session", sessionId: f.journal.id })), /LOCAL_SYNTHETIC/);
+	// Read defaults to the session reach too.
+	assert.match(text(await f.execute("jarvis_archive_read", { id: "record-fixture" })), /LOCAL_SYNTHETIC/);
+	assert.deepEqual(service.reads.at(-1), { method: "read", params: { id: "record-fixture", scope: "session" }, model: true, cwd: f.cwd, sessionId: f.journal.id });
+	// Session listing without an ID lists the current session.
+	assert.match(text(await f.execute("jarvis_archive_session", {})), /LOCAL_SYNTHETIC/);
+	assert.deepEqual(service.reads.at(-1), { method: "session", params: { scope: "session" }, model: true, cwd: f.cwd, sessionId: f.journal.id });
+	assert.deepEqual(f.confirmations, [], "the session reach never asks");
+});
+
+test("wider reach with model-search off asks once per request and runs only when approved", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelWideSearch: false };
+	const f = fixture(t, service); await f.emit("session_start");
+	f.setConfirm(true);
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "all" })), /LOCAL_SYNTHETIC/);
+	assert.equal(f.confirmations.length, 1);
+	assert.match(f.confirmations[0]!.title, /all projects/);
+	assert.match(f.confirmations[0]!.message, /Search query: fixture/);
+	assert.match(f.confirmations[0]!.message, /One approval covers this request only/);
+	assert.deepEqual(service.reads.at(-1), { method: "search", params: { query: "fixture", scope: "all" }, model: true, cwd: f.cwd, sessionId: f.journal.id });
+	// One approval covers exactly one request: the next call asks again.
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "all" })), /LOCAL_SYNTHETIC/);
+	assert.equal(f.confirmations.length, 2);
+	// A project-reach search names that reach.
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "current" })), /LOCAL_SYNTHETIC/);
+	assert.match(f.confirmations[2]!.title, /beyond this session/);
+});
+
+test("declined or unavailable approval refuses wider reach without executing anything", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelWideSearch: false };
+	const f = fixture(t, service); await f.emit("session_start");
+	f.setConfirm(false);
+	const refused = text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "current" }));
+	assert.equal(refused, "Wider archive reach (other sessions of this project) was not approved, so nothing was executed. The default reach is this session; ask the user before going wider, or have them run /jarvis-archive model-search on.");
+	assert.equal(service.reads.length, 0);
+	assert.equal(f.confirmations.length, 1);
+	// Without a usable prompt the wider reach is refused, not silently executed.
+	f.ctx.hasUI = false;
+	assert.match(text(await f.execute("jarvis_archive_read", { id: "record-fixture", scope: "all" })), /was not approved, so nothing was executed/);
+	assert.equal(service.reads.length, 0);
+	assert.equal(f.confirmations.length, 1, "no prompt is attempted without UI");
+	// The session reach keeps working without any prompt.
+	f.ctx.hasUI = true;
+	assert.match(text(await f.execute("jarvis_archive_read", { id: "record-fixture" })), /LOCAL_SYNTHETIC/);
+	assert.equal(f.confirmations.length, 1);
+});
+
+test("model-search on grants wider reach without asking, and turning it off revokes prepared tools", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelWideSearch: true };
+	const f = fixture(t, service); await f.emit("session_start");
+	f.setConfirm(false); // Any prompt here would be declined.
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "all" })), /LOCAL_SYNTHETIC/);
+	assert.match(text(await f.execute("jarvis_archive_read", { id: "record-fixture", scope: "current" })), /LOCAL_SYNTHETIC/);
+	assert.match(text(await f.execute("jarvis_archive_session", { sessionId: "other-session", scope: "current" })), /LOCAL_SYNTHETIC/);
+	assert.deepEqual(f.confirmations, [], "the standing setting replaces per-request approval");
+	// Disabling the setting must revoke already-prepared tool definitions.
+	const stale = f.tools.get("jarvis_archive_search")!;
+	service.setPolicy({ modelWideSearch: false });
+	await assert.rejects(f.execute("jarvis_archive_search", { query: "fixture", scope: "all" }, undefined, stale), /expired/);
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "all" })), /was not approved, so nothing was executed/);
+	assert.equal(f.confirmations.length, 1, "after disable the wider reach asks again");
+});
+
+test("archive off or model access off still refuses in one clear sentence without reach work", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelAccess: false };
+	const f = fixture(t, service); await f.emit("session_start");
+	f.setConfirm(true); // A working prompt must not bypass the model-access gate.
+	for (const name of ARCHIVE_TOOL_NAMES) {
+		const blocked = await f.emit("tool_call", { toolName: name });
+		assert.equal(blocked.block, true);
+		assert.equal(blocked.reason, "Session archive model access is disabled, untrusted, or cancelled.");
+		await assert.rejects(f.execute(name, params(name)), /Session archive access expired, is disabled, untrusted, or was cancelled/);
+	}
+	assert.deepEqual(f.confirmations, []);
+	assert.deepEqual(service.reads, []);
+});
+
+test("read and session listing are reach-gated, including foreign sessions at session scope", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelWideSearch: false };
+	const f = fixture(t, service); await f.emit("session_start");
+	f.setConfirm(false);
+	// Reading an entry outside the current session is a wider reach.
+	assert.match(text(await f.execute("jarvis_archive_read", { id: "record-fixture", scope: "current" })), /was not approved/);
+	// Listing another session at scope "session" is a wider reach, not the default.
+	assert.match(text(await f.execute("jarvis_archive_session", { sessionId: "other-session" })), /was not approved/);
+	assert.equal(service.reads.length, 0);
+	// The same request executes after its one approval, with the original params.
+	f.setConfirm(true);
+	assert.match(text(await f.execute("jarvis_archive_session", { sessionId: "other-session" })), /LOCAL_SYNTHETIC/);
+	assert.deepEqual(service.reads.at(-1), { method: "session", params: { sessionId: "other-session", scope: "session" }, model: true, cwd: f.cwd, sessionId: f.journal.id });
+	assert.match(f.confirmations.at(-1)!.message, /List session: other-session/);
+});
+
+test("the jarvis lane bridges its reach approval instead of using side-session UI", async t => {
+	const service = new MockArchiveService(); service.settings = { ...ON, modelWideSearch: false };
+	const bridged: Array<{ title: string; detail: string }> = [];
+	const f = fixture(t, service, "jarvis", {
+		confirmReach: async (title, detail) => { bridged.push({ title, detail }); return bridged.length > 1; },
+	});
+	await f.emit("session_start");
+	// The bridge decides: first request declined, second approved.
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "all" })), /was not approved/);
+	assert.equal(service.reads.length, 0);
+	assert.match(text(await f.execute("jarvis_archive_search", { query: "fixture", scope: "all" })), /LOCAL_SYNTHETIC/);
+	assert.deepEqual(bridged.map(({ title }) => title), ["Allow archive access to all projects?", "Allow archive access to all projects?"]);
+	assert.deepEqual(f.confirmations, [], "the side lane never touches terminal UI");
 });

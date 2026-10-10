@@ -31,12 +31,14 @@ interface Fixture {
 	root: string; agentDir: string; projectA: string; projectB: string; service: SharedArchiveService;
 	notices: Array<{ text: string; level: string; databaseExists: boolean }>;
 	context: (cwd?: string, sessionId?: string, trusted?: () => boolean) => ExtensionContext;
+	setConfirm: (answer: (title: string, message: string) => Promise<boolean>) => void;
 }
 async function fixture(run: (f: Fixture) => void | Promise<void>): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "pi-jarvis-archive-integration-"));
 	const agentDir = join(root, "agent"), projectA = join(root, "project-a"), projectB = join(root, "project-b");
 	for (const path of [agentDir, projectA, projectB]) mkdirSync(path);
 	const service = new SharedArchiveService(agentDir), notices: Fixture["notices"] = [];
+	let confirmAnswer: (title: string, message: string) => Promise<boolean> = async () => false;
 	const context: Fixture["context"] = (cwd = projectA, sessionId = "main-a", trusted = () => true) => {
 		const manager = SessionManager.inMemory(cwd);
 		manager.getSessionId = () => sessionId;
@@ -45,10 +47,10 @@ async function fixture(run: (f: Fixture) => void | Promise<void>): Promise<void>
 		return {
 			cwd, mode: "tui", hasUI: true, isProjectTrusted: trusted, sessionManager: manager,
 			ui: { notify: (text: string, level = "info") => notices.push({ text, level, databaseExists: existsSync(service.store.path) }),
-				confirm: async () => false },
+				confirm: (title: string, message: string) => confirmAnswer(title, message) },
 		} as unknown as ExtensionContext;
 	};
-	try { await run({ root, agentDir, projectA, projectB, service, notices, context }); }
+	try { await run({ root, agentDir, projectA, projectB, service, notices, context, setConfirm: (answer) => { confirmAnswer = answer; } }); }
 	finally { service.close(); rmSync(root, { recursive: true, force: true }); }
 }
 type Handler = (event: any, ctx: ExtensionContext) => unknown | Promise<unknown>;
@@ -181,7 +183,7 @@ test("sensitive acknowledgements are mandatory and capture, human reads and mode
 		}
 		assert.deepEqual(files(f.agentDir), []); assert.equal(existsSync(join(f.projectA, ".pi")), false);
 		await enable(f, ctx);
-		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: true, modelAccess: false });
+		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: true, modelAccess: false, modelWideSearch: false });
 		assert.equal(f.notices[0]!.databaseExists, false);
 		assert.match(f.notices[0]!.text, /PLAINTEXT.*WITHOUT secret filtering/);
 		assert.equal(existsSync(f.service.store.path), false, "acknowledgement/settings do not create the database");
@@ -193,7 +195,7 @@ test("sensitive acknowledgements are mandatory and capture, human reads and mode
 		assert.equal(sessionRecords(f, "main-a").length, 1);
 		assert.equal(JSON.parse(await f.service.command("stats", ctx)).records, 2, "one raw entry plus its session header");
 		await f.service.command("model-access on --confirm-sensitive", ctx);
-		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: false, modelAccess: true });
+		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: false, modelAccess: true, modelWideSearch: false });
 		assert.equal(page(f.service.search({ query: "fixture" }, ctx)).records.length, 1);
 		await f.service.command("model-access off", ctx);
 		assert.throws(() => f.service.session({ sessionId: "main-a" }, ctx), /model access/);
@@ -386,14 +388,19 @@ test("new capture never silently imports historical/disabled entries, and stale 
 		assert.equal(page(f.service.search({ query: "HISTORICAL_PRIVATE_CANARY" }, mainCtx, false)).records.length, 0);
 		await f.service.command("model-access on --confirm-sensitive", mainCtx);
 		const stale = side.tools.get("jarvis_archive_search")!;
-		assert.equal(page(toolText(await side.execute("jarvis_archive_search", { query: "newfixture" }))).records.length, 2);
+		// Default reach is this session only; an approved project reach finds both lanes.
+		assert.equal(page(toolText(await side.execute("jarvis_archive_search", { query: "newfixture" }))).records.length, 1);
+		f.setConfirm(async () => true);
+		assert.equal(page(toolText(await side.execute("jarvis_archive_search", { query: "newfixture", scope: "current" }))).records.length, 2);
+		f.setConfirm(async () => false);
 		await f.service.command("off", mainCtx);
 		(mainCtx.sessionManager as SessionManager).appendMessage(user("DISABLED_PRIVATE_CANARY"));
 		await main.emit("agent_settled"); await enable(f, mainCtx); await main.emit("agent_settled");
 		assert.equal(page(f.service.search({ query: "DISABLED_PRIVATE_CANARY" }, mainCtx, false)).records.length, 0);
 		await assert.rejects(side.execute("jarvis_archive_search", { query: "newfixture" }, undefined, stale), /expired/);
 		lifetime.abort(); await assert.rejects(side.execute("jarvis_archive_search", { query: "newfixture" }), /expired/);
-		assert.equal(page(toolText(await main.execute("jarvis_archive_search", { query: "newfixture" }))).records.length, 2, "side disposal does not revoke main archive");
+		f.setConfirm(async () => true);
+		assert.equal(page(toolText(await main.execute("jarvis_archive_search", { query: "newfixture", scope: "current" }))).records.length, 2, "side disposal does not revoke main archive");
 	});
 });
 
@@ -712,10 +719,14 @@ test("real main/overlay-side capture and read-only model access are independent 
 		t.mock.method(globalThis, "fetch", async () => { assert.fail("SDK fixture must never use the network"); });
 		await sdkFixture(f, (selected, context) => {
 			assert.equal(selected.provider, model.provider); requests.push(structuredClone(context));
-			if (issueTool) { issueTool = false; return response(selected, [{ type: "toolCall", id: "archive-search", name: "jarvis_archive_search", arguments: { query: "orbitfixture" } }]); }
+			if (issueTool) { issueTool = false; return response(selected, [{ type: "toolCall", id: "archive-search", name: "jarvis_archive_search", arguments: { query: "orbitfixture", scope: "current" } }]); }
 			return response(selected);
 		}, async sdk => {
-			const main = (await sdk.journal()).session, side = await sdk.side({ toolAccessProvider: () => repoAllowed }), session = sessionOf(side);
+			const bridge = new JarvisOverlayBridge();
+			// The side lane has no terminal UI: its reach approval arrives through the
+			// overlay bridge, which this fixture answers like a user clicking yes.
+			const approve = bridge.onChange(() => { if (bridge.getConfirmationToken()) bridge.resolveConfirmation(true); });
+			const main = (await sdk.journal()).session, side = await sdk.side({ toolAccessProvider: () => repoAllowed, bridge }), session = sessionOf(side);
 			assert.deepEqual(main.getActiveToolNames(), []); assert.deepEqual(session.getActiveToolNames(), []);
 			await main.prompt("capture main fixture"); await side.sendMessage("capture side fixture");
 			for (const request of requests) assert.doesNotMatch(JSON.stringify(request), /ARCHIVE_NO_AUTO_RECALL_CANARY|jarvis_archive_/);
@@ -738,8 +749,9 @@ test("real main/overlay-side capture and read-only model access are independent 
 			side.setToolAccessEnabled(false); await side.waitForToolAccessChange();
 			assert.deepEqual(session.getActiveToolNames().sort(), [...ARCHIVE_TOOL_NAMES].sort());
 			const mainTool = main.getToolDefinition("jarvis_archive_search")!;
-			side.dispose(); await side.waitForDisposal();
-			assert.match(toolText(await mainTool.execute("main-still-live", { query: "orbitfixture" }, undefined, undefined, main.extensionRunner.createContext() as ExtensionToolContext)), /ARCHIVE_NO_AUTO_RECALL_CANARY/i);
+			side.dispose(); await side.waitForDisposal(); approve();
+			f.setConfirm(async () => true);
+			assert.match(toolText(await mainTool.execute("main-still-live", { query: "orbitfixture", scope: "current" }, undefined, undefined, main.extensionRunner.createContext() as ExtensionToolContext)), /ARCHIVE_NO_AUTO_RECALL_CANARY/i);
 			assert.equal(requests.length, 4, "no model work for archive/settings/Repo/disposal operations");
 		});
 	});
@@ -854,3 +866,47 @@ for (const outcome of ["saved", "duplicate", "deleted"] as const) {
 		});
 	});
 }
+
+test("model-search is a sensitive acknowledged switch, defaults off, and shows in status", async () => {
+	await fixture(async f => {
+		const ctx = f.context();
+		await enable(f, ctx);
+		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: true, modelAccess: false, modelWideSearch: false });
+		assert.match(await f.service.command("status", ctx), /model-search off/);
+		// Enabling standing wider-reach permission needs the sensitive acknowledgement.
+		await assert.rejects(f.service.command("model-search on", ctx), error => error instanceof Error && error.message === ARCHIVE_WARNING);
+		await assert.rejects(f.service.command("--project model-search on --confirm", ctx), error => error instanceof Error && error.message === ARCHIVE_WARNING);
+		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: true, modelAccess: false, modelWideSearch: false });
+		await f.service.command("model-search on --confirm-sensitive", ctx);
+		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: true, modelAccess: false, modelWideSearch: true });
+		assert.match(await f.service.command("status", ctx), /model-search on/);
+		// Turning it off is ordinary, and clear falls back to the off default.
+		await f.service.command("model-search off", ctx);
+		assert.deepEqual(f.service.policy(ctx), { enabled: true, capture: true, modelAccess: false, modelWideSearch: false });
+		await f.service.command("model-search on --confirm-sensitive", ctx);
+		await f.service.command("clear --confirm-sensitive", ctx);
+		assert.deepEqual(f.service.policy(ctx), { enabled: false, capture: true, modelAccess: false, modelWideSearch: false });
+		assert.equal(existsSync(f.service.store.path), false, "switching model-search never creates the database");
+	});
+});
+
+test("session reach maps to the current session only, at search, read and session listing", async () => {
+	await fixture(async f => {
+		const main = f.context(); // sessionId "main-a"
+		const other = f.context(f.projectA, "main-b");
+		await enable(f, main);
+		f.service.capture(entry("mine-1", user("session-reach fixture zebra")), "main", main);
+		f.service.capture(entry("theirs-1", user("session-reach fixture zebra")), "main", other);
+		// Search at scope "session" finds only this session's entry.
+		const found = page(f.service.search({ query: "zebra", scope: "session" }, main, false)).records;
+		assert.deepEqual(found.map(record => record.entryId), ["mine-1"]);
+		// Reading another session's entry at scope "session" finds nothing.
+		const otherRecord = page(f.service.search({ query: "zebra" }, other, false)).records.find(record => record.entryId === "theirs-1")!;
+		assert.equal(f.service.read({ id: otherRecord.id, scope: "session" }, main, false), "No accessible archive record.");
+		assert.match(f.service.read({ id: otherRecord.id, scope: "current" }, main, false), /theirs-1|zebra/, "project reach still reaches it for the human path");
+		// Session listing without an ID resolves to the current session.
+		const listed = page(f.service.session({ scope: "session" }, main, false)).records;
+		assert.ok(listed.every(record => record.sessionId === "main-a"));
+		assert.deepEqual(listed.filter(record => record.type === "message").map(record => record.entryId), ["mine-1"]);
+	});
+});

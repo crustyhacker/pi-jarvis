@@ -11,9 +11,9 @@ import {
 import type { ArchivePolicy, ArchiveScope } from "../archive-types.js";
 
 type Scope = ArchiveScope;
-const defaults: ArchivePolicy = { enabled: false, capture: true, modelAccess: false };
-const on: ArchivePolicy = { enabled: true, capture: true, modelAccess: true };
-const off: ArchivePolicy = { enabled: false, capture: false, modelAccess: false };
+const defaults: ArchivePolicy = { enabled: false, capture: true, modelAccess: false, modelWideSearch: false };
+const on: ArchivePolicy = { enabled: true, capture: true, modelAccess: true, modelWideSearch: false };
+const off: ArchivePolicy = { enabled: false, capture: false, modelAccess: false, modelWideSearch: false };
 
 function fixture(t: TestContext) {
 	const root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "pi-jarvis-archive-config-")));
@@ -78,7 +78,7 @@ test("archive settings neither read nor overwrite legacy shared memory/model set
 	assert.deepEqual(f.policy(), { policy: { ...defaults, enabled: true }, errors: [] });
 	f.save("project", { capture: false });
 	assert.deepEqual(f.read("project"), { archive: { capture: false } });
-	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: false });
+	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: false, modelWideSearch: false });
 	f.clear("global");
 	f.clear("project");
 	assert.deepEqual(f.policy(), { policy: defaults, errors: [] });
@@ -115,10 +115,10 @@ test("capture/model access are independent; trusted projects can override defaul
 	const f = fixture(t);
 	f.save("global", { enabled: false, capture: false });
 	f.save("project", { enabled: true, capture: true, modelAccess: true });
-	assert.deepEqual(f.policy().policy, { enabled: false, capture: true, modelAccess: true });
+	assert.deepEqual(f.policy().policy, { enabled: false, capture: true, modelAccess: true, modelWideSearch: false });
 	assert.deepEqual(f.policy(false).policy, off);
 	assert.deepEqual(f.read("global"), { archive: { enabled: false, capture: false } });
-	assert.deepEqual(f.read("project"), { archive: on });
+	assert.deepEqual(f.read("project"), { archive: { enabled: true, capture: true, modelAccess: true } });
 	assert.deepEqual(fs.readdirSync(f.agentDir), ["extensions"], "disabled resolution never touches a DB path");
 	assert.deepEqual(fs.readdirSync(join(f.agentDir, "extensions")), ["pi-jarvis-archive.json"]);
 });
@@ -134,7 +134,7 @@ test("only an explicit global off is a master switch; clear removes it without m
 	assert.deepEqual(f.policy().policy, { ...defaults, enabled: true });
 	f.save("global", { capture: false, modelAccess: true });
 	assert.deepEqual(f.read("global"), { archive: { capture: false, modelAccess: true } });
-	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: true });
+	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: true, modelWideSearch: false });
 	f.save("project", { capture: true, modelAccess: false });
 	assert.deepEqual(f.policy().policy, { ...defaults, enabled: true }, "project fields can override global capture/model access independently");
 });
@@ -146,7 +146,7 @@ test("untrusted projects pause all archive but controls stay readable/manageable
 	assert.deepEqual(f.policy(false), {
 		policy: off, errors: [],
 	});
-	assert.deepEqual(f.policy().policy, { enabled: false, capture: false, modelAccess: true });
+	assert.deepEqual(f.policy().policy, { enabled: false, capture: false, modelAccess: true, modelWideSearch: false });
 	f.save("project", { enabled: true, capture: true, modelAccess: true });
 	assert.deepEqual(f.policy(false).policy, off);
 	assert.deepEqual(f.policy().policy, on, "trust restoration resumes resolved controls");
@@ -183,7 +183,7 @@ test("clear removes only this scope and restores fallback; an otherwise-empty fi
 	f.save("project", { capture: true, modelAccess: true });
 	assert.deepEqual(f.policy().policy, on);
 	f.clear("project");
-	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: false });
+	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: false, modelWideSearch: false });
 	assert.deepEqual(f.read("project"), {});
 	f.clear("global");
 	assert.deepEqual(f.policy().policy, defaults);
@@ -895,6 +895,6 @@ test("separate processes serialize partial archive changes and preserve unrelate
 	assert.deepEqual(f.read("global"), {
 		modelSelection: { mode: "follow-main" }, unknown: { keep: true }, archive: { enabled: true, capture: false, modelAccess: true },
 	});
-	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: true });
+	assert.deepEqual(f.policy().policy, { enabled: true, capture: false, modelAccess: true, modelWideSearch: false });
 	assert.deepEqual(fs.readdirSync(dirname(f.path("global"))), ["pi-jarvis-archive.json"]);
 });
