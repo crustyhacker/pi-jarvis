@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [Unreleased]
+
+### Archive search for the main agent
+- Give the model archive tools a **session reach**: `jarvis_archive_search`, `jarvis_archive_read` and `jarvis_archive_session` now default to the current session, so the main agent can recover details lost to context compaction on its own initiative without asking. `ArchiveStore.read` gains a session filter so entry IDs from other sessions cannot bypass the reach.
+- **Behaviour change:** the model tools' default scope changes from this project to this session. Wider reaches are now explicit: `scope: "current"` (other sessions of this project) or `scope: "all"` (every project), plus a foreign `sessionId`. Human `/jarvis-archive` commands are unchanged and keep defaulting to this project.
+- Gate every wider reach with one approval per request through Pi's normal tool confirmation (the Jarvis side session bridges the same prompt through its overlay, like memory-forget review). A declined or unavailable approval returns one clear sentence and executes nothing. Code cannot distinguish a user-instructed search from an agent-initiated one, so reach — not intent — is enforced; approving the prompt is the user's explicit permission.
+- Add a standing opt-in: `/jarvis-archive [--global|--project] model-search on --confirm-sensitive|off` sets `modelWideSearch` (off by default, layered project > global like model-access, shown in `/jarvis-archive status`). When on, model tools may search beyond the current session without asking; turning it off revokes already-prepared tool definitions.
+- Tool descriptions and guidance now say plainly: use these tools when something was said earlier and is no longer in context, starting with this session, not for content still in front of you.
+- Session reach follows the current Pi session ID. Compaction preserves it, but pre-fork/pre-tree history of the same conversation is outside the session reach (documented follow-up; use an approved wider reach for it).
+
 ## [1.12.1] - 2026-10-07
 
 ### Documentation
