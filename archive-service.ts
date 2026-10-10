@@ -8,10 +8,10 @@ import { ArchiveStore } from "./archive-store.js";
 import { ArchiveVault, type ArchiveVaultOptions } from "./archive-vault.js";
 import { promptArchiveSecret } from "./archive-secret-input.js";
 import { ARCHIVE_IMPORT_LIMITS, ArchiveImportFailure, discoverArchiveImports, importArchiveTranscript, type ImportAppendOutcome, type ImportCounts, type ImportInventory } from "./archive-import.js";
-import type { ArchiveInput, ArchivePage, ArchivePolicy, ArchiveScope, ArchiveSummary } from "./archive-types.js";
+import type { ArchiveInput, ArchivePage, ArchivePolicy, ArchiveScope, ArchiveSearch, ArchiveSummary } from "./archive-types.js";
 
 export type ArchiveContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted" | "sessionManager" | "ui" | "hasUI" | "mode"> & { signal?: AbortSignal };
-const OFF: ArchivePolicy = { enabled: false, capture: false, modelAccess: false };
+const OFF: ArchivePolicy = { enabled: false, capture: false, modelAccess: false, modelWideSearch: false };
 const ENCRYPTION_HELP = `Archive encryption (agent-wide; independent of recording/model access):
 /jarvis-archive encryption [status]
 /jarvis-archive encryption on|off|cleanup --confirm-sensitive --confirm-stopped
@@ -32,6 +32,8 @@ const HELP = `Full-session archive (separate from shared memory; defaults OFF):
 /jarvis-archive [--global|--project] capture on|off
 /jarvis-archive [--global|--project] model-access on --confirm-sensitive
 /jarvis-archive [--global|--project] model-access off
+/jarvis-archive [--global|--project] model-search on --confirm-sensitive
+/jarvis-archive [--global|--project] model-search off
 /jarvis-archive search [--all] [--offset N] <words>
 /jarvis-archive read [--all] [--metadata] <record-id> [character-offset]
 /jarvis-archive session [--all] <session-id> [record-offset]
@@ -43,7 +45,7 @@ const HELP = `Full-session archive (separate from shared memory; defaults OFF):
 /jarvis-archive import-report REPORT_ID [file offset]
 /jarvis-archive forget-session [--all] --confirm <session-id>
 /jarvis-archive prune [--all] --confirm <ISO timestamp>
-Controls default GLOBAL; an explicit global off is a master switch. Data defaults to this project. Full off blocks even record inspection; capture off leaves inspection available. Model tools are separately opt-in and read-only. Import is human-only, v3 JSONL; partial imports are reported. import-all previews recursive regular single-link .jsonl files (default: active agent directory/sessions) using metadata only. A sensitive confirmation and one-use preview token are required within 10 minutes; only reviewed files are imported sequentially, never added files. Discovery rejects unreadable/incomplete/over-limit scans (10,000 candidates, 50,000 visited entries, depth 64, 8 MiB inventory). Nested links, hardlinks and nonregular files are skipped. Reviewed directory identities/opened file metadata are checked and bulk reads stop at reviewed sizes; concurrent mutation checks are best effort, not a filesystem sandbox. import-cancel works even OFF. import-report pages the latest ephemeral same-project/session report while enabled (capture/model access may be off). clear removes settings, never data; acknowledgment is required because fallback can re-enable recording/model access. Accepted entries are preserved without truncation (64 MiB raw-entry/index budgets; 64K UTF-16 normalization-context limit); rejected entries are reported, not silently shortened. Use read pagination to reconstruct raw JSON; offsets are Unicode codepoints. No automatic recall or external file dereferencing.`;
+Controls default GLOBAL; an explicit global off is a master switch. Data defaults to this project. Full off blocks even record inspection; capture off leaves inspection available. Model tools are separately opt-in and read-only; they default to this session, and wider reaches (other sessions or projects) need per-request user approval or model-search. Session reach follows the current Pi session ID, so pre-fork/pre-tree history is outside it. Import is human-only, v3 JSONL; partial imports are reported. import-all previews recursive regular single-link .jsonl files (default: active agent directory/sessions) using metadata only. A sensitive confirmation and one-use preview token are required within 10 minutes; only reviewed files are imported sequentially, never added files. Discovery rejects unreadable/incomplete/over-limit scans (10,000 candidates, 50,000 visited entries, depth 64, 8 MiB inventory). Nested links, hardlinks and nonregular files are skipped. Reviewed directory identities/opened file metadata are checked and bulk reads stop at reviewed sizes; concurrent mutation checks are best effort, not a filesystem sandbox. import-cancel works even OFF. import-report pages the latest ephemeral same-project/session report while enabled (capture/model access may be off). clear removes settings, never data; acknowledgment is required because fallback can re-enable recording/model access. Accepted entries are preserved without truncation (64 MiB raw-entry/index budgets; 64K UTF-16 normalization-context limit); rejected entries are reported, not silently shortened. Use read pagination to reconstruct raw JSON; offsets are Unicode codepoints. No automatic recall or external file dereferencing.`;
 
 const encode = (value: unknown) => JSON.stringify(value).replace(/[<>\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const integer = (value: number | undefined, fallback: number, max: number) => {
@@ -217,23 +219,31 @@ export class SharedArchiveService {
 		if (!current.enabled || !current.capture || this.epoch !== epoch || ctx.sessionManager.getSessionId() !== sessionId) return;
 		this.executeStore(ctx, store => store.append({ project, sessionId, lane, entry: entry as ArchiveInput["entry"] }));
 	}
-	search(params: { query: string; scope?: "current" | "all"; sessionId?: string; offset?: number; limit?: number }, ctx: ArchiveContext, model = true): string {
+	search(params: { query: string; scope?: "session" | "current" | "all"; sessionId?: string; offset?: number; limit?: number }, ctx: ArchiveContext, model = true): string {
 		this.require(ctx, model);
 		if (typeof params.query !== "string" || !params.query.trim() || [...params.query].length > 512) throw new Error("Archive search needs 1–512 characters.");
 		this.scope(params.scope);
 		const offset = integer(params.offset, 0, Number.MAX_SAFE_INTEGER);
 		const limit = integer(params.limit, 20, 50);
 		if (!limit) throw new Error("Archive page limit must be positive.");
-		return this.page(this.executeStore(ctx, store => store.search({ ...params, project: this.project(ctx.cwd), offset, limit })), offset);
+		// "session" is the model tools' default reach: this project, this session only.
+		const { scope, ...rest } = params;
+		const request: ArchiveSearch = { ...rest, project: this.project(ctx.cwd), offset, limit };
+		if (scope === "session") { request.scope = "current"; request.sessionId = request.sessionId ?? ctx.sessionManager.getSessionId(); }
+		else request.scope = scope === "all" ? "all" : "current";
+		return this.page(this.executeStore(ctx, store => store.search(request)), offset);
 	}
-	read(params: { id: string; scope?: "current" | "all"; offset?: number; limit?: number; part?: "entry" | "metadata" }, ctx: ArchiveContext, model = true): string {
+	read(params: { id: string; scope?: "session" | "current" | "all"; offset?: number; limit?: number; part?: "entry" | "metadata" }, ctx: ArchiveContext, model = true): string {
 		this.require(ctx, model); this.scope(params.scope);
 		if (params.part !== undefined && params.part !== "entry" && params.part !== "metadata") throw new Error("Invalid archive read part.");
 		const offset = integer(params.offset, 0, Number.MAX_SAFE_INTEGER);
 		const limit = integer(params.limit, 4000, 12000);
 		if (!limit) throw new Error("Archive read limit must be positive.");
 		const metadata = params.part === "metadata";
-		const record = this.executeStore(ctx, store => store.read(params.id, this.project(ctx.cwd), params.scope === "all", metadata ? 0 : offset, metadata ? 1 : limit));
+		// A "session" reach must constrain reads by session too, or entry IDs
+		// from other sessions would bypass the reach gate entirely.
+		const sessionId = params.scope === "session" ? ctx.sessionManager.getSessionId() : undefined;
+		const record = this.executeStore(ctx, store => store.read(params.id, this.project(ctx.cwd), params.scope === "all", metadata ? 0 : offset, metadata ? 1 : limit, sessionId));
 		if (!record) return "No accessible archive record.";
 		if (metadata) {
 			const points = [...JSON.stringify(record.record)];
@@ -251,16 +261,19 @@ export class SharedArchiveService {
 		if (Buffer.byteLength(encode(record)) > 24_000) throw new Error("Archive metadata exceeds the output budget.");
 		return UNTRUSTED + encode(record);
 	}
-	session(params: { sessionId: string; scope?: "current" | "all"; offset?: number; limit?: number }, ctx: ArchiveContext, model = true): string {
+	session(params: { sessionId?: string; scope?: "session" | "current" | "all"; offset?: number; limit?: number }, ctx: ArchiveContext, model = true): string {
 		this.require(ctx, model); this.scope(params.scope);
 		const offset = integer(params.offset, 0, Number.MAX_SAFE_INTEGER);
 		const limit = integer(params.limit, 20, 50);
 		if (!limit) throw new Error("Archive page limit must be positive.");
-		return this.page(this.executeStore(ctx, store => store.session(params.sessionId, this.project(ctx.cwd), params.scope === "all", offset, limit)), offset);
+		// Without an explicit session ID, the model tools' default reach is the
+		// current session; an explicit foreign ID is a wider, gated reach.
+		const sessionId = params.sessionId ?? ctx.sessionManager.getSessionId();
+		return this.page(this.executeStore(ctx, store => store.session(sessionId, this.project(ctx.cwd), params.scope === "all", offset, limit)), offset);
 	}
 	status(ctx: ArchiveContext): string {
 		const { policy, configured, trusted } = this.observePolicy(ctx);
-		return `Full-session archive ${configured.enabled ? "ON" : "OFF"}; capture ${configured.capture ? "on" : "off"}; model access ${configured.modelAccess ? "on" : "off"}; effective access ${policy.enabled ? "available" : "paused"}${trusted ? "" : " (untrusted project: all access paused)"}.\n${this.vault.description()}\nGlobal settings: ${encode(archiveConfigPath(ctx.cwd, this.agentDir, "global"))}\nProject settings: ${encode(archiveConfigPath(ctx.cwd, this.agentDir, "project"))}\nSeparate from memory and Repo tools. /jarvis-archive help for controls. ${policy.enabled ? "Unredacted journal data; manual retention. Model access is explicit, not automatic recall." : "Data retained; archive-record reads/writes paused."}`;
+		return `Full-session archive ${configured.enabled ? "ON" : "OFF"}; capture ${configured.capture ? "on" : "off"}; model access ${configured.modelAccess ? "on" : "off"}; model-search ${configured.modelWideSearch ? "on" : "off"}; effective access ${policy.enabled ? "available" : "paused"}${trusted ? "" : " (untrusted project: all access paused)"}.\n${this.vault.description()}\nGlobal settings: ${encode(archiveConfigPath(ctx.cwd, this.agentDir, "global"))}\nProject settings: ${encode(archiveConfigPath(ctx.cwd, this.agentDir, "project"))}\nSeparate from memory and Repo tools. /jarvis-archive help for controls. ${policy.enabled ? "Unredacted journal data; manual retention. Model access is explicit, not automatic recall. Model tools default to this session; wider reaches need per-request approval or model-search." : "Data retained; archive-record reads/writes paused."}`;
 	}
 	/** Human command surface only. Never exposed as a model tool. */
 	async command(args: string, ctx: ArchiveContext): Promise<string> {
@@ -281,15 +294,15 @@ export class SharedArchiveService {
 			if (tokens.length || leadingScope) throw new Error(HELP);
 			return action === "help" ? HELP + "\n\n" + ENCRYPTION_HELP + "\n\n" + ARCHIVE_WARNING : this.status(ctx);
 		}
-		if (["on", "off", "clear", "capture", "model-access"].includes(action)) {
-			const value = action === "capture" || action === "model-access" ? tokens.shift() : action;
-			if ((action === "capture" || action === "model-access") && value !== "on" && value !== "off") throw new Error(HELP);
-			const sensitive = action === "on" || action === "clear" || (action === "model-access" && value === "on");
+		if (["on", "off", "clear", "capture", "model-access", "model-search"].includes(action)) {
+			const value = action === "capture" || action === "model-access" || action === "model-search" ? tokens.shift() : action;
+			if ((action === "capture" || action === "model-access" || action === "model-search") && value !== "on" && value !== "off") throw new Error(HELP);
+			const sensitive = action === "on" || action === "clear" || ((action === "model-access" || action === "model-search") && value === "on");
 			if (sensitive && (tokens.length !== 1 || tokens[0] !== "--confirm-sensitive")) throw new Error(ARCHIVE_WARNING);
 			if (!sensitive && tokens.length) throw new Error(HELP);
 			if (sensitive) { this.notice(ctx, ARCHIVE_WARNING, "warning"); this.announced = true; }
 			if (action === "clear") clearArchivePolicy(ctx.cwd, this.agentDir, scope);
-			else saveArchivePolicy(ctx.cwd, this.agentDir, scope, { [action === "capture" ? "capture" : action === "model-access" ? "modelAccess" : "enabled"]: value === "on" });
+			else saveArchivePolicy(ctx.cwd, this.agentDir, scope, { [action === "capture" ? "capture" : action === "model-access" ? "modelAccess" : action === "model-search" ? "modelWideSearch" : "enabled"]: value === "on" });
 			this.invalidate();
 			return `${scope} archive settings updated.\n${this.status(ctx)}`;
 		}
@@ -501,7 +514,7 @@ export class SharedArchiveService {
 	private project(cwd: string): string {
 		try { return realpathSync(cwd); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolve(cwd); throw new Error("Cannot resolve archive project directory safely."); }
 	}
-	private scope(scope: string | undefined): void { if (scope !== undefined && scope !== "current" && scope !== "all") throw new Error("Invalid archive scope."); }
+	private scope(scope: string | undefined): void { if (scope !== undefined && scope !== "session" && scope !== "current" && scope !== "all") throw new Error("Invalid archive scope."); }
 	private page(page: ArchivePage, offset: number): string {
 		page.records = page.records.map(displaySummary);
 		while (Buffer.byteLength(encode(page)) > 24_000 && page.records.length) {
