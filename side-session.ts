@@ -532,6 +532,9 @@ export class JarvisSideSessionRuntime {
 					registerFinalSnapshot: (snapshot) => { this.archiveFinalSnapshot = snapshot; },
 					isProjectTrusted: () => !this.lifetime.signal.aborted && (options.archiveTrustProvider?.() ?? options.projectTrusted ?? false),
 					onToolsChanged: () => this.syncActiveTools?.(),
+					// ctx.ui.confirm is unavailable in the isolated side SDK session; bridge
+					// the same per-request reach approval into the overlay, like confirmForget.
+					confirmReach: (title, detail, signal) => this.bridge.requestConfirmation(title, detail, signal),
 				})] : []),
 				// Permission preflight is registered BEFORE native await/connect hooks.
 				this.nativeMcp.extensionFactory,

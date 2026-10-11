@@ -9,7 +9,7 @@ import type { ArchivePolicy, ArchiveScope } from "./archive-types.js";
 
 type Scope = ArchiveScope;
 type Config = Record<string, unknown>;
-const FIELDS = ["enabled", "capture", "modelAccess"] as const;
+const FIELDS = ["enabled", "capture", "modelAccess", "modelWideSearch"] as const;
 const CONFIG_LIMIT_BYTES = 1024 * 1024;
 const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 20;
@@ -42,9 +42,9 @@ export function resolveArchivePolicy(cwd: string, agentDir: string, trusted = tr
 	};
 	const global = read("global");
 	const project = read("project");
-	if (errors.length || !trusted) return { policy: { enabled: false, capture: false, modelAccess: false }, errors };
+	if (errors.length || !trusted) return { policy: { enabled: false, capture: false, modelAccess: false, modelWideSearch: false }, errors };
 
-	const base: ArchivePolicy = { enabled: false, capture: true, modelAccess: false, ...global };
+	const base: ArchivePolicy = { enabled: false, capture: true, modelAccess: false, modelWideSearch: false, ...global };
 	const policy: ArchivePolicy = { ...base, ...project };
 	// Only explicit global enabled=false is a master switch; other fields remain independent preferences.
 	if (global.enabled === false) policy.enabled = false;

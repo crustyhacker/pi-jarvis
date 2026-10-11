@@ -659,12 +659,12 @@ export class ArchiveStore {
 		return { records: rows.slice(0, size).map(summary), nextOffset: rows.length > size ? start + size : null };
 	}
 
-	read(id: string, currentProject: string, all = false, start = 0, size = 12_000): ArchiveRead | undefined {
+	read(id: string, currentProject: string, all = false, start = 0, size = 12_000, sessionId?: string): ArchiveRead | undefined {
 		validId(id); flags(currentProject, all); offset(start); size = limit(size, ARCHIVE_STORE_LIMITS.read);
 		if (!this.existing()) return undefined;
 		const row = this.prepare(`SELECT ${COLUMNS},characters,substr(raw_json,min(?,characters)+1,?) AS content,
-			CAST(substr(raw_json,min(?,characters)+1,?) AS BLOB) AS content_bytes FROM records r WHERE r.id=?${all ? "" : " AND r.project=?"}`)
-			.get(start, size, start, size, id, ...(all ? [] : [currentProject]));
+			CAST(substr(raw_json,min(?,characters)+1,?) AS BLOB) AS content_bytes FROM records r WHERE r.id=?${all ? "" : " AND r.project=?"}${sessionId !== undefined ? " AND r.session_id=?" : ""}`)
+			.get(start, size, start, size, id, ...(all ? [] : [currentProject]), ...(sessionId !== undefined ? [sessionId] : []));
 		if (!row) return undefined;
 		const record = summary(row);
 		const total = Number(row.characters);

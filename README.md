@@ -22,7 +22,7 @@ Your main Pi session stays on the job. **Jarvis gives you room to investigate, r
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.12.1</p>
+<p><strong>Current version:</strong> 1.13.0</p>
 
 ```bash
 pi install npm:pi-jarvis
@@ -310,7 +310,7 @@ Removes the selected scope so `/jarvis` thinking falls back through the remainin
 Reports shared-memory status. Use `/jarvis-memory editor` for the curated-note TUI editor, or `/jarvis-memory help` for controls and inline data-management commands. Memory controls default to **global**, unlike model/thinking controls. See [Shared memory](#shared-memory) below.
 
 ### `/jarvis-archive`
-Reports the separate full-session archive's status. It defaults **OFF**, with independent capture, model-access and optional encryption controls. `/jarvis-archive help` documents enablement warnings, paging, explicit import, deletion and human-only encryption administration. See [Full-session archive](#full-session-archive).
+Reports the separate full-session archive's status. It defaults **OFF**, with independent capture, model-access, model-search and optional encryption controls. `/jarvis-archive help` documents enablement warnings, paging, explicit import, deletion and human-only encryption administration. See [Full-session archive](#full-session-archive).
 
 ### Side-session commands inside `/jarvis`
 The `/jarvis` input handles a small set of built-in commands against the isolated side-session:
@@ -339,18 +339,19 @@ These examples opt into recording; they are **not encrypted-first setup**. If yo
 /jarvis-archive --project on --confirm-sensitive    # record here only
 /jarvis-archive on --confirm-sensitive              # enable globally
 /jarvis-archive model-access on --confirm-sensitive # allow model search/read; recording alone doesn't
+/jarvis-archive model-search on --confirm-sensitive # allow model tools beyond this session without asking
 /jarvis-archive capture off                         # pause recording default, retain access
 /jarvis-archive off                                 # global MASTER OFF; keep stored data
 /jarvis-archive clear --confirm-sensitive           # remove global settings; fallback may re-enable
 ```
 
-Controls default to **global**; use `--project` for an override. Resolution is per-field project > global > defaults (`enabled: false`, `capture: true`, `modelAccess: false`), except an **explicit global off overrides every project**. `capture off` and `model-access off` set defaults that a project can override; inspect effective status. Use `clear --confirm-sensitive` to remove a scoped setting, never data. Malformed/unreadable settings and untrusted projects pause **all** archive access. Full off blocks even manual record inspection; recording-only/model-only pauses do not prevent explicit human reads. Separate files avoid interfering with memory/model settings:
+Controls default to **global**; use `--project` for an override. Resolution is per-field project > global > defaults (`enabled: false`, `capture: true`, `modelAccess: false`, `modelWideSearch: false`), except an **explicit global off overrides every project**. `capture off`, `model-access off` and `model-search off` set defaults that a project can override; inspect effective status. Use `clear --confirm-sensitive` to remove a scoped setting, never data. Malformed/unreadable settings and untrusted projects pause **all** archive access. Full off blocks even manual record inspection; recording-only/model-only pauses do not prevent explicit human reads. Separate files avoid interfering with memory/model settings:
 
 - Global: `<active-agent-dir>/extensions/pi-jarvis-archive.json`
 - Project: `.pi/jarvis-archive.json`
-- Shape: `{ "archive": { "enabled": true, "capture": true, "modelAccess": false } }`
+- Shape: `{ "archive": { "enabled": true, "capture": true, "modelAccess": false, "modelWideSearch": false } }`
 
-Enabling/model-access commands require the literal warning acknowledgment, and direct-file enablement shows a first-use warning. **This archive is unredacted, PLAINTEXT by default, and may retain passwords, tokens, private files, and sensitive tool output.** Optional password encryption protects only its active database, index and SQLite journals; original Pi transcripts, shared memory and retained plaintext sources/backups remain outside that protection. Model access can send retrieved data to the active provider even when storage is encrypted. Neither mode is a sandbox or a substitute for carefully managing secrets. Review [safe encryption setup](#safe-initial-setup) **before** enabling if you want to avoid new plaintext archive captures.
+Enabling/model-access/model-search-on commands require the literal warning acknowledgment, and direct-file enablement shows a first-use warning. **This archive is unredacted, PLAINTEXT by default, and may retain passwords, tokens, private files, and sensitive tool output.** Optional password encryption protects only its active database, index and SQLite journals; original Pi transcripts, shared memory and retained plaintext sources/backups remain outside that protection. Model access can send retrieved data to the active provider even when storage is encrypted. Neither mode is a sandbox or a substitute for carefully managing secrets. Review [safe encryption setup](#safe-initial-setup) **before** enabling if you want to avoid new plaintext archive captures.
 
 ### What “full” means
 
@@ -372,6 +373,8 @@ Recording begins after an activation baseline, never by importing pre-existing e
 ```
 
 Search/session pages return bounded excerpts of normalized indexing text with IDs, project, lane, timestamps and parent entry IDs. Excerpts are not exact quotations; use `read` for original case and content. Follow `nextOffset` to continue. Exceptionally large/escape-heavy provenance is explicitly labeled with `abbreviated` field names, never allowed to block record access; `read --metadata` (model tool `part: "metadata"`) pages the exact original metadata. `read` returns complete raw JSON **through pages**; its offsets count Unicode codepoints, not bytes or UTF-16 units. Results are bounded to 24,000 bytes of JSON plus an untrusted-data notice; stored payloads are not shortened. Use explicit `--all` to access other projects. Models get only three read-only tools—`jarvis_archive_search`, `jarvis_archive_read`, and `jarvis_archive_session`—when model access is enabled. No model controls, import, or deletion tools exist. Tools recheck current permissions/trust/cancellation and reject stale definitions.
+
+**Model-tool reach.** The model tools default to the **current session**, so the main agent can recover details that were said earlier and lost to compaction without asking. Any wider reach—other sessions of this project (`scope: "current"`) or other projects (`scope: "all"`)—asks for one approval per request through Pi's normal confirmation prompt (the Jarvis side asks through its overlay) unless the standing `model-search` setting is enabled; a declined or unavailable approval refuses with one sentence and executes nothing. Session reach follows the current Pi session ID: compaction keeps it, but pre-fork/pre-tree history of the same conversation is outside it (a known follow-up; use an approved wider reach for that). Human `/jarvis-archive search/read/session` commands are unaffected and keep defaulting to this project.
 
 Global accessibility is within the **same active Pi agent directory**, not cloud sync or other users' machines. Project controls govern operations initiated here; existing records from a paused project remain accessible through explicit all-project queries from another allowed project. Disabling is not deletion. Returned model-tool results persist normally in Pi and can be captured again as part of a later journal entry.
 
