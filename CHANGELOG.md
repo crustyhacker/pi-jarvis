@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.14.0] - 2026-10-11
+
+### Optional main-session watchers
+- Promote idle-agent watchers on the GitHub landing page alongside shared memory and the existing toolkit; keep off-by-default controls, local repeat-path limitations and wake-up costs explicit.
+- Add off-by-default `jarvis_watcher_set`, `jarvis_watcher_list`, and `jarvis_watcher_cancel` for main only. Wait for a command predicate, a regular-file newline count, or bounded recursive metadata quiet without model polling; wake with met, timed out, or check failed, last output and a required nonempty agent note.
+- Add independent scoped watcher settings and local `/jarvis-watchers` status/cancel/on/off/clear/set controls, overlay-local `/watchers` interception, main footer visibility and `/jarvis status` summaries. Keep existing memory/archive, Repo tools and bridge defaults unchanged.
+- Present watcher launch/progress/final results as compact semantic-accent blocks: plain-language condition, interval/time limit, cwd and full-command line count; Pi's normal Ctrl+O expands/collapses the exact immutable command. No bash override or approval/execution changes; inspected Pi hosts do not render a separate nested-bash transcript row.
+- Use supported launch-time nested bash execution for permission hooks. Denial or unverifiable/changed launch arguments refuse registration. Later repeats run locally through `pi.exec` with the byte-identical fully displayed command and cwd, including the bounded foreground supervisor. Repeats do not use bash hooks, custom backends, prefixes, result redactors or session environment; this is bounded launch-time permission, not a sandbox.
+- Preserve session snapshots and notes across compaction. Stop jobs at main lifecycle boundaries; resume reports lost/overdue without restarting or backfilling checks. Queue displayed extension notifications as follow-ups while busy; label them explicitly as not user-authored and carrying no user approval. Deliver certainly unsent pending completions on resume with their original reason; report submitted-but-unobserved sends as uncertain without automatic retry.
+- Register watcher lifecycle handlers after the existing Jarvis/memory/archive handlers, preserving synchronous owner and queue invalidation with watchers off. Coordinate launch review and pending notification admission with Jarvis-owned modal/private input. Document POSIX/local Linux validation, metadata-observation races, best-effort process cleanup and lack of crash-safe delivery acknowledgements. Add fake-clock and disposable local/SDK fixture tests.
+
 ## [1.13.1] - 2026-10-10
 
 ### Curated memory editor usability

@@ -4,17 +4,19 @@
 
 <img src="https://raw.githubusercontent.com/crustyhacker/pi-jarvis/main/docs/assets/jarvis-logo.svg" alt="JARVIS — Pi / A second lane of thought. Cyan, violet, and pink ASCII chrome." width="720">
 
-## Remember more. Explore in parallel. Stay in control.
+## Remember more. Wait less. Stay in control.
 
-**Persistent shared memory—with an editor you control. A second lane of thought. A searchable past.**
+**Memory you can edit. A second lane of thought. Watchers that wake an idle agent. A searchable past.**
 
 Your main Pi session stays on the job. **Jarvis gives you room to investigate, remember and act**—without turning every side question into a change of plan. Open a polished conversation overlay, choose its model and thinking level, and let assigned work continue when you close the window.
 
 **The payoff compounds across sessions.** Main Pi and Jarvis share saved preferences, corrections and project decisions—even if you never open the overlay. **Now you can open the [curated memory editor](#edit-what-pi-remembers), inspect the saved facts and correct them yourself.** Add the optional history archive to search recorded conversations and tool activity, import existing Pi chats after review, and optionally encrypt the active archive.
 
-**Power is explicit:** opt-in local tools + native MCP, quiet notes to main, and redirects that require your confirmation. [See the whole toolkit](#at-a-glance) · [Try memory in a minute](#memory-in-60-seconds).
+**New in 1.14.0: stop babysitting slow work.** Set an optional [watcher](#main-session-watchers) for a file, a shell predicate, or a path going quiet, then let main Pi finish its turn. When the condition is met—or the wait times out or fails—the extension wakes the agent with the result and its own next-step note. **No model polling while it waits.**
 
-**Know the defaults:** shared memory is **on in trusted projects**, stored in **local plaintext**, and recalled facts can reach your active model. The separate archive, archive encryption and three tool/bridge grants start **off**. Memory retrieval needs no embeddings or background model jobs. [Privacy and controls](#two-complementary-memory-features).
+**Power is explicit:** opt-in watchers, local tools + native MCP, quiet notes to main, and redirects that require your confirmation. [See the whole toolkit](#at-a-glance) · [Try memory in a minute](#memory-in-60-seconds).
+
+**Know the defaults:** shared memory is **on in trusted projects**, stored in **local plaintext**, and recalled facts can reach your active model. Watchers, the separate archive, archive encryption and three tool/bridge grants start **off**. Memory retrieval needs no embeddings or background model jobs. [Privacy and controls](#two-complementary-memory-features).
 
 [![CI](https://img.shields.io/github/actions/workflow/status/crustyhacker/pi-jarvis/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/crustyhacker/pi-jarvis/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/pi-jarvis?style=for-the-badge&color=7c3aed)](https://www.npmjs.com/package/pi-jarvis)
@@ -22,13 +24,13 @@ Your main Pi session stays on the job. **Jarvis gives you room to investigate, r
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.13.1</p>
+<p><strong>Current version:</strong> 1.14.0</p>
 
 ```bash
 pi install npm:pi-jarvis
 ```
 
-[Install](#quick-start) · [Memory editor](#edit-what-pi-remembers) · [Shared memory](#shared-memory) · [Search & import](#full-session-archive) · [Encryption](#optional-archive-encryption) · [TUI controls](#overlay-controls) · [Native MCP](#native-mcp)
+[Install](#quick-start) · [Watchers](#main-session-watchers) · [Memory editor](#edit-what-pi-remembers) · [Shared memory](#shared-memory) · [Search & import](#full-session-archive) · [Encryption](#optional-archive-encryption) · [TUI controls](#overlay-controls) · [Native MCP](#native-mcp)
 
 <p>
   <strong>Shared persistent memory</strong> ·
@@ -39,12 +41,68 @@ pi install npm:pi-jarvis
   <strong>Persistent side session</strong> ·
   <strong>Live main-session context</strong> ·
   <strong>Background task continuity</strong> ·
+  <strong>Idle-agent wake-up watchers</strong> ·
   <strong>In-window model + thinking selection</strong> ·
   <strong>Opt-in local tools + native MCP</strong> ·
   <strong>Confirmed redirects</strong>
 </p>
 
 </div>
+
+## Main-session watchers
+
+**Wait without model polling.** Version 1.14.0 adds optional main-agent watchers: a short check runs on an extension timer; the agent can finish its turn and be woken when the condition is met, the deadline expires, or checking fails. No model calls are made while waiting. The wake-up itself starts a model turn and can therefore cost tokens.
+
+Watchers start **off** and are independent of shared memory, archive controls, Jarvis Repo tools, Note main and Redirect. Enable them yourself in a trusted project:
+
+```text
+/jarvis-watchers on                         # global default
+/jarvis-watchers --project on               # this project's override
+/jarvis-watchers status
+/jarvis-watchers cancel <id>
+/jarvis-watchers off                        # explicit global master-off
+/jarvis-watchers --project clear            # remove controls; fallback may enable
+/jarvis-watchers --global set maxWatchers 3
+```
+
+`on`, `off`, `clear` and `set` default to global scope. Global settings live at `<agentDir>/extensions/pi-jarvis-watchers.json`; project overrides live at `.pi/jarvis-watchers.json`, under `watchers`. Per-field project > global > defaults applies, except explicit global `enabled=false` blocks project on. Invalid settings or denied/throwing project trust stop execution. Setting writes use a separate cooperative lock and atomic replacement; malformed files need manual repair, and contended/uncertain writes are not automatically retried. `clear` removes settings, not transcript history. Numeric settings have validated hard ceilings; see `watchers-config.ts`.
+
+| Setting | Default |
+|---|---:|
+| `enabled` | `false` |
+| `minIntervalSeconds` | `10` |
+| `maxTimeoutSeconds` | `21600` (six hours) |
+| `maxWatchers` | `5` |
+| `maxCheckSeconds` | `20` |
+| `outputTailChars` | `500` |
+| `maxDirectoryEntries` | `2000` (including the root) |
+
+The main model gets `jarvis_watcher_set`, `jarvis_watcher_list`, and `jarvis_watcher_cancel` when enabled. The setting tool requires a **nonempty label and nonempty agent note**, plus `condition` and `timeoutSeconds`; optional `intervalSeconds` and `checkTimeoutSeconds` must respect the effective limits. The note should say what the agent was waiting for and what it intended to do next, so a wake-up remains useful after compaction. Excess requests are refused, not silently clamped. A configured limit change cancels incompatible existing watchers instead of changing their approved commands.
+
+Conditions:
+- `{ "kind": "command", "command": "test -e build.done" }`: a short foreground POSIX shell predicate. Exit **0 = met**, **1 = not yet**; other exits, signals, launch failures and check-runtime expiry end it as **check failed**. Do not launch background work or request interactive input.
+- `{ "kind": "file_lines", "path": "build.log", "minLines": 100 }`: at least 100 newline (`LF`) characters in a regular file. A missing file is **not yet**; other read errors fail. File contents are counted, not printed.
+- `{ "kind": "path_quiet", "path": "logs", "quietMinutes": 5 }`: no observed metadata change for five minutes, measured from the first inventory and reset by changes. Uses a bounded recursive inventory of names, identities, modes, sizes and modification/change timestamps; symlink targets are not deliberately followed. The root and its ancestors must not be symlinks. Missing/unreadable paths fail. An inventory over the configured entry cap, depth 64 or approximately 8 MiB of metadata is refused at setup (and fails an already-running check). There is no filesystem snapshot: races and changes between samples can escape observation. Quiet does **not** prove successful completion.
+
+### Launch-time permission, not per-repeat permission
+
+**Watcher launch/progress and final-result blocks are compact by default.** They show the label, condition in plain words, interval/time limit, cwd and full-command line count. Use Pi's normal **Ctrl+O** tool expansion to show or hide the **entire byte-identical supervised execution command**, without abbreviation, reformatting or line numbering. The block uses the theme's semantic `accent` colour, not added-code/success green or a hard-coded palette; existing expansion preferences and keybinding customizations remain respected. Pi 1.0.0/1.1.0 does not render the nested bash launch as a separate transcript row (`parentToolCallId`); it remains represented by the same expandable watcher block. Hooks and permission prompts still receive the full unchanged command, never the collapsed display. The first check runs through the main session's normal `bash` tool via `ctx.executeTool` **inside** `jarvis_watcher_set`. Bash permission hooks can deny it; denial refuses the watcher and schedules nothing. A changed command/timeout or an unavailable/unverifiable result also refuses registration. Pi itself does not prompt before every bash command: the user's configured hooks decide whether approval is needed.
+
+After a permitted launch, the extension repeats the **byte-identical command, including its bounded foreground supervisor, in the same cwd**, through `pi.exec("/bin/sh", ["-c", command], ...)`. The command and its limits are fixed for that watcher. **Repeats do not pass through bash hooks, custom backends, prefixes or session environment.** They execute locally and do not inherit the isolation or environment of a remote/container/custom bash backend. They do not run its result-redaction hooks either. Choose predicates appropriate for local repeat execution; if you require fresh approval, backend isolation or redaction on every check, do not enable this fallback. Pi exposes no documented idle bash-tool dispatcher in the inspected 1.0.0/1.1.0 APIs; [the source investigation](docs/watchers-host-investigation.md) explains the choice.
+
+The included supervisor bounds retained output and attempts to kill its check's process group on runtime expiry or cancellation. Raw `pi.exec` alone is not a reliable hard output/process-tree limiter; the supervisor is part of the displayed command from the first launch onward. Checks use `/bin/sh`; this version refuses Windows hosts. Runtime validation is local Linux only. There is no sandbox, CPU/memory quota, rollback, or absolute cleanup guarantee for hostile commands. Host SIGKILL and deliberately escaped/daemonized descendants remain outside the cleanup promise. The supervisor's parent pipe helps stop its worker on parent death but is best effort. Successful checks also clean up their supervised group.
+
+### Visibility, lifecycle and honest delivery limits
+
+The main footer shows active/pending watchers; `/jarvis-watchers status` and `/jarvis status` show their conditions, elapsed times, deadlines, notes and delivery state. Cancel by ID yourself. Overlay `/watchers …` and `/jarvis-watchers …` are intercepted locally without side boot, provider work or queueing. A launch review blocks admission of Jarvis-owned modal/private inputs; existing modal/private input pauses new checks and holds notices until it ends. The deadline still advances. Ordinary closing/reopening Jarvis does not stop main watchers. `/jarvis stop` and `/jarvis access off` retain their side-only meanings.
+
+A fired watcher produces a displayed **extension-authored custom message**, expressly **not typed by the user and carrying no user approval or new permissions**, with reason, last output tail/omission flag, elapsed time and the agent's note. Command output and notes are untrusted data. Pi converts custom message content to user-role text for providers; the label is not a separate cryptographically authenticated provider role. It cannot make model confusion literally impossible. Output and notes are stored in the ordinary session and can reach the model/provider; do not put secrets in predicates, their output or notes. This feature is not archive encryption.
+
+If main is idle, the message starts a turn. If main is busy, it is a **follow-up**, not steering: it waits until the current pending work would finish. Normal execution submits one notification per watcher. Pi's extension send API has no delivery acknowledgement; a crash or host failure between saving state and delivery can leave an **uncertain** notice. Such sends are not automatically retried. A finished watcher's still-`pending` notice was certainly not submitted and is delivered on resume with its original met/timed out/check failed reason when policy and admission permit. Only a `submitted` notice missing from the active branch becomes uncertain. Cancellation can discard an unsent notice, not retract one already handed to Pi or undo command effects.
+
+Watcher snapshots use custom entries on the active session branch, separate from model context. **Compaction does not stop live checks or erase their notes.** Quit/reload/main-session replacement and tree/fork boundaries stop checking and abort owned work. No watcher daemon runs while Pi is closed. On resume, unfinished waits are reported with their notes as **lost**, or **overdue** when their wall-clock deadline has passed; the condition's outcome is unknown, and no check is restarted or backfilled. Historical jobs are never silently resurrected by tree/fork navigation. A fork has a different session ID and does not copy watcher jobs. If watchers are off, recovery notices are suppressed but stored summaries remain inspectable. `--no-session` runs cannot be recovered after exit. Stored state and output limits are not a hard disk quota; original session entries are never truncated.
+
+Version one mounts watcher tools **only in main**, never in Jarvis. It does not change existing tool, memory, archive, model/thinking, bridge, renderer or theme defaults.
 
 ## Edit what Pi remembers
 
@@ -178,19 +236,21 @@ Both work across main Pi and Jarvis, independently of **Repo tools** and whether
 | **[Optional archive encryption](#optional-archive-encryption)** | Protect the active archive database, index and SQLite journals. Choose session, process, fixed-duration, idle or OS-backed remembered unlock. |
 | **[A persistent second lane](#session-behavior)** | Investigate, brainstorm or get a second opinion in an isolated side conversation with restorable history. Side `/compact`, `/tree` and `/new` leave the main conversation alone. |
 | **[Main-session context](#how-it-fits-into-pi)** | See a deterministic main-session summary and bounded recent changes instead of manually pasting every update. |
+| **[Main-session watchers](#main-session-watchers)** | Let the agent wait without polling the model. Bounded local checks wake it with met/timed-out/check-failed results and its saved note; file creation and quiet paths are supported. Off by default, with visible limits and cancellation. |
 | **[Work that survives window close](#overlay-controls)** | Assigned work and enabled grants continue for the same live owner. Main status stays visible; `/jarvis stop` and `/jarvis access off` keep control close at hand. |
 | **[Your model, your thinking level](#model-and-thinking-resolution)** | Press **F2 / F3** inside Jarvis. Follow main or choose a physical model independently, with scoped settings and a preserved draft. |
 | **[Local tools + native MCP](#native-mcp)** | Enable Repo tools for `read`, `bash`, `edit`, `write` and configured native MCP capabilities. Connections and permission generations belong to the side session. |
 | **[Quiet notes or deliberate redirects](#redirect-flow)** | Send a follow-up without changing the main priority, or request a redirect with visible per-send approval. Separate switches, not an all-or-nothing bridge. |
 | **[A conversation-first TUI](#keyboard-and-drafts)** | Padded reading panels, restrained color, clear speaker headings, anchored scrollback, multiline drafts, theme-aware focus and compact diagnostics. |
-| **[Controls that stay separate](#permission-flow)** | Memory, archive capture, archive model access, encryption, Repo tools, Note main and Redirect each have their own operating boundaries. |
+| **[Controls that stay separate](#permission-flow)** | Watchers, memory, archive capture, archive model access, encryption, Repo tools, Note main and Redirect each have their own operating boundaries. |
 
 ### The everyday loop
 
 1. **Remember the decision.** Save a concise project fact or an intentional global preference.
 2. **Explore beside the main task.** Ask Jarvis for triage, a second opinion or an explicitly permitted repo inspection.
 3. **Find the evidence.** Search memory; opt into archive recording/import when you need original recorded history.
-4. **Bring back what matters.** Keep it as context, send a quiet note, or confirm a redirect. You choose the level of intervention.
+4. **Wait without babysitting.** Opt into a main watcher, record the agent's next-step note, and get a wake-up instead of repeated model polling.
+5. **Bring back what matters.** Keep it as context, send a quiet note, or confirm a redirect. You choose the level of intervention.
 
 No perfect-recall promise, autonomous swarm claim or hidden permission escalation: curation depends on tool use, recall is bounded, and stored history is untrusted context.
 

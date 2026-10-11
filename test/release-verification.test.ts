@@ -91,11 +91,12 @@ function main(): void {
 	assert.equal(packed.name, manifest.name);
 	assert.equal(packed.version, manifest.version);
 	const packedPaths = new Set((packed.files ?? []).map((entry) => normalizeManifestEntry(entry.path)));
-	for (const path of ["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md", ...[
+	for (const path of ["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md", "docs/watchers-host-investigation.md", ...[
 		"index", "jarvis-config", "main-context", "main-session-state", "model-picker", "overlay", "session-ref", "side-session",
 		"draft-editor", "overlay-layout", "transcript-viewport", "native-mcp", "jarvis-branding",
 		"memory-types", "memory-config", "memory-content", "memory-store", "memory-service", "memory-extension",
 		"memory-editor-types", "memory-editor", "memory-editor-controller",
+		"watchers-types", "watchers-config", "watchers-check", "watchers-service", "watchers-extension", "watchers-render",
 		"archive-types", "archive-config", "archive-store", "archive-service", "archive-extension", "archive-import",
 		"archive-crypto", "archive-keychain", "archive-secret-input", "archive-unlock", "archive-sqlite",
 		"archive-migration", "archive-vault-files", "archive-vault",
@@ -110,7 +111,7 @@ function main(): void {
 	for (const path of packedPaths) {
 		assert.ok(!/(^|\/)(test|tmp|prompts|coord|node_modules|\.pi|\.git)\//.test(path), `forbidden payload path: ${path}`);
 		assert.ok(!path.endsWith(".tgz"), `archive must not be repacked: ${path}`);
-		assert.ok(path.startsWith("dist/") || ["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md"].includes(path), `unexpected source artifact: ${path}`);
+		assert.ok(path.startsWith("dist/") || ["package.json", "README.md", "AGENTS.md", "LICENSE", "docs/archive-encryption-design.md", "docs/watchers-host-investigation.md"].includes(path), `unexpected source artifact: ${path}`);
 		assert.ok(!path.startsWith("dist/mcp-policy."), `stale removed artifact: ${path}`);
 	}
 	console.log("release verification passed");

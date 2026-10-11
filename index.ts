@@ -32,6 +32,7 @@ import { invalidateMemoryEditor, openMemoryEditor } from "./memory-editor-contro
 import { SharedArchiveService } from "./archive-service.js";
 import { createArchiveExtensionFactory } from "./archive-extension.js";
 import { abandonArchiveSecretPrompt, isArchiveSecretPromptActive, revokeArchiveSecretPrompt } from "./archive-secret-input.js";
+import { createWatcherExtension } from "./watchers-extension.js";
 
 type JarvisModelSelection =
 	| { mode: "follow-main" }
@@ -78,6 +79,7 @@ type MainState = {
 	memory: SharedMemoryService;
 	archive: SharedArchiveService;
 	mainArchiveSnapshot?: () => void;
+	watchers?: ReturnType<typeof createWatcherExtension>;
 	mainSession: MainSessionTracker;
 	mainContext: MainSessionContextPayload;
 	lastJarvisSeenMainContext?: MainSessionContextPayload;
@@ -140,7 +142,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 		memory: new SharedMemoryService(getAgentDir()),
 		archive: new SharedArchiveService(getAgentDir(), {
 			beforeSecretPrompt: async () => {
-				if (state.modelPickerOpen || state.memoryReviewOpen || state.memoryEditorOwner) {
+				if (state.modelPickerOpen || state.memoryReviewOpen || state.memoryEditorOwner || state.watchers?.hasPendingSetup()) {
 					throw new Error("Finish the current Jarvis picker, memory review or editor before entering an archive password.");
 				}
 				// Password preparation explicitly revokes access BEFORE closing/yielding.
@@ -194,7 +196,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				await dispatchMemoryCommand(state, memoryRequest, ctx, Boolean(state.overlayOpen));
 				return;
 			}
-			if (state.memoryEditorOwner || state.modelPickerOpen || state.memoryReviewOpen) {
+			if (state.memoryEditorOwner || state.modelPickerOpen || state.memoryReviewOpen || state.watchers?.hasPendingSetup()) {
 				ctx.ui.notify("Finish the current Jarvis picker, memory review or editor before opening Jarvis.", "warning");
 				return;
 			}
@@ -371,8 +373,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			}
 		};
 		updateContextState(pi, state, ctx);
-		if (isArchiveSecretPromptActive() || state.memoryEditorOwner) {
-			notify("Finish the private archive password/exit verification or memory editor before configuring Jarvis.", "warning");
+		if (isArchiveSecretPromptActive() || state.memoryEditorOwner || state.watchers?.hasPendingSetup()) {
+			notify("Finish private input, memory editing, or watcher launch review before configuring Jarvis.", "warning");
 			return;
 		}
 
@@ -411,7 +413,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 				notify("No /jarvis models are currently available from the main model registry.", "warning");
 				return undefined;
 			}
-			if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen || state.memoryEditorOwner || state.overlayOpen) {
+			if (isArchiveSecretPromptActive() || state.modelPickerOpen || state.memoryReviewOpen || state.memoryEditorOwner || state.overlayOpen || state.watchers?.hasPendingSetup()) {
 				notify("Finish the current private archive prompt or Jarvis dialog before opening the model picker.", "warning");
 				return undefined;
 			}
@@ -593,8 +595,8 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 			}
 		};
 		updateContextState(pi, state, ctx);
-		if (isArchiveSecretPromptActive() || state.memoryEditorOwner) {
-			notify("Finish the private archive password/exit verification or memory editor before configuring Jarvis.", "warning");
+		if (isArchiveSecretPromptActive() || state.memoryEditorOwner || state.watchers?.hasPendingSetup()) {
+			notify("Finish private input, memory editing, or watcher launch review before configuring Jarvis.", "warning");
 			return;
 		}
 
@@ -942,7 +944,7 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	createMemoryExtensionFactory(state.memory, "main", {
 		confirmForget: async (review, signal, ctx) => {
 			// A background main turn must not replace the private password sink.
-			if (!ctx.hasUI || signal?.aborted || isArchiveSecretPromptActive() || state.memoryReviewOpen || state.modelPickerOpen || state.memoryEditorOwner || state.overlayOpen) return false;
+			if (!ctx.hasUI || signal?.aborted || isArchiveSecretPromptActive() || state.memoryReviewOpen || state.modelPickerOpen || state.memoryEditorOwner || state.overlayOpen || state.watchers?.hasPendingSetup()) return false;
 			state.memoryReviewOpen = true;
 			try { return await ctx.ui.confirm("Forget this shared memory?", review, { signal }); }
 			finally { state.memoryReviewOpen = false; }
@@ -950,9 +952,24 @@ export default function jarvisExtension(pi: ExtensionAPI): void {
 	})(pi);
 	createArchiveExtensionFactory(state.archive, "main", {
 		registerFinalSnapshot: snapshot => { state.mainArchiveSnapshot = snapshot; },
+		confirmReach: async (title, detail, signal) => {
+			const ctx = state.statusContext;
+			if (!ctx?.hasUI || signal?.aborted || isArchiveSecretPromptActive() || state.watchers?.hasPendingSetup() || state.memoryReviewOpen || state.modelPickerOpen || state.memoryEditorOwner || state.overlayOpen) return false;
+			state.memoryReviewOpen = true;
+			try { return await ctx.ui.confirm(title, detail, { signal }); }
+			finally { state.memoryReviewOpen = false; }
+		},
 	})(pi);
 	// Close shared storage only after the archive lane's final snapshot/disposal.
 	pi.on("session_shutdown", (event) => { state.archive.close(event.reason); });
+
+	// Preserve the v1.13.1 lifecycle handler prefix, including synchronous owner
+	// and queue invalidation. Even a synchronous earlier handler introduces an
+	// awaited dispatch boundary; optional watchers must never precede it.
+	state.watchers = createWatcherExtension(pi, getAgentDir(), {
+		available: () => !isArchiveSecretPromptActive() && !state.memoryEditorOwner && !state.modelPickerOpen && !state.memoryReviewOpen && !state.overlayOpen,
+		notify: (text, level, ctx) => { if (state.overlayOpen) state.bridge.notify(text, level); else if (ctx.hasUI) ctx.ui.notify(text, level); else process.stderr.write(`[pi-jarvis] ${text}\n`); },
+	});
 }
 
 function updateContextState(pi: ExtensionAPI, state: MainState, ctx: ExtensionContext): void {
@@ -1056,7 +1073,7 @@ async function dispatchLocalControl(state: MainState, control: LocalControl, ctx
 			resetTransientAccessControls(state);
 			text = "Jarvis Repo tools, Note main and Redirect access off; pending confirmations cancelled. Already-started external effects cannot be rolled back.";
 		} else {
-			text = `${describeJarvisActivity(state)}. Close/reopen preserves work and access for this owner. /jarvis stop cancels work; /jarvis access off revokes the three grants. Background work ends on owner replacement/reload/quit, not a daemon.`;
+			text = `${describeJarvisActivity(state)}. Close/reopen preserves work and access for this owner. /jarvis stop cancels work; /jarvis access off revokes the three grants. Background work ends on owner replacement/reload/quit, not a daemon.\nMain watchers (independent): ${state.watchers?.status() ?? "unavailable"}`;
 		}
 		if (state.queuedMessages !== owner) return;
 		if (overlay) state.bridge.notify(text, "info");
@@ -1560,6 +1577,7 @@ async function dispatchMemoryCommand(state: MainState, args: string, ctx: Extens
 			ctx.ui.notify("Use /jarvis-memory editor without arguments; choose search and scope inside the editor.", "warning");
 			return;
 		}
+		if (state.watchers?.hasPendingSetup()) { ctx.ui.notify("Finish watcher launch permission review before opening the memory editor.", "warning"); return; }
 		await openMemoryEditor(state, ctx);
 		return;
 	}
@@ -1679,6 +1697,8 @@ function createOverlayView(
 			if (state.queuedMessages !== queue || isArchiveSecretPromptActive()) return;
 			const localControl = parseLocalControl(text);
 			if (localControl) { await dispatchLocalControl(state, localControl, ctx, true); return; }
+			const watchersCommand = /^\/(?:jarvis-watchers|watchers)(?:\s+([\s\S]*))?$/.exec(text.trim());
+			if (watchersCommand) { await state.watchers?.command(watchersCommand[1] ?? "status", ctx); return; }
 			const archiveCommand = parseArchiveCommand(text);
 			if (archiveCommand !== undefined) {
 				await dispatchArchiveCommand(state, archiveCommand, ctx, true);

@@ -425,6 +425,25 @@ test("queued side /new invalidates dirty editor without changing the main archiv
 	});
 });
 
+test("watchers off preserves the v1.13.1 synchronous owner-invalidation prefix at every session boundary", bounded, async t => {
+	for (const boundary of ["session_start", "session_tree", "session_shutdown", "session_before_switch", "session_before_fork", "session_before_tree"]) {
+		await isolated(t, async f => {
+			assert.equal(f.tools.get("jarvis_watcher_set")?.exposure, "hidden", "watchers must be off in this fixture");
+			const opened = f.command("jarvis-memory", "editor");
+			await until(() => Boolean(f.active));
+			const editor = f.active!.component;
+			assert.notDeepEqual(editor.render(110), [], "the editor starts with a live owner");
+			// v1.13.1 invalidates this owner before emit's first await. Observe it
+			// immediately, as the transaction guard does, not after navigation settles.
+			const navigation = f.emit(boundary, { reason: "resume" });
+			assert.deepEqual(editor.render(110), [], `${boundary} must revoke the owner before any awaited watcher handler`);
+			await navigation;
+			await opened;
+			assert.equal(f.forbiddenCalls, 0, "off watchers must not execute or wake anything");
+		});
+	}
+});
+
 test("actual index owner expiry inside service SQLite guard prevents reviewed create COMMIT without trust denial", bounded, async t => {
 	await isolated(t, async f => {
 		f.note(); // Prewarm SQLite so the targeted final guard runs after INSERT, before COMMIT.
