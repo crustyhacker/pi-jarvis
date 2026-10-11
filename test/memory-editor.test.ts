@@ -117,7 +117,7 @@ async function replace(f: Fixture, title: string, body: string) {
 }
 async function reviewAll(f: Fixture) {
 	for (let limit = 0; limit < 10000; limit++) {
-		const match = /Review page (\d+)\/(\d+)/.exec(f.screen());
+		const match = /Review page (\d+) of (\d+)/.exec(f.screen());
 		assert.ok(match, f.screen());
 		if (match[1] === match[2]) return;
 		await key(f, PGDN);
@@ -132,12 +132,12 @@ function bounds(lines: string[], width: number, height: number) {
 test("cached note-only browser uses exact API, pagination and explicit refresh; no render reads", async (t) => {
 	const f = fixture(t, 45); await settle();
 	assert.equal(f.calls.lists.length, 1); assert.deepEqual(f.calls.lists[0], { scope: "current", sort: "updated", offset: 0, limit: 20 });
-	assert.match(f.screen(), /1–20 of 45/);
+	assert.match(f.screen(), /45 notes · showing 1–20 · sorted by last update/);
 	for (let i = 0; i < 20; i++) f.ui.render(90);
-	assert.equal(f.calls.lists.length, 1); assert.equal(f.calls.gets.length, 0);
-	await key(f, PGDN); assert.match(f.screen(), /21–40 of 45/);
-	await key(f, "]"); assert.match(f.screen(), /41–45 of 45/);
-	await key(f, PGUP); assert.match(f.screen(), /21–40 of 45/);
+	assert.equal(f.calls.lists.length, 1); assert.equal(f.calls.gets.length, 1, "rendering never reads; only the highlighted-row preview did");
+	await key(f, PGDN); assert.match(f.screen(), /showing 21–40/);
+	await key(f, "]"); assert.match(f.screen(), /showing 41–45/);
+	await key(f, PGUP); assert.match(f.screen(), /showing 21–40/);
 	await key(f, "r"); assert.equal(f.calls.lists.at(-1)?.offset, 20);
 });
 
@@ -152,7 +152,7 @@ test("named scope/category/source/sort fields and literal search cover current/p
 	await key(f, "\x1b[15~"); assert.equal(f.calls.lists.at(-1)?.sort, "created"); // F5
 	await key(f, "\x06"); await key(f, paste('literal OR "query"')); await key(f, "\r");
 	assert.equal(f.calls.lists.at(-1)?.query, 'literal OR "query"'); assert.equal(f.calls.lists.at(-1)?.offset, 0);
-	assert.match(f.screen(), /No curated notes match/);
+	assert.match(f.screen(), /No notes match the current filters/);
 });
 
 test("full inspector scrolls all body and provenance without truncating metadata or unsafe timestamps", async (t) => {
@@ -166,8 +166,8 @@ test("full inspector scrolls all body and provenance without truncating metadata
 	for (let i = 0; i < 300; i++) { seen.add(f.screen()); await key(f, PGDN); }
 	// Reassemble only viewport content (not repeated headers/footers) across wrap/page boundaries.
 	const text = [...seen].map((screen) => screen.split("\n").slice(4, -3).join("")).join("");
-	for (const marker of [r.id.slice(0, 30), "PROJECT-TAIL", "SESSION-TAIL", "EVENT-TAIL", "BODY-TAIL", String(Number.MAX_SAFE_INTEGER), "not last author"]) assert.ok(text.includes(marker), marker);
-	assert.equal(f.calls.gets.length, 1); assert.ok(!text.includes("conversation"));
+	for (const marker of [r.id.slice(0, 30), "PROJECT-TAIL", "SESSION-TAIL", "EVENT-TAIL", "BODY-TAIL", "unknown", "not last author"]) assert.ok(text.includes(marker), marker);
+	assert.equal(f.calls.gets.length, 3); assert.ok(!text.includes("conversation"));
 });
 
 test("untrusted controls are escaped in list/inspector/form display, and unchanged originals are never rewritten", async (t) => {
@@ -276,7 +276,7 @@ test("split paste framing comes before every shortcut and drops prefix/suffix ke
 	for (const payload of ["n", "e", "d", " ", "\x04", "\x13", "\x1b", "y\r", "\x1bOQ"]) {
 		await key(f, paste(payload) + "n\r");
 	}
-	assert.equal(f.closed(), 0); assert.equal(f.calls.gets.length, 0); assert.equal(f.calls.creates.length, 0); assert.equal(f.calls.deletes.length, 0);
+	assert.equal(f.closed(), 0); assert.equal(f.calls.gets.length, 1, "only the startup preview read; pastes trigger nothing"); assert.equal(f.calls.creates.length, 0); assert.equal(f.calls.deletes.length, 0);
 	await edit(f); await key(f, "\x05");
 	await key(f, "\x1b[20"); await key(f, "0~ appended"); await key(f, "\x1b[20"); await key(f, "1~\x13");
 	assert.ok(f.ui.isDirty()); assert.ok(!f.screen().includes("SAVE REVIEW"));
@@ -289,12 +289,13 @@ test("split paste framing comes before every shortcut and drops prefix/suffix ke
 test("single deletion and selected-batch deletion show exact IDs/titles/scopes and require every page", async (t) => {
 	const f = fixture(t, 8, { columns: 70, rows: 18 }); await settle();
 	for (let i = 0; i < 8; i++) { await key(f, " "); await key(f, DOWN); }
-	await key(f, "\x04"); assert.equal(f.calls.gets.length, 8); assert.match(f.screen(), /8 exact note/);
+	const reads = f.calls.gets.length;
+	await key(f, "\x04"); assert.equal(f.calls.gets.length - reads, 8); assert.match(f.screen(), /8 exact note/);
 	await key(f, "y"); assert.equal(f.calls.deletes.length, 0); assert.match(f.screen(), /Approval blocked/);
 	let reviewed = "";
 	for (let limit = 0; limit < 100; limit++) {
 		reviewed += f.screen() + "\n";
-		const match = /Review page (\d+)\/(\d+)/.exec(f.screen())!;
+		const match = /Review page (\d+) of (\d+)/.exec(f.screen())!;
 		if (match[1] === match[2]) break;
 		await key(f, PGDN);
 	}
@@ -312,7 +313,7 @@ test("selection stays across pages, caps at 50, clears on filters; explicit sing
 	}
 	assert.match(f.screen(), /Selection limit is 50/);
 	await key(f, "\x1b[3;5~"); await reviewAll(f); await key(f, "y"); assert.equal(f.calls.deletes[0]?.expected.length, 1);
-	await key(f, "\x1bOQ"); assert.match(f.screen(), /Selected 0\/50/);
+	await key(f, "\x1bOQ"); assert.match(f.screen(), /Selected 0 of 50/);
 });
 
 test("dirty Escape then Enter requires visible discard review; cancellation keeps draft; clean close disposes once", async (t) => {
@@ -328,13 +329,13 @@ test("dirty Escape then Enter requires visible discard review; cancellation keep
 test("save conflict preserves complete draft and exact expected record; explicit reload discards only after review", async (t) => {
 	const f = fixture(t, 1); await edit(f); await key(f, "\x05"); await key(f, paste(" changed locally"));
 	const expected = structuredClone(f.records[0]!); f.records[0]!.text = "EXTERNAL body"; f.notify();
-	assert.ok(f.ui.isDirty()); assert.equal(f.calls.gets.length, 1);
+	assert.ok(f.ui.isDirty()); assert.equal(f.calls.gets.length, 2);
 	await key(f, "\x13"); await reviewAll(f); await key(f, "y");
 	assert.match(f.screen(), /Conflict/); assert.match(f.screen(), /changed locally/); assert.ok(f.ui.isDirty());
 	assert.deepEqual(f.calls.updates[0]?.expected, expected);
 	await key(f, "\x13"); assert.equal(f.calls.updates.length, 1); assert.match(f.screen(), /Ctrl\+R/);
-	await key(f, "\x12"); assert.match(f.screen(), /DISCARD DRAFT/); assert.equal(f.calls.gets.length, 1);
-	await reviewAll(f); await key(f, "y"); assert.equal(f.calls.gets.length, 2); assert.equal(f.ui.isDirty(), false); assert.match(f.screen(), /EXTERNAL body/);
+	await key(f, "\x12"); assert.match(f.screen(), /DISCARD DRAFT/); assert.equal(f.calls.gets.length, 2);
+	await reviewAll(f); await key(f, "y"); assert.equal(f.calls.gets.length, 3); assert.equal(f.ui.isDirty(), false); assert.match(f.screen(), /EXTERNAL body/);
 });
 
 test("collision/tombstone/unknown failures preserve drafts and sanitize errors without automatic write replay", async (t) => {
@@ -451,7 +452,9 @@ test("exact 50-note batch review across result pages is bounded and approves onl
 		for (let i = 0; i < count; i++) { await key(f, " "); await key(f, DOWN); }
 		if (page < 2) { await key(f, PGDN); for (let i = 0; i < 20; i++) await key(f, UP); }
 	}
-	await key(f, "\x04"); assert.equal(f.calls.gets.length, 50); assert.match(f.screen(), /50 exact note/);
+	const reads = f.calls.gets.length;
+	await key(f, "\x04"); assert.equal(f.calls.gets.length - reads, 50);
+	assert.match(f.screen(), /50 exact note/);
 	await key(f, "y"); assert.equal(f.calls.deletes.length, 0);
 	await reviewAll(f); await key(f, "y"); assert.equal(f.calls.deletes[0]?.expected.length, 50); assert.equal(f.records.length, 0);
 });
@@ -486,7 +489,7 @@ test("native StdinBuffer delayed lone-ESC paste opener never exits or reaches un
 
 test("Escape arming is deterministic: second ESC never exits, other keys are swallowed, and focus loss disarms", async (t) => {
 	const f = fixture(t, 0); await settle();
-	await key(f, "\x1b"); assert.equal(f.closed(), 0); assert.match(f.screen(), /Escape pending/);
+	await key(f, "\x1b"); assert.equal(f.closed(), 0); assert.match(f.screen(), /Press Enter to close, any other key to stay/);
 	await key(f, "\x1b"); assert.equal(f.closed(), 0);
 	await key(f, "n"); assert.equal(f.closed(), 0); assert.ok(!f.screen().includes("Create note"));
 	await key(f, "\x1b"); f.ui.focused = false; f.ui.focused = true;
@@ -510,8 +513,8 @@ test("all 32 delimiter partitions drain valid paste before browser and review ke
 		for (const chunk of fragments(end, cuts)) await key(f, chunk);
 	};
 	for (let cuts = 0; cuts < 32; cuts++) await drain(cuts);
-	assert.equal(f.closed(), 0); assert.equal(f.calls.gets.length, 0); assert.equal(f.calls.lists.length, 1);
-	assert.match(f.screen(), /Selected 0\/50/);
+	assert.equal(f.closed(), 0); assert.equal(f.calls.gets.length, 1, "only the startup preview read; framing drains never act"); assert.equal(f.calls.lists.length, 1);
+	assert.match(f.screen(), /Selected 0 of 50/);
 	await edit(f); await key(f, "\x13"); await reviewAll(f);
 	for (let cuts = 0; cuts < 32; cuts++) await drain(cuts);
 	assert.equal(f.calls.updates.length, 0); assert.match(f.screen(), /SAVE REVIEW/);
@@ -524,7 +527,7 @@ test("user Escape followed by a new split paste opener cannot close or authorize
 		if (review === "delete") await key(f, "\x04");
 		else { await edit(f); await key(f, paste(" locally changed")); if (review === "save") await key(f, "\x13"); else await back(f); }
 		await reviewAll(f);
-		await key(f, "\x1b"); assert.match(f.screen(), /Escape pending/);
+		await key(f, "\x1b"); assert.match(f.screen(), /Press Enter to close/);
 		await key(f, "\x1b"); assert.equal(f.closed(), 0);
 		for (const chunk of ["[", "2", "0", "0", "~y\r\x13\x04\x1b", "\x1b", "[", "2", "0", "1", "~"]) await key(f, chunk);
 		assert.match(f.screen(), /REVIEW/); assert.equal(f.closed(), 0);
@@ -545,7 +548,7 @@ test("native StdinBuffer timed-out paste START/END at every boundary and multipl
 		await delay(70); f.buffer.process(end.slice(split)); await delay(70);
 		assert.equal(f.closed(), 0, `boundary ${split}`); assert.equal(f.tui.getFocusedComponent(), f.ui);
 		assert.equal(f.ordinary.getValue(), ""); assert.deepEqual(f.submissions, []);
-		assert.equal(f.calls.gets.length, 0); assert.equal(f.calls.lists.length, 1); assert.match(f.screen(), /Selected 0\/50/);
+		assert.equal(f.calls.gets.length, 1, "startup preview only; hostile bytes read nothing"); assert.equal(f.calls.lists.length, 1); assert.match(f.screen(), /Selected 0 of 50/);
 		f.buffer.destroy(); f.tui.stop();
 	}
 	const f = nativeFixture(t); await settle();
@@ -556,7 +559,7 @@ test("native StdinBuffer timed-out paste START/END at every boundary and multipl
 	for (const chunk of end) { f.buffer.process(chunk); await delay(70); }
 	assert.equal(f.closed(), 0); assert.equal(f.tui.getFocusedComponent(), f.ui);
 	assert.equal(f.ordinary.getValue(), ""); assert.deepEqual(f.submissions, []);
-	assert.equal(f.calls.gets.length + f.calls.creates.length + f.calls.updates.length + f.calls.deletes.length, 0);
+	assert.equal(f.calls.gets.length, 1, "startup preview only"); assert.equal(f.calls.creates.length + f.calls.updates.length + f.calls.deletes.length, 0);
 });
 
 test("native delayed framing cannot approve a displayed save, deletion or dirty discard review", async (t) => {
@@ -577,7 +580,7 @@ test("native delayed framing cannot approve a displayed save, deletion or dirty 
 test("fresh native Escape then Enter positive control closes once and returns focus without note submission", async (t) => {
 	const f = nativeFixture(t); await settle();
 	f.buffer.process("\x1b"); await delay(25);
-	assert.equal(f.closed(), 0); assert.equal(f.tui.getFocusedComponent(), f.ui); assert.match(f.screen(), /Escape pending/);
+	assert.equal(f.closed(), 0); assert.equal(f.tui.getFocusedComponent(), f.ui); assert.match(f.screen(), /Press Enter to close/);
 	f.buffer.process("\r"); await settle();
 	assert.equal(f.closed(), 1); assert.equal(f.tui.getFocusedComponent(), f.ordinary);
 	assert.equal(f.ordinary.getValue(), ""); assert.deepEqual(f.submissions, []); assert.deepEqual(f.lines(), []);
@@ -586,17 +589,112 @@ test("fresh native Escape then Enter positive control closes once and returns fo
 	assert.equal(f.ordinary.getValue(), "synthetic human input after verified exit"); assert.deepEqual(f.submissions, []);
 });
 
-test("narrow browser shows F1 and Escape-then-Enter early, with bracketed active filter and useful selection hints", async (t) => {
+test("narrow browser shows the key legend and close gesture early, and names the active Tab target", async (t) => {
 	const f = fixture(t, 1, { columns: 99 }); await settle();
 	for (const width of [40, 80, 99]) {
 		const lines = f.lines(width); bounds(lines, width, 36);
-		assert.match(stripTerminalSequences(lines.at(-2)!), /^F1 help.*Esc then Enter close/);
-		assert.match(stripTerminalSequences(lines.at(-3)!), /Selected 0\/50.*Space select/);
+		assert.match(stripTerminalSequences(lines.at(-2)!), /^↑↓ move .*Esc, then Enter close\s*$/, `width ${width}`);
+		assert.match(stripTerminalSequences(lines.at(-3)!), /Selected 0 of 50 · Space select/, `width ${width}`);
 	}
-	for (const label of ["List", "Scope: current", "Category: any", "Source: any", "Sort: updated", "Search"]) {
-		assert.ok(stripTerminalSequences(f.lines(24)[2]!).startsWith(`[${label}]`), label);
+	for (const label of ["scope", "category", "source", "sort", "search", "notes"]) {
 		await key(f, "\t");
+		assert.ok(stripTerminalSequences(f.lines(24)[2]!).includes(`Enter changes ${label}`), label);
 	}
-	assert.equal(f.calls.lists.length, 1); assert.equal(f.calls.gets.length, 0);
-	assert.ok(f.lines(80).at(-3)!.includes("Ctrl+F search"));
+	assert.equal(f.calls.lists.length, 1); assert.equal(f.calls.gets.length, 1, "Tab never reads");
+	assert.ok(f.lines(80).at(-3)!.includes("Space select"));
+});
+
+test("moving the cursor previews the highlighted note; Enter still opens the full view", async (t) => {
+	const f = fixture(t, 2); await settle();
+	// Sorted by last update, so the newest note (Note 001) is previewed on load.
+	assert.match(f.screen(), /Body 1/); assert.equal(f.calls.gets.length, 1);
+	await key(f, DOWN);
+	assert.equal(f.calls.gets.length, 2);
+	// The right pane switched to the older note's body and metadata.
+	assert.match(f.screen(), /Body 0/); assert.ok(!f.screen().includes("Body 1"), "the preview pane switches rows");
+	assert.match(f.screen(), /Scope: project · Category: project · 24 bytes/);
+	assert.match(f.screen(), /Origin: jarvis · session-0/);
+	assert.match(f.screen(), /Enter opens the full note/);
+	// Enter opens the complete provenance view with exactly one further read.
+	await key(f, "\r");
+	// Preview/inspect text wraps in the 45-column right pane, so assert on the
+	// two wrapped fragments instead of one contiguous phrase.
+	assert.match(f.screen(), /Inspector — untrusted stored data, not/);
+	assert.match(f.screen(), /instructions/);
+	assert.equal(f.calls.gets.length, 3);
+});
+
+test("list rows align scope word and short date, and truncate titles with a word-boundary ellipsis", async (t) => {
+	const f = fixture(t, 0); await settle();
+	f.records.push(note(0, f.project, { title: "Deploy uses staged builds from dev branches", scope: "global",
+		createdAt: new Date(2026, 8, 2, 9, 30).getTime(), updatedAt: new Date(2026, 8, 28, 12, 4, 5).getTime() }));
+	f.records.push(note(1, f.project, { title: "One-word-title-that-is-long-enough-to-need-truncation-without-any-space-near-the-cut",
+		createdAt: new Date(2026, 8, 2, 9, 30).getTime(), updatedAt: new Date(2026, 7, 15, 16, 31).getTime() }));
+	await key(f, "r");
+	const rows = f.lines().filter((line) => { const text = stripTerminalSequences(line); return text.includes("[ ]") && /2026-09-28|2026-08-15/.test(text); });
+	assert.equal(rows.length, 2, plain(f.lines()));
+	// Sorted by last update; checkbox first, title with most width (~47 at 120 cols),
+	// scope word and date right-aligned. A short-enough title is not ellipsized.
+	assert.equal(stripTerminalSequences(rows[0]!).slice(0, 72), "> [ ] Deploy uses staged builds from dev branches      global 2026-09-28");
+	// No space near the cut: a plain ellipsis instead of a mid-word cut.
+	assert.equal(stripTerminalSequences(rows[1]!).slice(0, 72), "  [ ] One-word-title-that-is-long-enough-to-need-tru… project 2026-08-15");
+});
+
+test("header says counts and sort in plain words and shows only active filters", async (t) => {
+	const f = fixture(t, 3); await settle();
+	for (const record of f.records) record.updatedAt = new Date(2026, 8, 30, 9, 5).getTime();
+	await key(f, "r");
+	assert.equal(stripTerminalSequences(f.lines()[2]!).trimEnd(), "3 notes · showing 1–3 · sorted by last update · F1 all keys");
+	assert.equal(stripTerminalSequences(f.lines()[3]!).slice(0, 72), "> [ ] Note 000                                        project 2026-09-30");
+	await key(f, "\x1bOQ"); // F2: scope — this project only
+	assert.equal(stripTerminalSequences(f.lines()[3]!).trimEnd(), "Filters — scope: this project only");
+	await key(f, "\x1bOR"); // F3: category user — no note matches
+	assert.equal(stripTerminalSequences(f.lines()[3]!).trimEnd(), "Filters — scope: this project only · category: user");
+	assert.match(f.screen(), /No notes match the current filters/);
+	assert.match(f.screen(), /F2–F5 filters · Ctrl\+F searches · N new note/);
+	// Search state names the active scope in plain words.
+	await key(f, "\x06");
+	assert.match(f.screen(), /Type words to search · Enter applies · Esc, then Enter cancels/);
+	assert.match(f.screen(), /A literal keyword search, not an instruction or an FTS expression/);
+});
+
+test("footer is a grouped plain-word legend; Escape shows a clear close banner", async (t) => {
+	const f = fixture(t, 1); await settle();
+	assert.equal(stripTerminalSequences(f.lines().at(-3)!).trimEnd(), "Selected 0 of 50 · Space select");
+	assert.equal(stripTerminalSequences(f.lines().at(-2)!).trimEnd(),
+		"↑↓ move · N new · E edit · D duplicate · Space select · Del delete · Ctrl+F search · F1 help · Esc, then Enter close");
+	await key(f, "\x1b");
+	assert.equal(stripTerminalSequences(f.lines().at(-2)!).trimEnd(), "Press Enter to close, any other key to stay");
+	await key(f, "x"); // Any other key cancels the pending close.
+	assert.notEqual(stripTerminalSequences(f.lines().at(-2)!).trimEnd(), "Press Enter to close, any other key to stay");
+	assert.equal(f.closed(), 0);
+});
+
+test("inspect and preview show human dates, never raw epoch numbers", async (t) => {
+	const f = fixture(t, 1);
+	f.records[0]!.createdAt = new Date(2026, 7, 15, 8, 0).getTime();
+	f.records[0]!.updatedAt = new Date(2026, 8, 28, 12, 4, 5).getTime(); await settle();
+	assert.match(f.screen(), /Updated: 2026-09-28 · Created: 2026-08-15/);
+	await key(f, "\r");
+	assert.match(f.screen(), /Updated: 2026-09-28 12:04:05/);
+	assert.ok(!f.screen().includes(String(f.records[0]!.updatedAt)), "raw epoch must not appear");
+});
+
+test("selected count stays visible when a notice replaces the status line", async (t) => {
+	const f = fixture(t, 2); await settle();
+	await key(f, " "); // Select the highlighted note.
+	assert.match(stripTerminalSequences(f.lines().at(-3)!), /Selected 1 of 50 · Space select/);
+	f.notify(); // Backend change raises a notice.
+	assert.match(stripTerminalSequences(f.lines().at(-3)!), /Notes changed; R refreshes the browser\..* · Selected 1/);
+});
+
+test("first-use and empty-filter states say what to press", async (t) => {
+	const f = fixture(t, 0); await settle();
+	assert.match(f.screen(), /No curated notes here yet/);
+	assert.match(f.screen(), /Press N to write your first note · F1 help/);
+	assert.match(f.screen(), /No curated notes here yet\. N creates your first note · F1 shows all keys/);
+	const g = fixture(t, 2); await settle();
+	await key(g, "\x06"); await key(g, "zzz-nothing-matches"); await key(g, "\r");
+	assert.match(g.screen(), /No notes match the current filters/);
+	assert.match(g.screen(), /No notes match\. F2–F5 adjust filters · Ctrl\+F searches · N creates a note\./);
 });

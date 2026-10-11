@@ -22,7 +22,7 @@ Your main Pi session stays on the job. **Jarvis gives you room to investigate, r
 [![Pi extension](https://img.shields.io/badge/Pi-extension-06b6d4?style=for-the-badge)](https://github.com/crustyhacker/pi-jarvis)
 [![TypeScript](https://img.shields.io/badge/TypeScript-powered-2563eb?style=for-the-badge)](./package.json)
 
-<p><strong>Current version:</strong> 1.13.0</p>
+<p><strong>Current version:</strong> 1.13.1</p>
 
 ```bash
 pi install npm:pi-jarvis
@@ -63,6 +63,7 @@ Inside Jarvis, use **`/memory editor`**. No model call or side-session boot is r
 | When you want to… | The editor lets you… |
 |---|---|
 | **Find a saved decision** | Search and filter by project/global scope, category or origin lane; sort and browse pages. |
+| **Read a note while browsing** | The highlighted note previews live in the right pane as you move—no key needed; Enter opens the full record. |
 | **Understand where a fact came from** | Inspect the full text, timestamps, ID and original provenance—not just an excerpt. |
 | **Correct or reorganize a note** | Edit its title, multiline body, category and scope, with a visible save review. |
 | **Build on something useful** | Create a new note or duplicate an existing one without silently overwriting its title. |
@@ -70,7 +71,7 @@ Inside Jarvis, use **`/memory editor`**. No model call or side-session boot is r
 
 **Curated notes only:** this is not the full-session archive editor and does not edit automatic conversation captures. Notes remain local plaintext and may be recalled to models. Full memory off or denied trust blocks access; capture/recall-only pauses still allow human management. Deleting a note does not erase earlier context, transcripts or backups.
 
-**Quick keys:** Ctrl+F search · Ctrl+S review save · F1 help · **Escape, then Enter** back/close. [All editor controls and safeguards](#curated-memory-editor).
+**Quick keys:** ↑↓ move (live preview) · Enter open · N new · E edit · D duplicate · Space select · Del delete · Ctrl+F search · Ctrl+S review save · F1 help · **Escape, then Enter** back/close. [All editor controls and safeguards](#curated-memory-editor).
 
 ---
 
@@ -572,23 +573,24 @@ Place this in `<agentDir>/extensions/pi-jarvis.json` to disable memory before in
 
 A dedicated TUI overlay for **the useful facts you and your models save**—not the full-session archive and not automatic conversation captures. New in **1.12.0**. Inside Jarvis, `/memory editor` opens the same editor locally without a model call or waiting for queued side work.
 
-- **Find the right note:** paged browsing, keyword search, current-project/global/all-project scope, category and origin-lane filters, and sorting.
-- **See the whole record:** full text, scope/project association, category, ID, timestamps and original provenance—not just a search excerpt.
+- **Find the right note:** paged browsing, keyword search, this-project/global/all-projects scope, category and origin-lane filters, and sorting. The header says what is filtered in plain words, and only when something is.
+- **Read while you browse:** moving the cursor previews the highlighted note in the right pane (body first, then scope, dates and origin); Enter opens the full record with IDs and provenance. List rows show scope and last-updated date, aligned.
 - **Manage it deliberately:** create or duplicate notes; edit title, multiline body, category and scope; review saves and single/selected-note deletions.
 - **Keep your work:** dirty-draft discard checks and conflict detection protect against accidentally overwriting a concurrently changed note. Reload and review explicitly; failed or uncertain writes are not replayed automatically.
 
 | In the memory editor | Key |
 |---|---|
+| Move (live preview of the highlighted note) | ↑ / ↓ |
 | Search notes | Ctrl+F |
 | Scope / category / origin lane / sort | F2 / F3 / F4 / F5 |
 | Inspect / new / edit / duplicate | Enter / N / E / D |
 | Select notes / clear selections | Space / Ctrl+U |
 | Review selected deletion (up to 50), or the current note | Delete / Ctrl+D |
 | Review a save | Ctrl+S |
-| Back or close | **Escape, then Enter** |
+| Back or close | **Escape, then Enter** (the footer shows the pending-close banner) |
 | Complete shortcut help | F1 |
 
-Escape deliberately arms back/close rather than immediately releasing the window: a lone Escape can be the first byte of a slowly arriving paste. The next Enter confirms that navigation gesture; a second Escape does not close. Dirty drafts still require a separate discard review. Save/delete approvals require freshly visible review pages, and pasted input cannot approve them.
+Escape deliberately arms back/close rather than immediately releasing the window: a lone Escape can be the first byte of a slowly arriving paste. When armed, a clear banner shows: **“Press Enter to close, any other key to stay”**. The next Enter confirms that navigation gesture; a second Escape does not close. Dirty drafts still require a separate discard review. Save/delete approvals require freshly visible review pages, and pasted input cannot approve them.
 
 [See the editor preview and workflow overview above](#edit-what-pi-remembers). Initial window width is capped at 144 columns; Pi clamps smaller terminals, and reopening recalculates the width.
 

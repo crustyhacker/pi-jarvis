@@ -51,6 +51,8 @@ export class MemoryEditorOverlay implements Component, Focusable {
 	private listTop = 0;
 	private listHeight = 1;
 	private browserFocus = 0;
+	private browserFocusUsed = false;
+	private previewSeq = 0;
 	private record?: MemoryRecord;
 	private inspectScroll = 0;
 	private inspectLines = 0;
@@ -198,8 +200,26 @@ export class MemoryEditorOverlay implements Component, Focusable {
 			this.query = query; this.page = { ...page, records: page.records.map((r) => ({ ...r })) };
 			this.index = Math.min(this.index, Math.max(0, page.records.length - 1)); this.listTop = 0;
 			this.needsRefresh = false;
-			this.notice = page.total ? "" : "No curated notes match. N creates a note; adjust filters or search.";
+			const filtered = query.scope !== "current" || query.category || query.lane || query.query;
+			this.notice = page.total ? "" : filtered
+				? "No notes match. F2–F5 adjust filters · Ctrl+F searches · N creates a note."
+				: "No curated notes here yet. N creates your first note · F1 shows all keys.";
+			this.preview();
 		});
+	}
+
+	/** Best-effort read-only preview of the highlighted row; Enter still loads with full error handling. */
+	private preview(id = this.page.records[this.index]?.id): void {
+		if (this.disposed || this.paused || this.mode !== "browse" || !this.active()) return;
+		if (!id || this.record?.id === id) return;
+		const scope = this.query.scope, epoch = this.epoch, sequence = ++this.previewSeq;
+		try {
+			void Promise.resolve(this.backend.get(id, scope)).then((record) => {
+				if (this.disposed || this.paused || epoch !== this.epoch || sequence !== this.previewSeq || this.mode !== "browse"
+					|| this.page.records[this.index]?.id !== id || !record || record.kind !== "note") return;
+				this.record = clone(record); this.inspectScroll = 0; this.changed();
+			}).catch(() => { /* Preview stays silent on failure; the explicit Enter load reports errors. */ });
+		} catch { /* Preview is best effort and never blocks or warns on its own. */ }
 	}
 
 	private load(action: "inspect" | "edit" | "duplicate", id = this.page.records[this.index]?.id): void {
@@ -387,7 +407,7 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		if (matchesKey(data, "delete") || matchesKey(data, "ctrl+d")) { this.beginDelete(); return; }
 		if (matchesKey(data, "ctrl+delete")) { this.beginDelete(true); return; }
 		if (this.mode === "inspect") { this.scrollInput(data); return; }
-		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) { this.browserFocus = (this.browserFocus + (matchesKey(data, "tab") ? 1 : 5)) % 6; this.changed(); return; }
+		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) { this.browserFocus = (this.browserFocus + (matchesKey(data, "tab") ? 1 : 5)) % 6; this.browserFocusUsed = true; this.changed(); return; }
 		const filter = ["f2", "f3", "f4", "f5"].findIndex((key) => matchesKey(data, key as "f2"));
 		if (filter >= 0) { this.cycleFilter(filter + 1); return; }
 		if (this.browserFocus && (matchesKey(data, "enter") || matchesKey(data, "space") || matchesKey(data, "left") || matchesKey(data, "right"))) {
@@ -397,7 +417,7 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		if (data === "]" || kb.matches(data, "tui.select.pageDown")) { if (this.page.nextOffset !== null) this.refresh(this.page.nextOffset); return; }
 		if (data === "[" || kb.matches(data, "tui.select.pageUp")) { this.refresh(Math.max(0, this.page.offset - PAGE_SIZE)); return; }
 		if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
-			this.index = Math.max(0, Math.min(this.page.records.length - 1, this.index + (kb.matches(data, "tui.select.up") ? -1 : 1))); this.changed();
+			this.index = Math.max(0, Math.min(this.page.records.length - 1, this.index + (kb.matches(data, "tui.select.up") ? -1 : 1))); this.changed(); this.preview();
 		} else if (matchesKey(data, "space")) {
 			const record = this.page.records[this.index];
 			if (record) {
@@ -510,15 +530,15 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		this.frame = undefined;
 		if (this.disposed || !width || !height) return [];
 		this.focusChildren();
-		if (this.paused) return this.fit([this.theme.fg("warning", this.paused), this.backArmed ? "Escape pending — Enter closes; another key cancels." : "Content and drafts cleared; reopen explicitly. Esc then Enter closes.", "Already viewed output/backups are not erased."], width, height);
+		if (this.paused) return this.fit([this.theme.fg("warning", this.paused), this.backArmed ? "Press Enter to close, any other key to stay" : "Content and drafts cleared; reopen explicitly. Esc, then Enter closes.", "Already viewed output/backups are not erased."], width, height);
 		if (this.mode === "form" && (height < 14 || width < 24)) {
 			const input = this.formFocus === 1 ? this.renderBody(width, Math.max(1, height - 1))
 				: this.formFocus === 0 ? this.renderInput(this.title, width)
 					: [`${this.formFocus === 2 ? "Category: " + this.category : "Scope: " + this.scope} • Enter changes`];
-			return this.fit([...input, this.backArmed ? "Escape pending — Enter back" : "Enlarge for review; Esc then Enter back"], width, height);
+			return this.fit([...input, this.backArmed ? "Press Enter to go back, any other key to stay" : "Enlarge for review · Esc, then Enter goes back"], width, height);
 		}
 		if (height < 7 || width < 24) {
-			return this.fit(["Curated notes — enlarge to review", this.backArmed ? "Escape pending — Enter back/close" : this.busy || this.notice || "F1 help · Esc then Enter back/close"], width, height);
+			return this.fit(["Curated notes — enlarge to review", this.backArmed ? "Press Enter to close, any other key to stay" : this.busy || this.notice || "F1 help · Esc, then Enter closes"], width, height);
 		}
 		const lines = [this.theme.fg("accent", "Curated memory • notes only"),
 			this.theme.fg("muted", "Local plaintext, not a secret vault • may reach models • archive unaffected")];
@@ -526,13 +546,16 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		if (this.mode === "review") this.renderReview(lines, width, contentHeight);
 		else if (this.mode === "form") this.renderForm(lines, width, contentHeight);
 		else if (this.mode === "search") {
-			lines.push("Search literal keywords in the active scope (Enter apply, Esc then Enter cancel)", ...this.renderInput(this.search, width));
-			lines.push(`Scope: ${this.query.scope} • Query is not an instruction or an FTS expression.`);
+			lines.push("Type words to search · Enter applies · Esc, then Enter cancels", ...this.renderInput(this.search, width));
+			lines.push(`Scope: ${scopeWords(this.query.scope)} · A literal keyword search, not an instruction or an FTS expression.`);
 		} else if (this.mode === "help") this.renderDocument(lines, helpText(this.keybindings), width, contentHeight);
 		else this.renderBrowser(lines, width, contentHeight);
 		while (lines.length < height - 3) lines.push("");
-		lines.push(this.theme.fg(this.busy ? "accent" : this.notice ? "warning" : "dim", this.busy || this.notice || (this.needsRefresh ? "Notes changed — R refresh" : `Selected ${this.selected.size}/50 • Space select • Ctrl+F search`)));
-		lines.push(this.theme.fg("muted", this.hint()));
+		const status = this.busy || this.notice || (this.needsRefresh ? "Notes changed — R refreshes the browser" : "");
+		const count = this.selected.size ? ` · Selected ${this.selected.size}` : "";
+		lines.push(this.theme.fg(this.busy ? "accent" : this.notice ? "warning" : "dim",
+			status ? `${status}${this.busy ? "" : count}` : `Selected ${this.selected.size} of 50 · Space select`));
+		lines.push(this.theme.fg("muted", this.hint(width)));
 		lines.push(this.theme.fg("borderMuted", "─".repeat(width)));
 		const result = this.fit(lines, width, height);
 		if (this.mode === "review" && width >= 30 && width <= this.tui.terminal.columns && height >= 10
@@ -568,7 +591,7 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		if (review.geometry !== geometry) { review.geometry = geometry; review.seen.clear(); }
 		review.pages = Math.max(1, Math.ceil(wrapped.length / pageHeight));
 		review.page = Math.min(review.page, review.pages - 1);
-		lines.push(this.theme.fg("warning", `Review page ${review.page + 1}/${review.pages} • PgUp/PgDn • all pages required before Y/Enter`));
+		lines.push(this.theme.fg("warning", `Review page ${review.page + 1} of ${review.pages} · read every page before Y/Enter approves · PgUp/PgDn`));
 		lines.push(...wrapped.slice(review.page * pageHeight, (review.page + 1) * pageHeight));
 	}
 
@@ -598,29 +621,46 @@ export class MemoryEditorOverlay implements Component, Focusable {
 	}
 
 	private renderBrowser(lines: string[], width: number, height: number): void {
-		const fields = ["List", `Scope: ${this.query.scope}`, `Category: ${this.query.category ?? "any"}`,
-			`Source: ${this.query.lane ?? "any"}`, `Sort: ${this.query.sort}`, "Search"];
-		const focus = fields[this.browserFocus];
-		// Put the active Tab target first: a narrow viewport must not hide which filter Enter changes.
-		const filters = fields.slice(1, 5).filter((_field, index) => index + 1 !== this.browserFocus);
-		lines.push(truncateToWidth(`[${focus}] • ${filters.join(" • ")}`, width, "", true),
-			truncateToWidth(`Search: ${display(this.query.query || "(none)")} • ${this.page.offset + (this.page.records.length ? 1 : 0)}–${this.page.offset + this.page.records.length} of ${this.page.total}`, width, "", true));
+		const fieldNames = ["notes", "scope", "category", "source", "sort", "search"];
+		const sortWord = this.query.sort === "title" ? "title" : this.query.sort === "created" ? "created date" : "last update";
+		const active: string[] = [];
+		if (this.query.scope !== "current") active.push(`scope: ${scopeWords(this.query.scope)}`);
+		if (this.query.category) active.push(`category: ${this.query.category}`);
+		if (this.query.lane) active.push(`source: ${this.query.lane}`);
+		if (this.query.query) active.push(`search: "${display(this.query.query)}"`);
+		const filtered = active.length > 0;
+		// Plain counts and sort always; filters only when something is active. The Tab
+		// target leads the line so a narrow viewport still shows which filter Enter changes.
+		const shown = this.page.records.length ? `${this.page.offset + 1}–${this.page.offset + this.page.records.length}` : "0";
+		const focus = this.browserFocusUsed ? `Enter changes ${fieldNames[this.browserFocus]} · ` : "";
+		lines.push(truncateToWidth(`${focus}${this.page.total} ${this.page.total === 1 ? "note" : "notes"} · showing ${shown} · sorted by ${sortWord}${width >= 100 ? " · F1 all keys" : ""}`, width, "", true));
+		if (filtered) lines.push(truncateToWidth(`Filters — ${active.join(" · ")}`, width, "", true));
 		const available = Math.max(1, height - 2);
 		if (this.mode === "inspect" && width < 90) { this.renderDocument(lines, this.record ? recordText(this.record) : ["Choose a note with Enter."], width, available); return; }
-		const listWidth = width >= 90 ? Math.min(44, Math.floor(width * 0.4)) : width;
+		// Wide terminals: ~60% list / ~40% preview (preview never under 44 columns)
+		// so titles get roughly 50 characters; scope and date stay right-aligned.
+		const listWidth = width >= 90 ? Math.max(0, width - Math.max(44, Math.floor(width * 0.4))) : width;
 		this.listHeight = available;
 		this.listTop = Math.max(0, Math.min(this.listTop, this.index));
 		if (this.index >= this.listTop + available) this.listTop = this.index - available + 1;
 		const list = this.page.records.slice(this.listTop, this.listTop + available).map((record, i) => {
 			const current = this.listTop + i === this.index;
-			const text = `${current ? ">" : " "}${this.selected.has(record.id) ? "[x]" : "[ ]"} ${record.scope === "global" ? "G" : "P"} ${display(record.title)}`;
+			// Checkbox, title (most of the width, word-boundary ellipsis), scope word, short date.
+			const titleWidth = Math.max(0, listWidth - 25);
+			const title = ellipsize(display(record.title), titleWidth);
+			const text = `${current ? ">" : " "} ${this.selected.has(record.id) ? "[x]" : "[ ]"} ${title}${" ".repeat(Math.max(0, titleWidth - visibleWidth(title)))} ${(record.scope === "global" ? "global" : "project").padStart(7)} ${dayStamp(record.updatedAt).padStart(10)}`;
 			return this.theme.fg(current ? "accent" : "text", truncateToWidth(text, listWidth, "", true));
 		});
-		if (!list.length) list.push("No matching curated notes.");
+		if (!list.length) list.push(...(this.page.total
+			? ["No notes on this page — [ shows the previous page."]
+			: filtered
+				? ["No notes match the current filters.", "F2–F5 filters · Ctrl+F searches · N new note."]
+				: ["No curated notes here yet.", "Press N to write your first note · F1 help."]));
 		if (width < 90) { lines.push(...list); return; }
 		const rightWidth = width - listWidth - 3;
-		const doc = wrap(this.record ? [...(this.mode === "browse" ? ["Loaded note — Enter loads highlighted row."] : []), ...recordText(this.record)]
-			: ["Inspector — Enter loads the selected note.", "Full text and original provenance are scrollable.", "No conversations or archive entries."], rightWidth);
+		const doc = wrap(this.record
+			? (this.mode === "browse" ? previewText(this.record) : recordText(this.record))
+			: ["Move over a note to preview it here.", "Enter opens the full note with its provenance.", "No conversations or archive entries."], rightWidth);
 		this.inspectLines = doc.length; this.viewport = available;
 		this.inspectScroll = Math.max(0, Math.min(this.inspectScroll, Math.max(0, doc.length - available)));
 		const right = doc.slice(this.inspectScroll, this.inspectScroll + available);
@@ -637,14 +677,20 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		lines.push(...wrapped.slice(this.inspectScroll, this.inspectScroll + height));
 	}
 
-	private hint(): string {
-		if (this.backArmed) return "Escape pending — Enter back/close, never approve • another key cancels and is ignored";
-		if (this.mode === "review") return "PgUp/PgDn all pages • Y/Enter approve • N or Esc then Enter cancel • no pasted approval";
-		if (this.mode === "form") return "F1 help • Ctrl+S review save • Esc then Enter discard review • Tab fields • Ctrl+R reload";
-		if (this.mode === "search") return "F1 help • Enter apply search • Esc then Enter cancel";
-		if (this.mode === "help") return "F1 or Esc then Enter back • ↑↓/PgUp/PgDn/Home/End scroll";
-		if (this.mode === "inspect") return "F1 help • Esc then Enter back • ↑↓/PgUp/PgDn/Home/End scroll • E edit • D duplicate";
-		return "F1 help • Esc then Enter close • ↑↓ choose • Enter inspect • N/E/D • Delete review";
+	private hint(width: number): string {
+		if (this.backArmed) return "Press Enter to close, any other key to stay";
+		if (this.mode === "review") return "Read every page: PgUp/PgDn · Approve: Y or Enter · Cancel: N or Esc, then Enter";
+		if (this.mode === "form") return "Fields: Tab · Save: Ctrl+S · Reload: Ctrl+R · Help: F1 · Discard: Esc, then Enter";
+		if (this.mode === "search") return "Apply: Enter · Cancel: Esc, then Enter";
+		if (this.mode === "help") return "Scroll: ↑↓/PgUp/PgDn · Back: F1 or Esc, then Enter";
+		if (this.mode === "inspect") return "Scroll: ↑↓/PgUp/PgDn/Home/End · Edit: E · Duplicate: D · Help: F1 · Back: Esc, then Enter";
+		// Grouped plain-word legend. The close gesture always survives; middle
+		// groups are dropped one at a time until the line fits the terminal.
+		const groups = ["↑↓ move", "Enter open", "[ ] pages", "N new", "E edit", "D duplicate", "Space select", "Del delete", "Ctrl+F search", "F1 help"];
+		const close = "Esc, then Enter close";
+		let legend = [...groups, close];
+		while (visibleWidth(legend.join(" · ")) > width && legend.length > 2) legend.splice(1, legend.length === 3 ? 1 : 2);
+		return legend.join(" · ");
 	}
 
 	private fit(lines: string[], width: number, height: number): string[] {
@@ -660,7 +706,7 @@ export class MemoryEditorOverlay implements Component, Focusable {
 		if (this.mode === "inspect" || this.mode === "help") {
 			this.inspectScroll = Math.max(0, Math.min(this.inspectScroll + Math.sign(delta) * Math.min(10, Math.ceil(Math.abs(delta))), Math.max(0, this.inspectLines - this.viewport)));
 		} else if (this.mode === "review") this.reviewPage(Math.sign(delta));
-		else if (this.mode === "browse") this.index = Math.max(0, Math.min(this.page.records.length - 1, this.index + Math.sign(delta)));
+		else if (this.mode === "browse") { this.index = Math.max(0, Math.min(this.page.records.length - 1, this.index + Math.sign(delta))); this.preview(); }
 		else return { handled: true, render: false };
 		this.changed(); return { handled: true, render: true };
 	}
@@ -701,7 +747,38 @@ function display(text: string, multiline = false): string {
 	return text.replace(/[\x00-\x1f\x7f-\x9f\u200b\u200e\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g,
 		(char) => char === "\n" && multiline ? "\n" : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
-function date(value: number): string { return Number.isFinite(value) && Math.abs(value) <= 8.64e15 ? `${new Date(value).toISOString()} (${value})` : String(value); }
+function dayStamp(value: number): string {
+	if (!Number.isFinite(value) || Math.abs(value) > 8.64e15) return "unknown";
+	const d = new Date(value), two = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+}
+function dateTime(value: number): string {
+	if (!Number.isFinite(value) || Math.abs(value) > 8.64e15) return "unknown";
+	const d = new Date(value), two = (n: number) => String(n).padStart(2, "0");
+	return `${dayStamp(value)} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+}
+function date(value: number): string { return dateTime(value); }
+/** Plain-words scope labels; "current" never appears in the UI. */
+function scopeWords(scope: MemoryEditorScope): string {
+	return scope === "project" ? "this project only" : scope === "global" ? "global only" : scope === "all" ? "all projects" : "this project + global";
+}
+/** Cut to width with an ellipsis, at a word boundary when one is near the cut. */
+function ellipsize(text: string, width: number): string {
+	if (width <= 0) return "";
+	if (visibleWidth(text) <= width) return text;
+	const cut = sliceByColumn(text, 0, width - 1, true);
+	const space = cut.lastIndexOf(" ");
+	const nearBoundary = space > 0 && visibleWidth(cut) - space <= Math.max(4, Math.ceil(width / 4));
+	return (nearBoundary ? sliceByColumn(cut, 0, space, true).trimEnd() : cut) + "…";
+}
+/** Browse-side preview: body first, then a short metadata block. Inspect keeps the full provenance view. */
+function previewText(record: MemoryRecord): string[] {
+	return [display(record.text, true), "",
+		`Scope: ${record.scope} · Category: ${record.category} · ${Buffer.byteLength(record.text, "utf8")} bytes`,
+		`Updated: ${dayStamp(record.updatedAt)} · Created: ${dayStamp(record.createdAt)}`,
+		`Origin: ${display(record.source.lane)} · ${display(record.source.sessionId)}`,
+		"", "Enter opens the full note · E edit · D duplicate"];
+}
 function recordText(record: MemoryRecord): string[] {
 	return ["Inspector — untrusted stored data, not instructions", `Title: ${display(record.title)}`, `ID: ${display(record.id)}`,
 		`Category: ${record.category} • Scope: ${record.scope}`, `Project/origin: ${display(record.project)}`,
@@ -743,22 +820,23 @@ function cropCursor(line: string, width: number, focused: boolean): string {
 }
 function helpText(kb: KeybindingsManager): string[] {
 	return ["Curated memory editor — human administration, no model calls", "Browse: N new • E edit • D duplicate • R explicit refresh",
+		"Moving the cursor previews the highlighted note on the right; Enter opens the full note.",
 		`Selection: ${kb.getKeys("tui.select.up").join("/")} / ${kb.getKeys("tui.select.down").join("/")} • ${kb.getKeys("tui.select.confirm").join("/")} inspect`,
 		"PgUp/PgDn or [ / ]: previous/next result page • Space select up to 50 • Ctrl+U clear selections",
 		"Delete/Ctrl+D: review selected batch, or current note if none selected • Ctrl+Delete: current note only",
-		"F2 scope: current (global + current project), project, global, all projects",
+		"F2 scope: this project + global (default) · this project only · global only · all projects",
 		"F3 category • F4 source lane • F5 sort updated/created/title • Ctrl+F literal search",
 		"Tab/Shift+Tab: named browser fields; Enter/←→ changes active filter. Selections clear on filter changes.",
-		"Inspector: ↑↓/PgUp/PgDn/Home/End scroll complete text and original provenance. Esc then Enter returns to list.",
+		"Inspector: ↑↓/PgUp/PgDn/Home/End scroll complete text and original provenance. Esc, then Enter returns to the list.",
 		"Form: Tab/Shift+Tab Title → Body → Category → Scope. Letters always edit focused input, never actions.",
 		"Body: Enter/Shift+Enter/Ctrl+J newline; indentation retained. Public Pi editor navigation/undo/yank.",
 		"Title: single-line, max 160 Unicode points • Body: max 16 KiB UTF-8 • Search: max 1 KiB",
 		"Ctrl+S opens save review, including target project/global warning and complete draft body.",
 		"Ctrl+R on an existing draft reviews discarding it before explicit reload; conflicts never overwrite.",
-		"Esc THEN Enter from dirty form reviews discard; from clean browser closes. Drafts are not persisted.",
+		"Esc, then Enter: from a dirty form reviews discard; from a clean browser closes. Drafts are not persisted.",
 		"Escape alone retains a possible paste opener; a second Escape only re-arms, never exits.",
 		"Another non-continuation key cancels Escape arming and is ignored. No timing-based exit.",
-		"Reviews: PgUp/PgDn/←→ display every page; Y/Enter after focused valid display. N or Esc THEN Enter cancels.",
+		"Reviews: PgUp/PgDn/←→ display every page; Y/Enter after focused valid display. N or Esc, then Enter cancels.",
 		"Paste framing is consumed before all shortcuts, including split framing and attached trailing keys.",
 		"Paste can insert safe text only in Title/Body/Search; never select, change fields, save, delete or close.",
 		"Local plaintext, not a secret vault. Best-effort secret checks do not guarantee all secrets are detected.",

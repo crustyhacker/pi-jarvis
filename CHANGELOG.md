@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
+## [1.13.1] - 2026-10-10
+
+### Curated memory editor usability
+- Live preview: moving the cursor (arrows or fullscreen wheel) shows the highlighted note in the right pane—body first, then scope, category, size, human-readable dates and origin—without pressing Enter. Enter still opens the full provenance view. The preview is one bounded read-only fetch per move and stays silent on failure.
+- List rows show the checkbox, the title with most of the width (word-boundary ellipsis when truncated), and right-aligned scope word (project/global) and last-updated date (YYYY-MM-DD). At wide terminals the split is about 60% list / 40% preview, with the preview never under 44 columns.
+- The header says counts and sort order in plain words and shows a “Filters —” line only when scope/category/source/search is active; “current” scope is spelled “this project + global”.
+- The footer is a grouped plain-word key legend that drops middle groups until it fits the terminal; after Escape a banner reads “Press Enter to close, any other key to stay”. Escape-then-Enter remains the close gesture (a lone Escape can be a split paste opener), and the selected count stays visible when a notice is shown.
+- Human dates everywhere (YYYY-MM-DD, with time in the inspector); raw epoch numbers no longer appear. Empty and first-use states say what to press.
+- Presentation only: no data, storage, permission, review, safety or API changes. All paste framing, review, conflict and size protections are unchanged.
+
 ## [1.13.0] - 2026-10-10
 
 ### Archive search for the main agent
