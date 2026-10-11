@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 > Historical note: releases before the `pi-jarvis` 1.x line refer to the project's earlier `pi-btw` and `/btw` naming. Those entries are preserved as historical release records and do not describe the current product name or command surface.
 
-## [Unreleased]
+## [1.13.0] - 2026-10-10
 
 ### Archive search for the main agent
 - Give the model archive tools a **session reach**: `jarvis_archive_search`, `jarvis_archive_read` and `jarvis_archive_session` now default to the current session, so the main agent can recover details lost to context compaction on its own initiative without asking. `ArchiveStore.read` gains a session filter so entry IDs from other sessions cannot bypass the reach.
