@@ -235,7 +235,7 @@ test("human plaintext-to-cipher conversion preserves raw/provenance/FTS/tombston
 	if (!nativeAvailable(t)) return;
 	const f = fixture(t), mainCtx = f.context(), sideCtx = f.context("side-source"); await f.service.start(mainCtx);
 	append(mainCtx, "HISTORICAL_VAULT_CANARY");
-	const main = mount(f, "main", mainCtx), side = mount(f, "jarvis", sideCtx);
+	const main = mount(f, "main", mainCtx, { confirmReach: async () => true }), side = mount(f, "jarvis", sideCtx, { confirmReach: async () => true });
 	await main.emit("session_start"); await side.emit("session_start"); await enable(f, mainCtx);
 	const values = [
 		entry("raw-user", { role: "user", content: [{ type: "text", text: "vaultfixture unfiltered api_key=disposable-secret 🛰️<>𐐀" },
@@ -289,9 +289,10 @@ test("human plaintext-to-cipher conversion preserves raw/provenance/FTS/tombston
 	assert.ok(!side.activeTools().some(name => name.startsWith("jarvis_archive_")));
 	await f.service.command("model-access on --confirm-sensitive", mainCtx);
 	main.setRepoTools(false); side.setRepoTools(false);
-	for (const extension of [main, side]) {
+	for (const [extension, sessionCount] of [[main, 2], [side, 1]] as const) {
 		await extension.emit("agent_settled"); assert.deepEqual(extension.activeTools().sort(), [...ARCHIVE_TOOL_NAMES].sort());
-		assert.equal(page(toolText(await extension.execute("jarvis_archive_search", { query: "vaultfixture" }))).records.length, 3);
+		assert.equal(page(toolText(await extension.execute("jarvis_archive_search", { query: "vaultfixture" }))).records.length, sessionCount, "session-default reach finds only this session's records");
+		assert.equal(page(toolText(await extension.execute("jarvis_archive_search", { query: "vaultfixture", scope: "current" }))).records.length, 3);
 	}
 	await f.service.command("model-access off", mainCtx);
 	append(sideCtx, "AFTER_MODEL_OFF_VAULT_CANARY"); await side.emit("turn_end");
@@ -747,7 +748,7 @@ for (const access of ["policy", "stats", "status"] as const) for (const phase of
 			assert.equal(signal.aborted, false);
 		}
 		throwing = true; const before = observations;
-		if (access === "policy") assert.deepEqual(f.service.policy(ctx), { enabled: false, capture: false, modelAccess: false });
+		if (access === "policy") assert.deepEqual(f.service.policy(ctx), { enabled: false, capture: false, modelAccess: false, modelWideSearch: false });
 		else if (access === "stats") await assert.rejects(f.service.command("stats", ctx), error => {
 			assert.ok(error instanceof Error); assert.match(error.message, /disabled|locked|untrusted/); noLeak(f, error.message); return true;
 		});
